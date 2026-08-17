@@ -29,7 +29,7 @@ just like an idiomatic one. The full methodology is in
 
 ## Running it
 
-Tasks run on [lemans](https://github.com/rails/lemans), the Ruby harness built
+Tasks run on lemans (to be released), the Ruby harness built
 for this project. From this directory:
 
 ```sh
