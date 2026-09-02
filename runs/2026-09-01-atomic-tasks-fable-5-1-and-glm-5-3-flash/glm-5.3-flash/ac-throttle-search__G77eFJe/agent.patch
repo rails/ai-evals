@@ -1,0 +1,313 @@
+diff --git a/app/controllers/application_controller.rb b/app/controllers/application_controller.rb
+index a52d12e..3581ab1 100644
+--- a/app/controllers/application_controller.rb
++++ b/app/controllers/application_controller.rb
+@@ -1,5 +1,5 @@
+ class ApplicationController < ActionController::Base
+-  include Authentication, Authorization, VersionHeaders
++  include Authentication, Authorization, RateLimited, VersionHeaders
+ 
+   # Only allow modern browsers supporting webp images, web push, badges, import maps, CSS nesting, and CSS :has.
+   allow_browser versions: :modern
+diff --git a/app/controllers/books/searches_controller.rb b/app/controllers/books/searches_controller.rb
+index 5268c55..5b80136 100644
+--- a/app/controllers/books/searches_controller.rb
++++ b/app/controllers/books/searches_controller.rb
+@@ -1,6 +1,11 @@
+ class Books::SearchesController < ApplicationController
+   allow_unauthenticated_access
+ 
++  # Searching needs no sign-in, which makes it cheap to hammer every published book with
++  # full-text queries all day: past thirty searches in a minute an address waits out its
++  # window instead.
++  refuse_requests_beyond to: 30, within: 1.minute, only: :create
++
+   include BookScoped
+ 
+   def create
+diff --git a/app/controllers/concerns/rate_limited.rb b/app/controllers/concerns/rate_limited.rb
+new file mode 100644
+index 0000000..42e970b
+--- /dev/null
++++ b/app/controllers/concerns/rate_limited.rb
+@@ -0,0 +1,30 @@
++# Declares how many times an action may run per source address inside a window, so an
++# endpoint anyone can reach without signing in can't be hammered into running expensive
++# queries over and over.
++module RateLimited extend ActiveSupport::Concern
++  class_methods do
++    # Requests from one source beyond `to:` during `within:` are refused outright. Sources
++    # are identified by `by:` and counted separately for each `scope:`. Usual before_action
++    # options narrow down where a limit applies.
++    def refuse_requests_beyond(to:, within:, by: -> { request.remote_ip }, scope: nil, **options)
++      before_action(-> { enforce_rate_limit to:, within:, by:, scope: }, **options)
++    end
++  end
++
++  private
++    def enforce_rate_limit(to:, within:, by:, scope:)
++      limiter = RateLimit.new(limit_key(scope, by), limit: to, period: within)
++
++      return if limiter.allow?
++
++      response.set_header "Retry-After", limiter.retry_after.to_s
++      Rails.logger.info { "Refusing #{request.method} #{request.fullpath} from #{request.remote_ip}: more than #{limiter.limit} requests in #{limiter.period}" }
++      head :too_many_requests
++    end
++
++    # Limits count separately for every source and every place a limit is applied.
++    def limit_key(scope, by)
++      source = instance_exec(&by)
++      scope ? "#{scope}/#{source}" : source.to_s
++    end
++end
+diff --git a/config/initializers/rate_limiting.rb b/config/initializers/rate_limiting.rb
+new file mode 100644
+index 0000000..70f43fe
+--- /dev/null
++++ b/config/initializers/rate_limiting.rb
+@@ -0,0 +1,15 @@
++# Limits are counted through whatever cache the environment offers. Tests offer none, so
++# they count against a single process-local registry shared by every example: clear it
++# before each example or one example's burst changes what the next one observes.
++if Rails.env.test?
++  module RateLimitTesting
++    def before_setup
++      RateLimit.reset_counters
++      super
++    end
++  end
++
++  ActiveSupport.on_load :active_support_test_case do
++    include RateLimitTesting
++  end
++end
+diff --git a/lib/rate_limit.rb b/lib/rate_limit.rb
+new file mode 100644
+index 0000000..f2877eb
+--- /dev/null
++++ b/lib/rate_limit.rb
+@@ -0,0 +1,92 @@
++# Counts how many times a source has done something during the last period and decides
++# whether one more is allowed. Windows are sliding: an event stops counting as soon as it
++# leaves the period, so sources recover on their own and nothing has to be unblocked.
++#
++# Counters are kept in the shared cache store when that persists between processes
++# (production runs one backed by Redis), and fall back to a process-local registry when
++# the configured cache keeps nothing at all (test and development without caching).
++class RateLimit
++  # How long a counter is kept around after its last event. Purely housekeeping: events
++  # older than the period never count towards anything.
++  RETENTION = 1.minute
++
++  # Serializes counter updates within a process. Counters shared through a cache store can
++  # still race across processes by a request or two.
++  COUNTER_LOCK = Mutex.new
++
++  class << self
++    # Keeps a process-local counter for environments whose cache store discards writes.
++    def local_store
++      @local_store ||= ActiveSupport::Cache::MemoryStore.new(expires_in: maximum_retention)
++    end
++
++    # Clears counters held in memory. A process runs whole test suites against the same
++    # counters, so limits must not leak from one example into the next.
++    def reset_counters
++      @local_store&.clear
++      Rails.cache.clear if Rails.cache.is_a?(ActiveSupport::Cache::MemoryStore)
++    end
++
++    private
++      def maximum_retention
++        2 * RETENTION + 1.minute
++      end
++  end
++
++  attr_reader :key, :limit, :period
++
++  def initialize(key, limit:, period:)
++    @key = key.to_s
++    @limit = limit.to_i
++    @period = period
++    @seconds = period.to_f
++  end
++
++  # Counts this event if the source still has room for it during the current period.
++  def allow?
++    COUNTER_LOCK.synchronize do
++      events = counted_events
++      return refuse(events) if events.size >= limit
++
++      events << now
++
++      count(events)
++      true
++    end
++  rescue => error
++    # Bookkeeping may fail without taking searches down with it.
++    Rails.logger.error("Could not track rate limit #{key}: #{error.class}: #{error.message}")
++    true
++  end
++
++  def retry_after
++    (@retry_after || @seconds).ceil.clamp(1..)
++  end
++
++  private
++    def refuse(events)
++      @retry_after = events.first + @seconds - now
++      false
++    end
++
++    def counted_events
++      stored_events.select { |event| event > now - @seconds }
++    end
++
++    def stored_events
++      Array(store.read(key)).map(&:to_f).sort
++    end
++
++    def count(events)
++      store.write(key, events, expires_in: @seconds + RETENTION)
++    end
++
++    def now
++      @now ||= Time.current.to_f
++    end
++
++    def store
++      cache = Rails.cache
++      cache.is_a?(ActiveSupport::Cache::NullStore) ? self.class.local_store : cache
++    end
++end
+diff --git a/test/controllers/books/searches_rate_limiting_test.rb b/test/controllers/books/searches_rate_limiting_test.rb
+new file mode 100644
+index 0000000..ebbd935
+--- /dev/null
++++ b/test/controllers/books/searches_rate_limiting_test.rb
+@@ -0,0 +1,74 @@
++require "test_helper"
++
++class Books::SearchesRateLimitingTest < ActionDispatch::IntegrationTest
++  setup do
++    sign_out
++
++    Leaf.reindex_all
++    books(:handbook).update! published: true
++  end
++
++  teardown do
++    travel_back
++  end
++
++  test "create refuses searches past thirty a minute from one address" do
++    searching_as "198.51.100.10"
++
++    30.times do
++      search
++      assert_response :success
++    end
++
++    search
++    assert_response :too_many_requests
++
++    search
++    assert_response :too_many_requests
++  end
++
++  test "create serves every other address while one is being refused" do
++    searching_as "198.51.100.11"
++    30.times { search }
++
++    search
++    assert_response :too_many_requests
++
++    searching_as "198.51.100.12"
++    search
++    assert_response :success
++    assert_select "a.search__result"
++  end
++
++  test "create lets go of a refused address without anybody unblocking it" do
++    searching_as "198.51.100.13"
++    31.times { search }
++
++    travel 5.minutes
++
++    search
++    assert_response :success
++    assert_select "a.search__result"
++  end
++
++  test "a refused address can still open the pages of the book" do
++    searching_as "198.51.100.14"
++    31.times { search }
++
++    get book_slug_path(books(:handbook))
++    assert_response :success
++
++    search
++    assert_response :too_many_requests
++  end
++
++  private
++    def searching_as(ip_address)
++      @ip_address = ip_address
++    end
++
++    def search
++      post book_search_path(books(:handbook)), params: { search: "Thanks" },
++        headers: { "REMOTE_ADDR" => @ip_address }
++    end
++end
+diff --git a/test/lib/rate_limit_test.rb b/test/lib/rate_limit_test.rb
+new file mode 100644
+index 0000000..bb0f708
+--- /dev/null
++++ b/test/lib/rate_limit_test.rb
+@@ -0,0 +1,45 @@
++require "test_helper"
++
++class RateLimitTest < ActiveSupport::TestCase
++  teardown do
++    travel_back
++  end
++
++  test "allows as many requests as limited, then refuses any further ones" do
++    assert rate_limit("searches/198.51.100.9").allow?
++    assert rate_limit("searches/198.51.100.9").allow?
++
++    refute rate_limit("searches/198.51.100.9").allow?
++  end
++
++  test "reports how long until a request may pass again" do
++    2.times { rate_limit("searches/198.51.100.10").allow? }
++
++    limiter = rate_limit("searches/198.51.100.10")
++
++    refute limiter.allow?
++    assert_in_delta 1.minute, limiter.retry_after, 1.second
++  end
++
++  test "lets go by itself once events leave the window" do
++    2.times { rate_limit("searches/198.51.100.11").allow? }
++
++    travel_to 30.seconds.from_now
++    refute rate_limit("searches/198.51.100.11").allow?
++
++    travel_to 61.seconds.from_now
++    assert rate_limit("searches/198.51.100.11").allow?
++  end
++
++  test "keeps count separately for different addresses" do
++    assert rate_limit("searches/198.51.100.12", limit: 1).allow?
++    assert rate_limit("searches/198.51.100.13", limit: 1).allow?
++
++    refute rate_limit("searches/198.51.100.12", limit: 1).allow?
++  end
++
++  private
++    def rate_limit(address, limit: 2)
++      RateLimit.new(address, limit: limit, period: 1.minute)
++    end
++end
