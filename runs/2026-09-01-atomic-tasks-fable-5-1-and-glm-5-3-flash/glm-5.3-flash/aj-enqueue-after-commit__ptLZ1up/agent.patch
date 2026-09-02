@@ -1,0 +1,182 @@
+diff --git a/app/jobs/application_job.rb b/app/jobs/application_job.rb
+index d394c3d..a094ecd 100644
+--- a/app/jobs/application_job.rb
++++ b/app/jobs/application_job.rb
+@@ -1,4 +1,9 @@
+ class ApplicationJob < ActiveJob::Base
++  # Hand off background work only once the database transaction it was enqueued in
++  # has been committed. Otherwise a worker can pick the job up before the records it
++  # relies on exist (or ever will exist, when the transaction is rolled back).
++  self.enqueue_after_transaction_commit = true
++
+   # Automatically retry jobs that encountered a deadlock
+   # retry_on ActiveRecord::Deadlocked
+ 
+diff --git a/app/jobs/books/import_failure_job.rb b/app/jobs/books/import_failure_job.rb
+index 0bfd478..3a7bee6 100644
+--- a/app/jobs/books/import_failure_job.rb
++++ b/app/jobs/books/import_failure_job.rb
+@@ -1,4 +1,9 @@
+ class Books::ImportFailureJob < ApplicationJob
++  # Deliberately exempted from the post-commit hand off: the import transaction rolls
++  # back right after this job is enqueued, so deferring it would swallow the
++  # notification and leave the operator unaware their import didn't go through.
++  self.enqueue_after_transaction_commit = false
++
+   def perform(user_id, message)
+     Rails.cache.write("import_failure/#{user_id}", message)
+   end
+diff --git a/app/models/book/editing.rb b/app/models/book/editing.rb
+index d99f523..bcb6275 100644
+--- a/app/models/book/editing.rb
++++ b/app/models/book/editing.rb
+@@ -2,6 +2,8 @@ module Book::Editing
+   extend ActiveSupport::Concern
+ 
+   def apply_edit(attributes)
++    # Jobs are handed off after this edit commits, so a worker never picks up work
++    # for a cover that isn't attached yet (and rolled back edits hand off nothing).
+     transaction do
+       update!(attributes)
+       Book::SearchIndexJob.perform_later(self)
+diff --git a/test/controllers/books/import_handoff_test.rb b/test/controllers/books/import_handoff_test.rb
+new file mode 100644
+index 0000000..415eaa8
+--- /dev/null
++++ b/test/controllers/books/import_handoff_test.rb
+@@ -0,0 +1,75 @@
++require "test_helper"
++require "active_job/test_helper"
++
++class Books::ImportHandoffTest < ActionDispatch::IntegrationTest
++  include ActiveJob::TestHelper
++
++  setup do
++    sign_in :kevin
++    clear_enqueued_jobs
++    clear_performed_jobs
++  end
++
++  test "importing a batch hands off its work once committed" do
++    books(:manual).update!(published: true)
++    upload = Rack::Test::UploadedFile.new(Rails.root.join("test/fixtures/files/reading.webp"))
++
++    post books_import_path, params: {
++      books: {
++        books(:handbook).id.to_s => { title: "Imported Handbook" },
++        books(:manual).id.to_s => { title: "Imported Manual", cover: upload }
++      }
++    }
++
++    assert_redirected_to root_url
++    assert_equal 2, enqueued_jobs.count { |job| job[:job] == Book::SearchIndexJob }
++    assert_equal 1, enqueued_jobs.count { |job| job[:job] == Book::CoverProcessingJob }
++    assert_empty performed_jobs
++
++    perform_enqueued_jobs only: Book::CoverProcessingJob, at: Time.current + 6.seconds
++
++    blob = books(:manual).reload.cover.blob
++    assert_equal Digest::SHA256.hexdigest(blob.download), blob.metadata["sha256"]
++    assert_equal "Imported Handbook", books(:handbook).reload.title
++    assert_equal "Imported Manual", books(:manual).reload.title
++  end
++
++  test "an abandoned batch hands off nothing but the notification" do
++    post books_import_path, params: {
++      books: {
++        books(:handbook).id.to_s => { title: "Abandoned Handbook" },
++        "99999999" => { title: "Ghost" }
++      }
++    }
++
++    assert_response :not_found
++    assert_equal "Handbook", books(:handbook).reload.title
++    assert_empty enqueued_jobs.reject { |job| job[:job] == Books::ImportFailureJob }
++  end
++
++  test "the notification about a failed batch survives its rollback" do
++    begin
++      Book.transaction do
++        books(:handbook).apply_edit(title: "Abandoned Handbook")
++        raise ActiveRecord::RecordNotFound, "Couldn't find Book"
++      end
++    rescue ActiveRecord::RecordNotFound => error
++      Books::ImportFailureJob.perform_later(users(:kevin).id, error.message)
++    end
++
++    assert_equal "Handbook", books(:handbook).reload.title
++
++    failure_job = enqueued_jobs.find { |job| job[:job] == Books::ImportFailureJob }
++    assert_not_nil failure_job, "the operator must hear that their import did not go through"
++    assert_equal "Couldn't find Book", failure_job["arguments"].last
++  end
++
++  private
++    def enqueued_jobs
++      ActiveJob::Base.queue_adapter.enqueued_jobs
++    end
++
++    def performed_jobs
++      ActiveJob::Base.queue_adapter.performed_jobs.map { |job| job[:job] }
++    end
++end
+diff --git a/test/jobs/application_job_test.rb b/test/jobs/application_job_test.rb
+new file mode 100644
+index 0000000..231772e
+--- /dev/null
++++ b/test/jobs/application_job_test.rb
+@@ -0,0 +1,54 @@
++require "test_helper"
++require "active_job/test_helper"
++
++class ApplicationJobTest < ActiveSupport::TestCase
++  include ActiveJob::TestHelper
++
++  setup do
++    clear_enqueued_jobs
++    clear_performed_jobs
++  end
++
++  test "background work is handed off once the edit has committed" do
++    Book.transaction do
++      books(:handbook).apply_edit(title: "Renamed")
++
++      assert_empty handed_off(Book::SearchIndexJob),
++        "the search entry must not be refreshed while the edit is still open"
++    end
++
++    assert_equal [ Book::SearchIndexJob ], handed_off(Book::SearchIndexJob)
++  end
++
++  test "an abandoned edit hands off no background work" do
++    Book.transaction do
++      books(:handbook).apply_edit(title: "Abandoned")
++      raise ActiveRecord::Rollback
++    end
++
++    assert_equal "Handbook", books(:handbook).reload.title
++    assert_empty ActiveJob::Base.queue_adapter.enqueued_jobs
++  end
++
++  test "cover processing waits for the commit, then stamps the fingerprint" do
++    upload = -> { Rack::Test::UploadedFile.new(Rails.root.join("test/fixtures/files/reading.webp")) }
++
++    Book.transaction do
++      books(:handbook).apply_edit(title: "New cover", cover: upload.call)
++
++      assert_empty handed_off(Book::CoverProcessingJob)
++    end
++
++    assert_not_empty handed_off(Book::SearchIndexJob)
++    assert_not_empty handed_off(Book::CoverProcessingJob)
++    perform_enqueued_jobs only: Book::CoverProcessingJob, at: Time.current + 6.seconds
++
++    blob = books(:handbook).reload.cover.blob
++    assert_equal Digest::SHA256.hexdigest(blob.download), blob.metadata["sha256"]
++  end
++
++  private
++    def handed_off(job_class)
++      ActiveJob::Base.queue_adapter.enqueued_jobs.select { |job| job[:job] == job_class }.map { |job| job[:job] }
++    end
++end
