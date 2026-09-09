@@ -1,0 +1,283 @@
+diff --git a/app/models/card/entropic.rb b/app/models/card/entropic.rb
+index ebaad78..4b981bb 100644
+--- a/app/models/card/entropic.rb
++++ b/app/models/card/entropic.rb
+@@ -1,6 +1,9 @@
+ module Card::Entropic
+   extend ActiveSupport::Concern
+ 
++  # Due cards are postponed in batches of this size to keep each bulk-write transaction short.
++  AUTO_POSTPONE_BATCH_SIZE = 1_000
++
+   included do
+     scope :due_to_be_postponed, -> do
+       active
+@@ -24,11 +27,90 @@ module Card::Entropic
+   end
+ 
+   class_methods do
+-    def auto_postpone_all_due
+-      due_to_be_postponed.find_each do |card|
+-        card.auto_postpone(user: card.account.system_user)
++    # Postpones every due card with a handful of set-based statements per batch.
++    #
++    # Running the full per-card callback stack (Card#auto_postpone) costs tens of
++    # queries per card, so once an install grows past a hundred thousand cards the
++    # hourly sweep can no longer finish within its hour. This performs the same
++    # state changes in bulk instead: Not Now records, events, and system comments
++    # are inserted directly, activity spikes are cleared, cards are sent back to
++    # triage and touched, and affected boards are touched once per batch.
++    def auto_postpone_all_due(batch_size: AUTO_POSTPONE_BATCH_SIZE)
++      due_to_be_postponed.in_batches(of: batch_size) do |batch|
++        auto_postpone_batch(batch)
+       end
+     end
++
++    private
++      def auto_postpone_batch(batch)
++        # Plucking re-runs the due_to_be_postponed conditions, so cards that were
++        # revived or postponed since the batch range was computed are left alone.
++        due_cards = batch.pluck(:id, :account_id, :board_id, :column_id)
++        return if due_cards.empty?
++
++        card_ids    = due_cards.map(&:first)
++        account_ids = due_cards.map(&:second).uniq
++        board_ids   = due_cards.map(&:third).uniq
++        column_ids  = due_cards.map(&:fourth).compact.uniq
++
++        system_user_ids = User.where(account_id: account_ids, role: :system).pluck(:account_id, :id).to_h
++        now = Time.current
++
++        events = due_cards.map do |card_id, account_id, board_id, _|
++          { id: ActiveRecord::Type::Uuid.generate, account_id:, board_id:, creator_id: system_user_ids.fetch(account_id),
++            eventable_type: "Card", eventable_id: card_id, action: "card_auto_postponed", particulars: {},
++            created_at: now, updated_at: now }
++        end
++
++        comments = due_cards.map do |card_id, account_id, _, _|
++          { id: ActiveRecord::Type::Uuid.generate, account_id:, card_id:, creator_id: system_user_ids.fetch(account_id),
++            created_at: now, updated_at: now }
++        end
++
++        transaction do
++          Card::ActivitySpike.where(card_id: card_ids).delete_all
++
++          Card::NotNow.insert_all due_cards.map { |card_id, account_id, _, _|
++            { id: ActiveRecord::Type::Uuid.generate, account_id:, card_id:, user_id: system_user_ids.fetch(account_id),
++              created_at: now, updated_at: now }
++          }
++
++          Event.insert_all events
++
++          Comment.insert_all comments
++          ActionText::RichText.insert_all comments.map { |comment|
++            { id: ActiveRecord::Type::Uuid.generate, account_id: comment[:account_id], record_type: "Comment", record_id: comment[:id],
++              name: "body", body: auto_postponed_comment_body, created_at: now, updated_at: now }
++          }
++
++          Card.where(id: card_ids).update_all(column_id: nil, last_active_at: now, updated_at: now)
++          Board.where(id: board_ids).update_all(updated_at: now)
++          Column.where(id: column_ids).update_all(updated_at: now) if column_ids.any?
++        end
++
++        dispatch_webhook_jobs_for(events, board_ids)
++        broadcast_refreshes_for(board_ids, account_ids)
++      end
++
++      def auto_postponed_comment_body
++        Card::Eventable::SystemCommenter.body_for(Event.new(action: "card_auto_postponed"))
++      end
++
++      def dispatch_webhook_jobs_for(events, board_ids)
++        webhooked_board_ids = Webhook.active.triggered_by_action("card_auto_postponed").where(board_id: board_ids).pluck(:board_id)
++        event_ids = events.select { it[:board_id].in?(webhooked_board_ids) }.map { it[:id] }
++
++        if event_ids.any?
++          ActiveJob.perform_all_later Event.where(id: event_ids).map { |event| Event::WebhookDispatchJob.new(event) }
++        end
++      end
++
++      # One refresh per affected board and account replaces the per-card cascade
++      # of touches and broadcasts emitted by the callback-driven path.
++      def broadcast_refreshes_for(board_ids, account_ids)
++        Board.where(id: board_ids).each { |board| Turbo::StreamsChannel.broadcast_refresh_to(board) }
++        Account.where(id: account_ids).each { |account| Turbo::StreamsChannel.broadcast_refresh_to(account, :all_boards) }
++      end
+   end
+ 
+   def entropy
+diff --git a/app/models/card/eventable/system_commenter.rb b/app/models/card/eventable/system_commenter.rb
+index 5c7defc..1e37dfe 100644
+--- a/app/models/card/eventable/system_commenter.rb
++++ b/app/models/card/eventable/system_commenter.rb
+@@ -3,6 +3,13 @@ class Card::Eventable::SystemCommenter
+ 
+   attr_reader :card, :event
+ 
++  # Renders the comment body for an event without persisting anything. Only
++  # suitable for actions whose body does not reference the card (e.g.
++  # card_auto_postponed).
++  def self.body_for(event)
++    new(nil, event).comment_body
++  end
++
+   def initialize(card, event)
+     @card, @event = card, event
+   end
+@@ -13,32 +20,32 @@ class Card::Eventable::SystemCommenter
+     card.comments.create! creator: card.account.system_user, body: comment_body, created_at: event.created_at
+   end
+ 
+-  private
+-    def comment_body
+-      case event.action
+-      when "card_assigned"
+-        "#{creator_name} <strong>assigned</strong> this to #{assignee_names}."
+-      when "card_unassigned"
+-        "#{creator_name} <strong>unassigned</strong> from #{assignee_names}."
+-      when "card_closed"
+-        "<strong>Moved</strong> to “Done” by #{creator_name}"
+-      when "card_reopened"
+-        "<strong>Reopened</strong> by #{creator_name}"
+-      when "card_postponed"
+-        "#{creator_name} <strong>moved</strong> this to “Not Now”"
+-      when "card_auto_postponed"
+-        "<strong>Moved</strong> to “Not Now” due to inactivity"
+-      when "card_title_changed"
+-        "#{creator_name} <strong>changed the title</strong> from “#{old_title}” to “#{new_title}”."
+-      when "card_board_changed"
+-        "#{creator_name} <strong>moved</strong> this from “#{old_board}” to “#{new_board}”."
+-      when "card_triaged"
+-        "#{creator_name} <strong>moved</strong> this to “#{column}”"
+-      when "card_sent_back_to_triage"
+-        "#{creator_name} <strong>moved</strong> this back to “Maybe?”"
+-      end
++  def comment_body
++    case event.action
++    when "card_assigned"
++      "#{creator_name} <strong>assigned</strong> this to #{assignee_names}."
++    when "card_unassigned"
++      "#{creator_name} <strong>unassigned</strong> from #{assignee_names}."
++    when "card_closed"
++      "<strong>Moved</strong> to “Done” by #{creator_name}"
++    when "card_reopened"
++      "<strong>Reopened</strong> by #{creator_name}"
++    when "card_postponed"
++      "#{creator_name} <strong>moved</strong> this to “Not Now”"
++    when "card_auto_postponed"
++      "<strong>Moved</strong> to “Not Now” due to inactivity"
++    when "card_title_changed"
++      "#{creator_name} <strong>changed the title</strong> from “#{old_title}” to “#{new_title}”."
++    when "card_board_changed"
++      "#{creator_name} <strong>moved</strong> this from “#{old_board}” to “#{new_board}”."
++    when "card_triaged"
++      "#{creator_name} <strong>moved</strong> this to “#{column}”"
++    when "card_sent_back_to_triage"
++      "#{creator_name} <strong>moved</strong> this back to “Maybe?”"
+     end
++  end
+ 
++  private
+     def creator_name
+       h event.creator.name
+     end
+diff --git a/test/models/card/entropic_test.rb b/test/models/card/entropic_test.rb
+index 848cfa7..4ca9927 100644
+--- a/test/models/card/entropic_test.rb
++++ b/test/models/card/entropic_test.rb
+@@ -86,3 +86,95 @@ class Card::EntropicTest < ActiveSupport::TestCase
+     assert_equal(cards(:logo, :radio).to_set, Card.postponing_soon.to_set)
+   end
+ end
++
++class Card::EntropicBulkTest < ActiveSupport::TestCase
++  setup do
++    Current.session = sessions(:david)
++  end
++
++  test "auto postpone all due postpones cards in batches with full side effects" do
++    cards(:logo).update!(last_active_at: 2.days.ago - entropies(:writebook_board).auto_postpone_period, column: columns(:writebook_in_progress))
++    cards(:logo).create_activity_spike!
++    cards(:layout).update!(last_active_at: 2.days.ago - entropies(:writebook_board).auto_postpone_period)
++
++    assert_difference -> { Card::NotNow.count }, +2 do
++      assert_difference -> { Event.where(action: "card_auto_postponed").count }, +2 do
++        assert_difference -> { Comment.by_system.count }, +2 do
++          # batch_size of 1 forces the sweep through multiple batches
++          Card.auto_postpone_all_due(batch_size: 1)
++        end
++      end
++    end
++
++    card = cards(:logo).reload
++    assert card.postponed?
++    assert_equal accounts("37s").system_user, card.postponed_by
++    assert_nil card.column_id
++    assert_nil card.activity_spike
++    assert card.last_active_at > 1.minute.ago
++
++    event = card.events.last
++    assert_equal "card_auto_postponed", event.action
++    assert_equal accounts("37s").system_user, event.creator
++
++    comment = card.comments.last
++    assert comment.creator.system?
++    assert_includes comment.body.to_plain_text, "Not Now"
++
++    assert cards(:layout).reload.postponed?
++  end
++
++  test "auto postpone all due does not re-postpone cards on subsequent runs" do
++    cards(:logo).update!(last_active_at: 2.days.ago - entropies(:writebook_board).auto_postpone_period)
++
++    Card.auto_postpone_all_due
++
++    assert_no_difference -> { Card::NotNow.count } do
++      assert_no_difference -> { Event.count } do
++        Card.auto_postpone_all_due
++      end
++    end
++  end
++
++  test "auto postpone all due performs a constant number of queries per batch" do
++    cards(:logo, :layout, :text, :shipping).each do |card|
++      card.update!(last_active_at: 2.days.ago - entropies(:writebook_board).auto_postpone_period)
++    end
++
++    queries = 0
++    subscriber = ActiveSupport::Notifications.subscribe("sql.active_record") do |*, payload|
++      queries += 1 unless payload[:name] == "SCHEMA"
++    end
++
++    Card.auto_postpone_all_due(batch_size: 1_000)
++  ensure
++    ActiveSupport::Notifications.unsubscribe(subscriber)
++
++    # The callback-driven path this replaced ran ~50 queries per card.
++    assert_operator queries, :<, 40, "expected the sweep to run a bounded number of queries, got #{queries}"
++  end
++
++  test "auto postpone all due only dispatches webhooks for boards subscribed to card_auto_postponed" do
++    cards(:logo).update!(last_active_at: 2.days.ago - entropies(:writebook_board).auto_postpone_period)
++
++    # The writebook fixture webhook is not subscribed to card_auto_postponed.
++    assert_no_enqueued_jobs only: Event::WebhookDispatchJob do
++      Card.auto_postpone_all_due
++    end
++
++    Webhook.create! name: "Entropy hook", url: "https://example.com/entropy", board: boards(:writebook), subscribed_actions: %w[ card_auto_postponed ]
++    cards(:layout).update!(last_active_at: 2.days.ago - entropies(:writebook_board).auto_postpone_period)
++
++    assert_enqueued_with job: Event::WebhookDispatchJob do
++      Card.auto_postpone_all_due
++    end
++  end
++
++  test "auto postpone all due touches affected boards" do
++    cards(:logo).update!(last_active_at: 2.days.ago - entropies(:writebook_board).auto_postpone_period)
++
++    assert_changes -> { boards(:writebook).reload.updated_at } do
++      Card.auto_postpone_all_due
++    end
++  end
++end
