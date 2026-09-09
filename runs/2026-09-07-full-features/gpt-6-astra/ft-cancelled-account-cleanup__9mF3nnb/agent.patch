@@ -1,0 +1,234 @@
+diff --git a/app/jobs/account/incinerate_due_job.rb b/app/jobs/account/incinerate_due_job.rb
+new file mode 100644
+index 0000000..e5e9982
+--- /dev/null
++++ b/app/jobs/account/incinerate_due_job.rb
+@@ -0,0 +1,5 @@
++class Account::IncinerateDueJob < ApplicationJob
++  def perform
++    Account.incinerate_due
++  end
++end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index a6a70b1..92590d9 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -1,5 +1,5 @@
+ class Account < ApplicationRecord
+-  include Account::Storage, Cancellable, Entropic, MultiTenantable, Seedeable
++  include Account::Storage, Cancellable, Entropic, Incineratable, MultiTenantable, Seedeable
+ 
+   has_one :join_code, dependent: :destroy
+   has_many :users, dependent: :destroy
+diff --git a/app/models/account/incineratable.rb b/app/models/account/incineratable.rb
+index 2357b99..52c008d 100644
+--- a/app/models/account/incineratable.rb
++++ b/app/models/account/incineratable.rb
+@@ -1,3 +1,57 @@
+ module Account::Incineratable
++  extend ActiveSupport::Concern
++
+   INCINERATION_GRACE_PERIOD = 30.days
++
++  included do
++    scope :due_for_incineration, -> { joins(:cancellation).where(account_cancellations: { created_at: ...INCINERATION_GRACE_PERIOD.ago }) }
++  end
++
++  class_methods do
++    def incinerate_due
++      due_for_incineration.find_each(&:incinerate)
++    end
++  end
++
++  def incinerate
++    with_lock do
++      if self.class.due_for_incineration.exists?(id)
++        Current.with_account(self) do
++          incinerate_unscoped_records
++          incinerate_account_records
++          delete
++        end
++      end
++    end
++  end
++
++  private
++    def incinerate_unscoped_records
++      # These records have no account_id: storage totals,
++      # and SQLite's full-text index (removed by Search::Record's callbacks).
++      ::Storage::Total.where(owner: self).or(::Storage::Total.where(owner: boards)).delete_all
++      Search::Record.for(id).where(account_id: id).find_each(&:destroy!)
++    end
++
++    def incinerate_account_records
++      # Delete directly to avoid callbacks creating new records or jobs for an
++      # account that no longer exists. Include framework and SaaS tables too.
++      self.class.connection_pool.with_connection do |connection|
++        account_id = connection.quote(self.class.type_for_attribute("id").serialize(id))
++
++        # Filter join tables, including legacy ones, must be cleared before filters.
++        filters = Filter.where(account_id: id).select(:id).to_sql
++        connection.tables.each do |table|
++          if connection.schema_cache.columns_hash(table).key?("filter_id")
++            connection.delete "DELETE FROM #{connection.quote_table_name(table)} WHERE filter_id IN (#{filters})"
++          end
++        end
++
++        connection.tables.each do |table|
++          if connection.schema_cache.columns_hash(table).key?("account_id")
++            connection.delete "DELETE FROM #{connection.quote_table_name(table)} WHERE account_id = #{account_id}"
++          end
++        end
++      end
++    end
+ end
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 549f6ae..00c8110 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -7,6 +7,9 @@ production: &production
+     schedule: every 30 minutes
+ 
+   # Application cleanup
++  incinerate_due_accounts:
++    class: Account::IncinerateDueJob
++    schedule: every day at 04:12
+   auto_postpone_all_due:
+     command: "Card.auto_postpone_all_due"
+     schedule: every hour at minute 50
+diff --git a/test/jobs/account/incinerate_due_job_test.rb b/test/jobs/account/incinerate_due_job_test.rb
+new file mode 100644
+index 0000000..b7d3638
+--- /dev/null
++++ b/test/jobs/account/incinerate_due_job_test.rb
+@@ -0,0 +1,130 @@
++require "test_helper"
++
++class Account::IncinerateDueJobTest < ActiveJob::TestCase
++  setup do
++    @account = accounts(:"37s")
++    Current.reset
++  end
++
++  test "incinerates all data belonging to accounts cancelled more than 30 days ago" do
++    @account.create_cancellation!(initiated_by: users(:david), created_at: 31.days.ago)
++    Current.with_account(@account) do
++      cards(:logo).image.attach io: StringIO.new("image"), filename: "image.png", content_type: "image/png"
++      ActiveStorage::VariantRecord.create!(blob: cards(:logo).image.blob, variation_digest: "variant")
++      ActiveStorage::Blob.create_and_upload!(io: StringIO.new("unattached"), filename: "unattached.txt", content_type: "text/plain")
++      cards(:logo).update!(description: "Account data to incinerate")
++      comments(:logo_agreement_jz).reindex
++      @account.materialize_storage
++      boards(:writebook).materialize_storage
++    end
++    search_record_ids = Search::Record.for(@account.id).where(account_id: @account.id).ids
++    assert_not_empty search_record_ids
++    assert_not_empty account_data_counts(@account)
++    accounts(:initech).materialize_storage
++    accounts(:initech).users.create!(name: "David", identity: identities(:david))
++    other_account_data = account_data_counts(accounts(:initech))
++    identity_ids = Identity.ids
++    storage_total_ids = Storage::Total.where(owner: @account).or(Storage::Total.where(owner: @account.boards)).ids
++
++    Account::IncinerateDueJob.perform_now
++
++    assert_not Account.exists?(@account.id)
++    assert_empty account_data_counts(@account)
++    assert_not Storage::Total.exists?(id: storage_total_ids)
++    if ApplicationRecord.connection.adapter_name == "SQLite"
++      assert_not Search::Record::SQLite::Fts.exists?(rowid: search_record_ids)
++    end
++    assert Storage::Total.exists?(owner: accounts(:initech))
++    assert_equal other_account_data, account_data_counts(accounts(:initech))
++    assert_equal identity_ids.sort, Identity.ids.sort
++    assert Account.exists?(accounts(:initech).id)
++  end
++
++  test "retains accounts cancelled less than 30 days ago or exactly 30 days ago" do
++    freeze_time do
++      @account.create_cancellation!(initiated_by: users(:david), created_at: 30.days.ago)
++      accounts(:initech).create_cancellation!(initiated_by: users(:mike), created_at: 30.days.ago + 1.second)
++
++      assert_no_difference "Account.count" do
++        Account::IncinerateDueJob.perform_now
++      end
++    end
++  end
++
++  test "incinerates accounts just beyond the grace period and can run repeatedly" do
++    freeze_time do
++      @account.create_cancellation!(initiated_by: users(:david), created_at: 30.days.ago - 1.second)
++      accounts(:initech).create_cancellation!(initiated_by: users(:mike), created_at: 31.days.ago)
++
++      assert_difference "Account.count", -2 do
++        Account::IncinerateDueJob.perform_now
++        Account::IncinerateDueJob.perform_now
++      end
++    end
++  end
++
++  test "retains reactivated accounts" do
++    @account.create_cancellation!(initiated_by: users(:david), created_at: 31.days.ago)
++    @account.reactivate
++
++    assert_no_difference "Account.count" do
++      Account::IncinerateDueJob.perform_now
++    end
++  end
++
++  test "removes filter join rows including legacy associations" do
++    @account.create_cancellation!(initiated_by: users(:david), created_at: 31.days.ago)
++    filter = filters(:jz_assignments)
++    filter.board_ids = [ boards(:writebook).id ]
++    filter.tags << tags(:mobile)
++    filter.assignees << users(:jz)
++    filter.creators << users(:david)
++    filter.closers << users(:kevin)
++    connection = ApplicationRecord.connection
++    filter_id = connection.quote(Filter.type_for_attribute("id").serialize(filter.id))
++    user_id = connection.quote(User.type_for_attribute("id").serialize(users(:david).id))
++    connection.insert "INSERT INTO assigners_filters (filter_id, assigner_id) VALUES (#{filter_id}, #{user_id})"
++
++    Account::IncinerateDueJob.perform_now
++
++    connection.tables.each do |table|
++      if connection.columns(table).any? { |column| column.name == "filter_id" }
++        assert_equal 0, connection.select_value("SELECT COUNT(*) FROM #{connection.quote_table_name(table)} WHERE filter_id = #{filter_id}"), table
++      end
++    end
++  end
++
++  test "rechecks eligibility when an account was reactivated after selection" do
++    @account.create_cancellation!(initiated_by: users(:david), created_at: 31.days.ago)
++    selected_account = Account.due_for_incineration.find(@account.id)
++    @account.reactivate
++
++    assert_no_difference "Account.count" do
++      selected_account.incinerate
++    end
++  end
++
++  test "rolls back data deletion if incineration fails" do
++    @account.create_cancellation!(initiated_by: users(:david), created_at: 31.days.ago)
++    original_data = account_data_counts(@account)
++    @account.stubs(:delete).raises(ActiveRecord::StatementInvalid)
++
++    assert_raises ActiveRecord::StatementInvalid do
++      @account.incinerate
++    end
++
++    assert Account.exists?(@account.id)
++    assert_equal original_data, account_data_counts(@account)
++  end
++
++  private
++    def account_data_counts(account)
++      connection = ApplicationRecord.connection
++      connection.tables.each_with_object({}) do |table, counts|
++        if connection.columns(table).any? { |column| column.name == "account_id" }
++          count = connection.select_value("SELECT COUNT(*) FROM #{connection.quote_table_name(table)} WHERE account_id = #{connection.quote(Account.type_for_attribute("id").serialize(account.id))}")
++          counts[table] = count if count.positive?
++        end
++      end
++    end
++end

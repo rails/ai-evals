@@ -1,0 +1,388 @@
+diff --git a/app/jobs/webhook/delivery_job.rb b/app/jobs/webhook/delivery_job.rb
+new file mode 100644
+index 0000000..2011952
+--- /dev/null
++++ b/app/jobs/webhook/delivery_job.rb
+@@ -0,0 +1,9 @@
++class Webhook::DeliveryJob < ApplicationJob
++  queue_as :webhooks
++
++  discard_on ActiveJob::DeserializationError
++
++  def perform(delivery)
++    delivery.deliver_now
++  end
++end
+diff --git a/app/models/event.rb b/app/models/event.rb
+index 5c85165..e01d81c 100644
+--- a/app/models/event.rb
++++ b/app/models/event.rb
+@@ -24,6 +24,7 @@ class Event < ApplicationRecord
+   }
+ 
+   after_create -> { eventable.event_was_created(self) }
++  after_create_commit :deliver_to_webhooks_later
+ 
+   delegate :card, to: :eventable
+ 
+@@ -38,4 +39,18 @@ class Event < ApplicationRecord
+   def description_for(user)
+     Event::Description.new(self, user)
+   end
++
++  def deliver_to_webhooks_later
++    deliver_to_webhooks_now
++  end
++
++  def deliver_to_webhooks_now
++    board.webhooks.active.find_each do |webhook|
++      begin
++        webhook.deliver_event(self)
++      rescue ActiveRecord::RecordNotUnique, ActiveRecord::RecordInvalid
++        # Already delivered exactly once; ignore duplicates.
++      end
++    end
++  end
+ end
+diff --git a/app/models/webhook.rb b/app/models/webhook.rb
+index 5ecb714..7e771b9 100644
+--- a/app/models/webhook.rb
++++ b/app/models/webhook.rb
+@@ -21,6 +21,7 @@ class Webhook < ApplicationRecord
+   has_secure_token :signing_secret
+ 
+   has_many :deliveries, dependent: :delete_all
++  has_one :delinquency_tracker, class_name: "Webhook::DelinquencyTracker", dependent: :destroy
+ 
+   belongs_to :account, default: -> { board.account }
+   belongs_to :board
+@@ -36,14 +37,42 @@ class Webhook < ApplicationRecord
+   validates :name, presence: true
+   validate :validate_url
+ 
++  after_create :create_initial_delinquency_tracker
++
+   def activate
+-    update! active: true unless active?
++    transaction do
++      update! active: true unless active?
++      delinquency_tracker&.reset
++    end
+   end
+ 
+   def deactivate
+     update! active: false
+   end
+ 
++  def subscribed_to?(action)
++    subscribed_actions.include?(action.to_s)
++  end
++
++  def deliver_event(event)
++    if active? && subscribed_to?(event.action)
++      delivery = deliveries.find_or_create_by!(event: event)
++
++      if delivery.previously_new_record?
++        delivery.deliver_later
++      end
++      delivery
++    end
++  end
++
++  def record_delivery_success
++    delinquency_tracker&.record_success
++  end
++
++  def record_delivery_failure
++    ensure_delinquency_tracker.record_failure
++  end
++
+   def for_basecamp?
+     url.match? BASECAMP_CAMPFIRE_WEBHOOK_URL_REGEX
+   end
+@@ -57,6 +86,16 @@ class Webhook < ApplicationRecord
+   end
+ 
+   private
++    def create_initial_delinquency_tracker
++      unless delinquency_tracker.present?
++        Webhook::DelinquencyTracker.create!(webhook: self, account: account)
++      end
++    end
++
++    def ensure_delinquency_tracker
++      delinquency_tracker || Webhook::DelinquencyTracker.create!(webhook: self, account: account)
++    end
++
+     def validate_url
+       uri = URI.parse(url.presence)
+ 
+diff --git a/app/models/webhook/delinquency_tracker.rb b/app/models/webhook/delinquency_tracker.rb
+new file mode 100644
+index 0000000..df73b9c
+--- /dev/null
++++ b/app/models/webhook/delinquency_tracker.rb
+@@ -0,0 +1,48 @@
++class Webhook::DelinquencyTracker < ApplicationRecord
++  FAILURE_THRESHOLD = 10
++  FAILURE_WINDOW = 1.hour
++
++  belongs_to :account, default: -> { webhook.account }
++  belongs_to :webhook
++
++  def record_success
++    if consecutive_failures_count.to_i != 0 || first_failure_at.present?
++      update! consecutive_failures_count: 0, first_failure_at: nil
++    end
++  end
++
++  def record_failure
++    now = Time.current
++
++    if stale_window?(now)
++      update! consecutive_failures_count: 1, first_failure_at: now
++    else
++      update! consecutive_failures_count: consecutive_failures_count.to_i + 1, first_failure_at: first_failure_at || now
++    end
++
++    if should_deactivate?
++      webhook.deactivate
++    end
++  end
++
++  def should_deactivate?
++    if consecutive_failures_count.to_i >= FAILURE_THRESHOLD && first_failure_at.present?
++      true
++    else
++      false
++    end
++  end
++
++  def reset
++    update! consecutive_failures_count: 0, first_failure_at: nil
++  end
++
++  private
++    def stale_window?(now)
++      if first_failure_at.present? && updated_at.present?
++        first_failure_at < FAILURE_WINDOW.ago(now) && updated_at < FAILURE_WINDOW.ago(now)
++      else
++        false
++      end
++    end
++end
+diff --git a/app/models/webhook/delivery.rb b/app/models/webhook/delivery.rb
+index 4ecfeb8..8a1a6e7 100644
+--- a/app/models/webhook/delivery.rb
++++ b/app/models/webhook/delivery.rb
+@@ -1,4 +1,7 @@
+ class Webhook::Delivery < ApplicationRecord
++  RETENTION_PERIOD = 7.days
++  REQUEST_TIMEOUT = 10
++
+   belongs_to :account, default: -> { webhook.account }
+   belongs_to :webhook
+   belongs_to :event
+@@ -9,6 +12,58 @@ class Webhook::Delivery < ApplicationRecord
+   enum :state, %w[ pending in_progress completed errored ].index_by(&:itself), default: :pending
+ 
+   scope :ordered, -> { order created_at: :desc, id: :desc }
++  scope :stale, -> { where(created_at: ...RETENTION_PERIOD.ago) }
++
++  validates :event_id, uniqueness: { scope: :webhook_id }
++
++  class << self
++    def cleanup
++      stale.delete_all
++    end
++  end
++
++  def deliver_later
++    Webhook::DeliveryJob.perform_later(self)
++  end
++
++  def deliver_now
++    with_lock do
++      if completed? || errored?
++        false
++      else
++        perform_delivery
++        true
++      end
++    end
++  rescue ActiveRecord::RecordNotFound
++    false
++  end
++
++  def perform_delivery
++    update! state: :in_progress
++
++    payload = build_payload
++    body = JSON.generate(payload)
++    headers = build_headers(body)
++
++    store_request(headers, body)
++
++    begin
++      code, response_headers, response_body = post_webhook(headers, body)
++      store_response(code: code, headers: response_headers, body: response_body, error: nil)
++      update! state: :completed
++
++      if succeeded?
++        webhook.record_delivery_success
++      else
++        webhook.record_delivery_failure
++      end
++    rescue StandardError => error
++      store_response(code: nil, headers: {}, body: nil, error: error_class_for(error))
++      update! state: :errored
++      webhook.record_delivery_failure
++    end
++  end
+ 
+   def sanitized_request
+     if headers = request&.dig("headers")&.except("X-Webhook-Signature")
+@@ -29,4 +84,90 @@ class Webhook::Delivery < ApplicationRecord
+   def succeeded?
+     completed? && response[:error].blank? && response[:code].between?(200, 299)
+   end
++
++  private
++    def build_payload
++      {
++        "event" => {
++          "id" => event.id,
++          "action" => event.action.to_s,
++          "created_at" => event.created_at.utc.iso8601(3),
++          "creator" => {
++            "id" => event.creator_id,
++            "name" => event.creator.name
++          },
++          "eventable" => {
++            "type" => event.eventable_type,
++            "id" => event.eventable_id,
++            "url" => eventable_url
++          },
++          "particulars" => event.api_particulars
++        },
++        "board" => {
++          "id" => event.board_id,
++          "name" => event.board.name
++        },
++        "webhook" => {
++          "id" => webhook.id,
++          "name" => webhook.name
++        }
++      }
++    end
++
++    def eventable_url
++      Rails.application.routes.url_helpers.polymorphic_url(event.eventable, host: host_for_url)
++    rescue StandardError
++      nil
++    end
++
++    def host_for_url
++      ENV.fetch("WEBHOOK_URL_HOST", "example.com")
++    end
++
++    def build_headers(body)
++      {
++        "Content-Type" => "application/json",
++        "User-Agent" => "fizzy/1.0.0 Webhook",
++        "X-Webhook-Signature" => signature_for(body),
++        "X-Webhook-Timestamp" => event.created_at.utc.iso8601
++      }
++    end
++
++    def signature_for(body)
++      OpenSSL::HMAC.hexdigest("SHA256", webhook.signing_secret, body)
++    end
++
++    def store_request(headers, body)
++      update! request: { "headers" => headers, "body" => body, "url" => webhook.url, "method" => "POST" }
++    end
++
++    def store_response(code:, headers:, body:, error:)
++      update! response: { "code" => code, "headers" => headers, "body" => truncated_body(body), "error" => error }
++    end
++
++    def truncated_body(body)
++      if body.is_a?(String) && body.bytesize > 10_000
++        body.byteslice(0, 10_000)
++      else
++        body
++      end
++    end
++
++    def post_webhook(headers, body)
++      uri = URI.parse(webhook.url)
++      http = Net::HTTP.new(uri.host, uri.port)
++      http.use_ssl = uri.scheme == "https"
++      http.open_timeout = REQUEST_TIMEOUT
++      http.read_timeout = REQUEST_TIMEOUT
++
++      request = Net::HTTP::Post.new(uri.request_uri, headers)
++      request.body = body
++
++      response = http.request(request)
++      [ response.code.to_i, response.to_hash, response.body ]
++    end
++
++    def error_class_for(error)
++      error.class.name.demodulize.underscore
++    end
+ end
+diff --git a/db/migrate/20260908000001_add_unique_index_to_webhook_deliveries.rb b/db/migrate/20260908000001_add_unique_index_to_webhook_deliveries.rb
+new file mode 100644
+index 0000000..d5d4609
+--- /dev/null
++++ b/db/migrate/20260908000001_add_unique_index_to_webhook_deliveries.rb
+@@ -0,0 +1,5 @@
++class AddUniqueIndexToWebhookDeliveries < ActiveRecord::Migration[8.2]
++  def change
++    add_index :webhook_deliveries, [ :webhook_id, :event_id ], unique: true
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 58218ff..2f44232 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_09_08_000001) do
+   create_table "accesses", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -841,6 +841,7 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.index ["account_id"], name: "index_webhook_deliveries_on_account_id"
+     t.index ["created_at"], name: "index_webhook_deliveries_on_created_at"
+     t.index ["event_id"], name: "index_webhook_deliveries_on_event_id"
++    t.index ["webhook_id", "event_id"], name: "index_webhook_deliveries_on_webhook_id_and_event_id", unique: true
+     t.index ["webhook_id"], name: "index_webhook_deliveries_on_webhook_id"
+   end
+ 
+diff --git a/db/schema_sqlite.rb b/db/schema_sqlite.rb
+index 9e4f050..8b5489d 100644
+--- a/db/schema_sqlite.rb
++++ b/db/schema_sqlite.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_09_08_000001) do
+   create_table "accesses", id: :uuid, force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -614,6 +614,7 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.index ["account_id"], name: "index_webhook_deliveries_on_account_id"
+     t.index ["created_at"], name: "index_webhook_deliveries_on_created_at"
+     t.index ["event_id"], name: "index_webhook_deliveries_on_event_id"
++    t.index ["webhook_id", "event_id"], name: "index_webhook_deliveries_on_webhook_id_and_event_id", unique: true
+     t.index ["webhook_id"], name: "index_webhook_deliveries_on_webhook_id"
+   end
+ 

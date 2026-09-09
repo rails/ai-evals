@@ -1,0 +1,393 @@
+diff --git a/app/models/card/entropic.rb b/app/models/card/entropic.rb
+index ebaad78..fa7f7ee 100644
+--- a/app/models/card/entropic.rb
++++ b/app/models/card/entropic.rb
+@@ -2,33 +2,50 @@ module Card::Entropic
+   extend ActiveSupport::Concern
+ 
+   included do
+-    scope :due_to_be_postponed, -> do
+-      active
+-        .joins(board: :account)
+-        .left_outer_joins(board: :entropy)
+-        .joins("LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.account_id = accounts.id AND account_entropies.container_type = 'Account' AND account_entropies.container_id = accounts.id")
+-        .where("last_active_at <= #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)')}", Time.now)
+-    end
+-
+-    scope :postponing_soon, -> do
+-      now = Time.now
+-      active
+-        .joins(board: :account)
+-        .left_outer_joins(board: :entropy)
+-        .joins("LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.account_id = accounts.id AND account_entropies.container_type = 'Account' AND account_entropies.container_id = accounts.id")
+-        .where("last_active_at > #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)')}", now)
+-        .where("last_active_at <= #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period) * 0.75')}", now)
+-    end
+-
+     delegate :auto_postpone_period, to: :board
+   end
+ 
+   class_methods do
++    # Hourly sweep, see config/recurring.yml.
+     def auto_postpone_all_due
+-      due_to_be_postponed.find_each do |card|
+-        card.auto_postpone(user: card.account.system_user)
++      Card::EntropySweep.run
++    end
++
++    def due_to_be_postponed
++      matching_entropy_periods do |period, now|
++        [ "last_active_at <= ?", now - period ]
+       end
+     end
++
++    def postponing_soon
++      matching_entropy_periods do |period, now|
++        [ "last_active_at > ? AND last_active_at <= ?", now - period, now - period * 0.75 ]
++      end
++    end
++
++    private
++      # Resolves the effective entropy period per board in Ruby -- a handful of
++      # rows -- instead of joining accounts and both entropy tables to COALESCE
++      # the period per card row. That computation couldn't use any index, so
++      # every run scanned and dated every card in the install.
++      def matching_entropy_periods
++        now = Time.current
++
++        entropy_periods_by_board_id.flat_map { |period, board_ids|
++          board_ids.each_slice(1000).map { |ids| active.where(board_id: ids).where(*yield(period, now)) }
++        }.reduce(:or) || none
++      end
++
++      def entropy_periods_by_board_id
++        account_periods = Entropy.where(container_type: "Account").pluck(:account_id, :auto_postpone_period).to_h
++        board_periods = Entropy.where(container_type: "Board").pluck(:container_id, :auto_postpone_period).to_h
++
++        Board.pluck(:id, :account_id).each_with_object(Hash.new { |h, k| h[k] = [] }) do |(board_id, account_id), periods|
++          if period = board_periods[board_id] || account_periods[account_id]
++            periods[period] << board_id
++          end
++        end
++      end
+   end
+ 
+   def entropy
+diff --git a/app/models/card/entropy_sweep.rb b/app/models/card/entropy_sweep.rb
+new file mode 100644
+index 0000000..f02e703
+--- /dev/null
++++ b/app/models/card/entropy_sweep.rb
+@@ -0,0 +1,169 @@
++# Set-based implementation of the hourly entropy sweep.
++#
++# Postponing cards one at a time costs dozens of queries per card -- triage
++# changes, not-now records, timeline events, system comments, watches, search
++# indexing, touches, broadcasts, webhook dispatch -- which stopped fitting in
++# the hourly window once installs grew past 100k cards. The sweep produces the
++# same user-visible outcome, but applies it a batch at a time: one transaction
++# per batch, bulk inserts for the history records, and a single refresh
++# broadcast per affected board instead of one per card.
++class Card::EntropySweep
++  BATCH_SIZE = 500
++
++  def self.run
++    new.run
++  end
++
++  def initialize
++    @system_user_ids = {}
++    @affected_board_ids = Set.new
++    @affected_account_ids = Set.new
++  end
++
++  def run
++    # Snapshot the due set up front: keyset-paginating the live relation makes
++    # every later batch re-scan the remaining due cards to re-sort them.
++    Card.due_to_be_postponed.pluck(:id).each_slice(BATCH_SIZE) do |ids|
++      postpone_batch(Card.where(id: ids).pluck(:id, :board_id, :account_id, :column_id))
++    end
++
++    broadcast_refreshes
++  end
++
++  private
++    attr_reader :system_user_ids, :affected_board_ids, :affected_account_ids
++
++    def postpone_batch(card_rows)
++      now = Time.current
++      event_rows = []
++
++      Card.transaction do
++        insert_not_now_records(card_rows, now)
++        card_rows.keep_if { |card_id, _, _, _| card_id.in?(postponed_card_ids(card_rows, now)) }
++
++        if card_rows.any?
++          Card::ActivitySpike.where(card_id: card_rows.map(&:first)).delete_all
++          Card.where(id: card_rows.map(&:first)).update_all(column_id: nil, last_active_at: now, updated_at: now)
++
++          event_rows = insert_event_records(card_rows, now)
++          insert_comment_records(card_rows, now)
++          ensure_system_user_watches(card_rows, now)
++
++          touch_columns(card_rows, now)
++          touch_boards(card_rows, now)
++
++          affected_board_ids.merge(card_rows.map(&:second))
++          affected_account_ids.merge(card_rows.map(&:third))
++        end
++      end
++
++      dispatch_webhook_jobs(event_rows)
++    end
++
++    def insert_not_now_records(card_rows, now)
++      Card::NotNow.insert_all(card_rows.map { |card_id, _, account_id, _|
++        { id: uuid, account_id: account_id, card_id: card_id, user_id: system_user_id_for(account_id), created_at: now, updated_at: now }
++      })
++    end
++
++    # Only cards whose not-now record was created by this sweep are processed
++    # further, so a card postponed by a user mid-batch doesn't get a duplicate
++    # auto-postpone event.
++    def postponed_card_ids(card_rows, now)
++      Card::NotNow.where(card_id: card_rows.map(&:first), created_at: now).pluck(:card_id).to_set
++    end
++
++    def insert_event_records(card_rows, now)
++      card_rows.map { |card_id, board_id, account_id, _|
++        { id: uuid, account_id: account_id, board_id: board_id, creator_id: system_user_id_for(account_id),
++          eventable_type: "Card", eventable_id: card_id, action: "card_auto_postponed", particulars: {},
++          created_at: now, updated_at: now }
++      }.tap { |rows| Event.insert_all!(rows) }
++    end
++
++    def insert_comment_records(card_rows, now)
++      comment_ids = {}
++
++      Comment.insert_all!(card_rows.map { |card_id, _, account_id, _|
++        { id: comment_ids[card_id] = uuid, account_id: account_id, card_id: card_id,
++          creator_id: system_user_id_for(account_id), created_at: now, updated_at: now }
++      })
++
++      ActionText::RichText.insert_all!(card_rows.map { |card_id, _, account_id, _|
++        { id: uuid, record_type: "Comment", record_id: comment_ids[card_id], name: "body",
++          body: comment_body, account_id: account_id, created_at: now, updated_at: now }
++      })
++
++      Search::Record.index_comments(card_rows.map { |card_id, board_id, account_id, _|
++        { account_id: account_id, board_id: board_id, card_id: card_id,
++          searchable_id: comment_ids[card_id], content: comment_plain_text, created_at: now }
++      })
++    end
++
++    def ensure_system_user_watches(card_rows, now)
++      pairs = card_rows.map { |card_id, _, account_id, _| [ card_id, system_user_id_for(account_id), account_id ] }.uniq { |card_id, user_id, _| [ card_id, user_id ] }
++      card_ids, user_ids = pairs.map(&:first).uniq, pairs.map(&:second).uniq
++
++      existing = Watch.where(card_id: card_ids, user_id: user_ids).pluck(:card_id, :user_id).to_set
++      missing = pairs.reject { |card_id, user_id, _| [ card_id, user_id ].in?(existing) }
++
++      if missing.any?
++        Watch.insert_all!(missing.map { |card_id, user_id, account_id|
++          { id: uuid, account_id: account_id, card_id: card_id, user_id: user_id, watching: true, created_at: now, updated_at: now }
++        })
++      end
++
++      Watch.where(card_id: card_ids, user_id: user_ids).update_all(watching: true, updated_at: now) if existing.any?
++    end
++
++    def touch_columns(card_rows, now)
++      column_ids = card_rows.map(&:fourth).compact
++      Column.where(id: column_ids).touch_all(time: now) if column_ids.any?
++    end
++
++    def touch_boards(card_rows, now)
++      Board.where(id: card_rows.map(&:second)).touch_all(time: now)
++    end
++
++    def dispatch_webhook_jobs(event_rows)
++      if event_rows.any? && webhook_board_ids.any?
++        dispatched = event_rows.select { |row| row[:board_id].in?(webhook_board_ids) }
++
++        if dispatched.any?
++          events = Event.where(id: dispatched.map { |row| row[:id] })
++          ActiveJob.perform_all_later(events.map { |event| Event::WebhookDispatchJob.new(event) })
++        end
++      end
++    end
++
++    def broadcast_refreshes
++      Board.where(id: affected_board_ids.to_a).find_each(&:broadcast_refresh_later)
++
++      Account.where(id: affected_account_ids.to_a).find_each do |account|
++        Turbo::StreamsChannel.broadcast_refresh_later_to(account, :all_boards)
++      end
++    end
++
++    def webhook_board_ids
++      @webhook_board_ids ||= Webhook.active.triggered_by_action("card_auto_postponed").distinct.pluck(:board_id).to_set
++    end
++
++    def system_user_id_for(account_id)
++      system_user_ids.fetch(account_id) do
++        system_user_ids[account_id] = User.where(account_id: account_id, role: :system).pick(:id) ||
++          raise("Account #{account_id} has no system user")
++      end
++    end
++
++    def comment_body
++      @comment_body ||= Card::Eventable::SystemCommenter.body_for("card_auto_postponed")
++    end
++
++    def comment_plain_text
++      @comment_plain_text ||= ActionText::Content.new(comment_body).to_plain_text
++    end
++
++    def uuid
++      ActiveRecord::Type::Uuid.generate
++    end
++end
+diff --git a/app/models/card/eventable/system_commenter.rb b/app/models/card/eventable/system_commenter.rb
+index 5c7defc..38cc826 100644
+--- a/app/models/card/eventable/system_commenter.rb
++++ b/app/models/card/eventable/system_commenter.rb
+@@ -3,6 +3,14 @@ class Card::Eventable::SystemCommenter
+ 
+   attr_reader :card, :event
+ 
++  class << self
++    # Body for actions whose comment doesn't interpolate event or card data,
++    # like card_auto_postponed. Lets the bulk entropy sweep reuse the wording.
++    def body_for(action)
++      new(nil, Event.new(action: action)).send(:comment_body)
++    end
++  end
++
+   def initialize(card, event)
+     @card, @event = card, event
+   end
+diff --git a/app/models/search/record.rb b/app/models/search/record.rb
+index 2aaff7c..a4f1483 100644
+--- a/app/models/search/record.rb
++++ b/app/models/search/record.rb
+@@ -20,6 +20,15 @@ class Search::Record < ApplicationRecord
+     def card_join
+       "INNER JOIN #{table_name} ON #{table_name}.card_id = cards.id"
+     end
++
++    # Bulk-indexes freshly created comments. The entropy sweep creates comments
++    # set-based, so per-record indexing callbacks never run for them.
++    def index_comments(rows)
++      rows.group_by { |row| self.for(row[:account_id]) }.each do |records, group|
++        records.insert_all!(group.map { |row| records.comment_index_row(row) })
++        records.sync_fts_for_comments(group.map { |row| row[:searchable_id] })
++      end
++    end
+   end
+ 
+   scope :for_query, ->(query, user:) do
+diff --git a/app/models/search/record/sqlite.rb b/app/models/search/record/sqlite.rb
+index 857e858..4ee2946 100644
+--- a/app/models/search/record/sqlite.rb
++++ b/app/models/search/record/sqlite.rb
+@@ -30,6 +30,20 @@ module Search::Record::SQLite
+     def for(account_id)
+       self
+     end
++
++    def comment_index_row(row)
++      row.merge(searchable_type: "Comment")
++    end
++
++    def sync_fts_for_comments(searchable_ids)
++      binds = searchable_ids.map { |id| ActiveRecord::Relation::QueryAttribute.new("searchable_id", id, type_for_attribute("searchable_id")) }
++
++      connection.exec_query(<<~SQL, "Search::Record FTS Comment Sync", binds)
++        INSERT INTO search_records_fts (rowid, title, content)
++        SELECT id, title, content FROM #{table_name}
++        WHERE searchable_type = 'Comment' AND searchable_id IN (#{binds.map { "?" }.join(", ")})
++      SQL
++    end
+   end
+ 
+   def card_title
+diff --git a/app/models/search/record/trilogy.rb b/app/models/search/record/trilogy.rb
+index 7705f3b..1e06ee2 100644
+--- a/app/models/search/record/trilogy.rb
++++ b/app/models/search/record/trilogy.rb
+@@ -19,6 +19,15 @@ module Search::Record::Trilogy
+         def self.name
+           "Search::Record"
+         end
++
++        def self.comment_index_row(row)
++          row.merge(searchable_type: "Comment", id: ActiveRecord::Type::Uuid.generate,
++            account_key: "account#{row[:account_id]}", content: Search::Stemmer.stem(row[:content]))
++        end
++
++        def self.sync_fts_for_comments(searchable_ids)
++          # MySQL FULLTEXT indexes the shard table itself; nothing to sync.
++        end
+       end
+     end.freeze
+   end
+diff --git a/lib/rails_ext/active_record_date_arithmetic.rb b/lib/rails_ext/active_record_date_arithmetic.rb
+deleted file mode 100644
+index 5121c3f..0000000
+--- a/lib/rails_ext/active_record_date_arithmetic.rb
++++ /dev/null
+@@ -1,53 +0,0 @@
+-# frozen_string_literal: true
+-
+-# Adds database-agnostic date arithmetic methods to ActiveRecord adapters.
+-# This allows code to perform date calculations without checking which database adapter is in use.
+-#
+-# Usage:
+-#   connection.date_subtract("created_at", "3600")
+-#   # MySQL/Trilogy: "DATE_SUB(created_at, INTERVAL 3600 SECOND)"
+-#   # SQLite: "datetime(created_at, '-' || (3600) || ' seconds')"
+-
+-# Module for MySQL-based adapters (Trilogy, Mysql2, etc.)
+-module MysqlDateArithmetic
+-  # Generates SQL for subtracting seconds from a date/time column in MySQL.
+-  #
+-  # @param date_column [String] The date/time column or expression
+-  # @param seconds_expression [String] SQL expression that evaluates to number of seconds
+-  # @return [String] MySQL DATE_SUB expression
+-  #
+-  # Example:
+-  #   date_subtract("last_active_at", "COALESCE(auto_postpone_period, 3600)")
+-  #   # => "DATE_SUB(last_active_at, INTERVAL COALESCE(auto_postpone_period, 3600) SECOND)"
+-  def date_subtract(date_column, seconds_expression)
+-    "DATE_SUB(#{date_column}, INTERVAL #{seconds_expression} SECOND)"
+-  end
+-end
+-
+-# Module for SQLite adapter
+-module SqliteDateArithmetic
+-  # Generates SQL for subtracting seconds from a date/time column in SQLite.
+-  #
+-  # @param date_column [String] The date/time column or expression
+-  # @param seconds_expression [String] SQL expression that evaluates to number of seconds
+-  # @return [String] SQLite datetime expression
+-  #
+-  # Example:
+-  #   date_subtract("last_active_at", "COALESCE(auto_postpone_period, 3600)")
+-  #   # => "datetime(last_active_at, '-' || (COALESCE(auto_postpone_period, 3600)) || ' seconds')"
+-  def date_subtract(date_column, seconds_expression)
+-    "datetime(#{date_column}, '-' || (#{seconds_expression}) || ' seconds')"
+-  end
+-end
+-
+-ActiveSupport.on_load(:active_record) do
+-  # Prepend MySQL date arithmetic to AbstractMysqlAdapter (covers Trilogy, Mysql2, etc.)
+-  if defined?(ActiveRecord::ConnectionAdapters::AbstractMysqlAdapter)
+-    ActiveRecord::ConnectionAdapters::AbstractMysqlAdapter.prepend(MysqlDateArithmetic)
+-  end
+-
+-  # Prepend SQLite date arithmetic to SQLite3Adapter
+-  if defined?(ActiveRecord::ConnectionAdapters::SQLite3Adapter)
+-    ActiveRecord::ConnectionAdapters::SQLite3Adapter.prepend(SqliteDateArithmetic)
+-  end
+-end
