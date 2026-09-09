@@ -1,0 +1,342 @@
+diff --git a/app/jobs/event/webhook_dispatch_job.rb b/app/jobs/event/webhook_dispatch_job.rb
+new file mode 100644
+index 0000000..96f01ba
+--- /dev/null
++++ b/app/jobs/event/webhook_dispatch_job.rb
+@@ -0,0 +1,18 @@
++require "active_job/continuable"
++
++class Event::WebhookDispatchJob < ApplicationJob
++  include ActiveJob::Continuable
++
++  queue_as :webhooks
++
++  discard_on ActiveJob::DeserializationError
++
++  def perform(event)
++    step :dispatch do |step|
++      Webhook.active.triggered_by(event).find_each(start: step.cursor) do |webhook|
++        webhook.trigger(event)
++        step.advance! from: webhook.id
++      end
++    end
++  end
++end
+diff --git a/app/jobs/webhook/delivery_job.rb b/app/jobs/webhook/delivery_job.rb
+new file mode 100644
+index 0000000..a6e3249
+--- /dev/null
++++ b/app/jobs/webhook/delivery_job.rb
+@@ -0,0 +1,9 @@
++class Webhook::DeliveryJob < ApplicationJob
++  queue_as :webhooks
++
++  discard_on ActiveJob::DeserializationError
++
++  def perform(delivery)
++    delivery.deliver
++  end
++end
+diff --git a/app/models/event.rb b/app/models/event.rb
+index 5c85165..2349532 100644
+--- a/app/models/event.rb
++++ b/app/models/event.rb
+@@ -24,6 +24,7 @@ class Event < ApplicationRecord
+   }
+ 
+   after_create -> { eventable.event_was_created(self) }
++  after_create_commit :dispatch_webhooks
+ 
+   delegate :card, to: :eventable
+ 
+@@ -38,4 +39,9 @@ class Event < ApplicationRecord
+   def description_for(user)
+     Event::Description.new(self, user)
+   end
++
++  private
++    def dispatch_webhooks
++      Event::WebhookDispatchJob.perform_later(self)
++    end
+ end
+diff --git a/app/models/webhook.rb b/app/models/webhook.rb
+index 5ecb714..f008aa9 100644
+--- a/app/models/webhook.rb
++++ b/app/models/webhook.rb
+@@ -1,4 +1,6 @@
+ class Webhook < ApplicationRecord
++  include Triggerable
++
+   SLACK_WEBHOOK_URL_REGEX = %r{//hooks\.slack\.com/services/T[^\/]+/B[^\/]+/[^\/]+\Z}i
+   CAMPFIRE_WEBHOOK_URL_REGEX = %r{/rooms/\d+/\d+-[^\/]+/messages\Z}i
+   BASECAMP_CAMPFIRE_WEBHOOK_URL_REGEX = %r{/\d+/integrations/[^\/]+/buckets/\d+/chats/\d+/lines\Z}i
+@@ -21,6 +23,7 @@ class Webhook < ApplicationRecord
+   has_secure_token :signing_secret
+ 
+   has_many :deliveries, dependent: :delete_all
++  has_one :delinquency_tracker, dependent: :delete
+ 
+   belongs_to :account, default: -> { board.account }
+   belongs_to :board
+@@ -30,6 +33,8 @@ class Webhook < ApplicationRecord
+   scope :ordered, -> { order(name: :asc, id: :desc) }
+   scope :active, -> { where(active: true) }
+ 
++  after_create :create_delinquency_tracker!
++
+   normalizes :subscribed_actions, with: ->(value) { Array.wrap(value).map(&:to_s).uniq & PERMITTED_ACTIONS }
+   normalizes :url, with: -> { it.strip }
+ 
+@@ -44,6 +49,10 @@ class Webhook < ApplicationRecord
+     update! active: false
+   end
+ 
++  def renderer
++    @renderer ||= ApplicationController.renderer.new(script_name: account.slug, https: !Rails.env.local?)
++  end
++
+   def for_basecamp?
+     url.match? BASECAMP_CAMPFIRE_WEBHOOK_URL_REGEX
+   end
+diff --git a/app/models/webhook/delinquency_tracker.rb b/app/models/webhook/delinquency_tracker.rb
+new file mode 100644
+index 0000000..df6df70
+--- /dev/null
++++ b/app/models/webhook/delinquency_tracker.rb
+@@ -0,0 +1,43 @@
++class Webhook::DelinquencyTracker < ApplicationRecord
++  DELINQUENCY_THRESHOLD = 10
++  DELINQUENCY_DURATION = 1.hour
++
++  belongs_to :account, default: -> { webhook.account }
++  belongs_to :webhook
++
++  def record_delivery_of(delivery)
++    if delivery.succeeded?
++      reset
++    else
++      mark_first_failure_time if consecutive_failures_count.zero?
++      increment!(:consecutive_failures_count, touch: true)
++
++      webhook.deactivate if delinquent?
++    end
++  end
++
++  private
++    def reset
++      update_columns consecutive_failures_count: 0, first_failure_at: nil
++    end
++
++    def mark_first_failure_time
++      update_columns first_failure_at: Time.current
++    end
++
++    def delinquent?
++      failing_for_too_long? && too_many_consecutive_failures?
++    end
++
++    def failing_for_too_long?
++      if first_failure_at
++        first_failure_at.before?(DELINQUENCY_DURATION.ago)
++      else
++        false
++      end
++    end
++
++    def too_many_consecutive_failures?
++      consecutive_failures_count >= DELINQUENCY_THRESHOLD
++    end
++end
+diff --git a/app/models/webhook/delivery.rb b/app/models/webhook/delivery.rb
+index 4ecfeb8..8d4cb18 100644
+--- a/app/models/webhook/delivery.rb
++++ b/app/models/webhook/delivery.rb
+@@ -1,4 +1,13 @@
+ class Webhook::Delivery < ApplicationRecord
++  include Rails.application.routes.url_helpers
++
++  class ResponseTooLarge < StandardError; end
++
++  STALE_TRESHOLD = 7.days
++  USER_AGENT = "fizzy/1.0.0 Webhook"
++  ENDPOINT_TIMEOUT = 7.seconds
++  MAX_RESPONSE_SIZE = 100.kilobytes
++
+   belongs_to :account, default: -> { webhook.account }
+   belongs_to :webhook
+   belongs_to :event
+@@ -9,6 +18,31 @@ class Webhook::Delivery < ApplicationRecord
+   enum :state, %w[ pending in_progress completed errored ].index_by(&:itself), default: :pending
+ 
+   scope :ordered, -> { order created_at: :desc, id: :desc }
++  scope :stale, -> { where(created_at: ...STALE_TRESHOLD.ago) }
++
++  after_create_commit :deliver_later
++
++  def self.cleanup(batch_size: 500, pause: 0.1)
++    sleep pause until stale.limit(batch_size).delete_all.zero?
++  end
++
++  def deliver_later
++    Webhook::DeliveryJob.perform_later(self)
++  end
++
++  def deliver
++    in_progress!
++
++    self.request[:headers] = headers
++    self.response = perform_request
++    self.state = :completed
++    save!
++
++    webhook.delinquency_tracker.record_delivery_of(self)
++  rescue
++    errored!
++    raise
++  end
+ 
+   def sanitized_request
+     if headers = request&.dig("headers")&.except("X-Webhook-Signature")
+@@ -29,4 +63,124 @@ class Webhook::Delivery < ApplicationRecord
+   def succeeded?
+     completed? && response[:error].blank? && response[:code].between?(200, 299)
+   end
++
++  private
++    def perform_request
++      if resolved_ip.nil?
++        { error: :private_uri }
++      else
++        request = Net::HTTP::Post.new(uri, headers).tap { |request| request.body = payload }
++
++        response = http.request(request) do |net_http_response|
++          stream_body_with_limit(net_http_response)
++        end
++
++        { code: response.code.to_i }
++      end
++    rescue ResponseTooLarge
++      { error: :response_too_large }
++    rescue Resolv::ResolvTimeout, Resolv::ResolvError, SocketError
++      { error: :dns_lookup_failed }
++    rescue Net::OpenTimeout, Net::ReadTimeout, Errno::ETIMEDOUT
++      { error: :connection_timeout }
++    rescue Errno::ECONNREFUSED, Errno::EHOSTUNREACH, Errno::ECONNRESET, Errno::EPERM
++      { error: :destination_unreachable }
++    rescue OpenSSL::SSL::SSLError
++      { error: :failed_tls }
++    end
++
++    def stream_body_with_limit(response)
++      bytes_read = 0
++      response.read_body do |chunk|
++        bytes_read += chunk.bytesize
++        raise ResponseTooLarge if bytes_read > MAX_RESPONSE_SIZE
++      end
++    end
++
++    def resolved_ip
++      return @resolved_ip if defined?(@resolved_ip)
++      @resolved_ip = SsrfProtection.resolve_public_ip(uri.host)
++    end
++
++    def uri
++      @uri ||= URI(webhook.url)
++    end
++
++    def http
++      Net::HTTP.new(uri.host, uri.port).tap do |http|
++        http.ipaddr = resolved_ip
++        http.use_ssl = (uri.scheme == "https")
++        http.open_timeout = ENDPOINT_TIMEOUT
++        http.read_timeout = ENDPOINT_TIMEOUT
++      end
++    end
++
++    def headers
++      {
++        "User-Agent" => USER_AGENT,
++        "Content-Type" => content_type,
++        "X-Webhook-Signature" => signature,
++        "X-Webhook-Timestamp" => event.created_at.utc.iso8601
++      }
++    end
++
++    def signature
++      OpenSSL::HMAC.hexdigest("SHA256", webhook.signing_secret, payload)
++    end
++
++    def content_type
++      if webhook.for_campfire?
++        "text/html"
++      elsif webhook.for_basecamp?
++        "application/x-www-form-urlencoded"
++      else
++        "application/json"
++      end
++    end
++
++    def payload
++      @payload ||= if webhook.for_basecamp?
++        { content: render_payload(formats: :html) }.to_query
++      elsif webhook.for_campfire?
++        render_payload(formats: :html)
++      elsif webhook.for_slack?
++        slack_payload
++      else
++        render_payload(formats: :json)
++      end
++    end
++
++    def render_payload(**options)
++      webhook.renderer.render(layout: false, template: "webhooks/event", assigns: { event: event }, **options).strip
++    end
++
++    def convert_html_to_mrkdwn(html)
++      document = Nokogiri::HTML5(html)
++
++      document.css("a").each do |a|
++        a.replace("<#{a["href"].strip}|#{a.text}>") if a["href"].present?
++      end
++
++      document.css("b").each do |b|
++        b.replace("*#{b.text}*")
++      end
++
++      document.css("i").each do |i|
++        i.replace("_#{i.text}_")
++      end
++
++      document.text
++    end
++
++    def slack_payload
++      text = event.description_for(nil).to_plain_text
++      url = polymorphic_url(event.eventable, base_url_options.merge(script_name: account.slug))
++
++      { text: "#{text} <#{url}|Open in Fizzy>" }.to_json
++    end
++
++    def base_url_options
++      Rails.application.routes.default_url_options.presence ||
++        Rails.application.config.action_mailer.default_url_options
++    end
+ end
+diff --git a/app/models/webhook/triggerable.rb b/app/models/webhook/triggerable.rb
+new file mode 100644
+index 0000000..d90ecfb
+--- /dev/null
++++ b/app/models/webhook/triggerable.rb
+@@ -0,0 +1,12 @@
++module Webhook::Triggerable
++  extend ActiveSupport::Concern
++
++  included do
++    scope :triggered_by, ->(event) { where(board: event.board).triggered_by_action(event.action) }
++    scope :triggered_by_action, ->(action) { where("subscribed_actions LIKE ?", "%\"#{action}\"%") }
++  end
++
++  def trigger(event)
++    deliveries.find_or_create_by!(event: event) unless account.cancelled?
++  end
++end
