@@ -1,4 +1,4 @@
-require "/app/test/test_helper"
+require "test_helper"
 
 class VerifierTest < ActionDispatch::IntegrationTest
   ORIGINAL_PNG = Tempfile.new([ "diagram", ".png" ]).tap do |file|

@@ -1,4 +1,4 @@
-require "/app/test/test_helper"
+require "test_helper"
 
 class VerifierTenant < ActiveRecord::Base
   self.table_name = "tenants"

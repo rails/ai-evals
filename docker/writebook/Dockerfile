@@ -33,8 +33,10 @@ RUN set -eu; \
     [ -z "$(find "$checkout" -mindepth 2 -maxdepth 2 -type d -name test -print -quit)" ] \
     || { echo "rails checkout strip incomplete in $checkout" >&2; exit 1; }
 
+# Do not bake Bootsnap or other runtime artifacts from the upstream source into task sandboxes.
 RUN RAILS_ENV=test ./bin/rails db:prepare && \
-    rm -f log/*.log tmp/local_secret.txt
+    rm -rf tmp && \
+    rm -f log/*.log
 
 # A fresh one-commit repo: the agent's working tree, and the git-apply context
 # for seeds and solutions. Seeded tasks get resealed again by the harness.
