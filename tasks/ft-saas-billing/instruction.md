@@ -14,10 +14,7 @@ metadata:
 setup:
 - bin/rails db:test:prepare
 restore:
-- saas/test
-- test
 - bin
-- config/environments/test.rb
 ---
 Hosted Fizzy is going paid. Add billing.
 
