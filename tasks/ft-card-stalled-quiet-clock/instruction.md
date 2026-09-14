@@ -13,6 +13,8 @@ metadata:
   category: full-features
 setup:
 - bin/rails db:test:prepare
+restore:
+- bin
 ---
 Some cards get a burst of attention and then go cold. We want to flag those.
 

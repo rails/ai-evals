@@ -11,6 +11,8 @@ tags:
 - serialization
 metadata:
   category: full-features
+restore:
+- bin
 ---
 Cards, comments, boards, and other resources are available through the API, but
 account activity is only available in the HTML timeline. Add
