@@ -1,0 +1,356 @@
+diff --git a/app/jobs/card/auto_postpone_due_job.rb b/app/jobs/card/auto_postpone_due_job.rb
+new file mode 100644
+index 0000000..f2c049c
+--- /dev/null
++++ b/app/jobs/card/auto_postpone_due_job.rb
+@@ -0,0 +1,9 @@
++class Card::AutoPostponeDueJob < ApplicationJob
++  # A sweep that's still running when the next one is scheduled only makes things worse, and
++  # there's nothing to catch up on: the cards it didn't get to are still due on the next run.
++  limits_concurrency to: 1, key: :auto_postpone_due_cards, on_conflict: :discard
++
++  def perform
++    Card.auto_postpone_all_due
++  end
++end
+diff --git a/app/models/account/entropic.rb b/app/models/account/entropic.rb
+index b1303e0..723afa4 100644
+--- a/app/models/account/entropic.rb
++++ b/app/models/account/entropic.rb
+@@ -2,9 +2,31 @@ module Account::Entropic
+   extend ActiveSupport::Concern
+ 
+   DEFAULT_ENTROPY_PERIOD = 30.days
++  POSTPONING_BATCH_SIZE = 1_000
+ 
+   included do
+     has_one :entropy, as: :container, dependent: :destroy
+     after_create -> { create_entropy!(auto_postpone_period: DEFAULT_ENTROPY_PERIOD, account: self) }
+   end
++
++  # Collects the cards that have exhausted their entropy period once, and then works through them
++  # by id: batching the lookup itself would run it again for every thousand cards postponed.
++  # Reading each batch back through the same scope leaves behind the cards that stopped being due
++  # in the meantime, and preloading it spares the postponements a few queries per card.
++  def auto_postpone_due_cards
++    postponer = nil
++    due_cards = cards.due_to_be_postponed(periods: auto_postpone_periods)
++      .preload(:board, :column, :closure, :not_now, :activity_spike)
++
++    due_cards.ids.each_slice(POSTPONING_BATCH_SIZE) do |ids|
++      due_cards.where(id: ids).each do |card|
++        card.auto_postpone(user: postponer ||= system_user)
++      end
++    end
++  end
++
++  # The entropy periods this account runs on: its own, plus the ones its boards override it with.
++  def auto_postpone_periods
++    entropies.auto_postpone_periods
++  end
+ end
+diff --git a/app/models/card/entropic.rb b/app/models/card/entropic.rb
+index ebaad78..d6941bb 100644
+--- a/app/models/card/entropic.rb
++++ b/app/models/card/entropic.rb
+@@ -1,23 +1,41 @@
+ module Card::Entropic
+   extend ActiveSupport::Concern
+ 
++  # Share of its entropy period a card has to spend inactive before its postponement is announced.
++  POSTPONING_SOON_SHARE = 0.75...1
++
++  # The entropy period a card runs on: the one configured for its board, or its account's.
++  ENTROPY_PERIOD = "COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)"
++
+   included do
+-    scope :due_to_be_postponed, -> do
+-      active
+-        .joins(board: :account)
++    scope :with_entropies, -> do
++      joins(:board)
+         .left_outer_joins(board: :entropy)
+-        .joins("LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.account_id = accounts.id AND account_entropies.container_type = 'Account' AND account_entropies.container_id = accounts.id")
+-        .where("last_active_at <= #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)')}", Time.now)
++        .joins("LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.container_type = 'Account' AND account_entropies.container_id = boards.account_id")
+     end
+ 
+-    scope :postponing_soon, -> do
+-      now = Time.now
+-      active
+-        .joins(board: :account)
+-        .left_outer_joins(board: :entropy)
+-        .joins("LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.account_id = accounts.id AND account_entropies.container_type = 'Account' AND account_entropies.container_id = accounts.id")
+-        .where("last_active_at > #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)')}", now)
+-        .where("last_active_at <= #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period) * 0.75')}", now)
++    # Cards running on +period+ that have spent the given +shares+ of it inactive: (1..) for the
++    # ones that have already exhausted it, (0.75...1) for the ones three quarters through it.
++    #
++    # Comparing +last_active_at+ with timestamps worked out upfront -- instead of with a deadline
++    # the database has to derive for every row -- is what keeps these lookups indexable.
++    scope :inactive_for, ->(shares, of:, now: Time.now) do
++      with_entropies
++        .where("#{ENTROPY_PERIOD} = ?", of)
++        .where(last_active_at: ..(now - of * shares.begin))
++        .then { |cards| shares.end ? cards.where("cards.last_active_at > ?", now - of * shares.end) : cards }
++    end
++
++    # Cards that have exhausted their entropy period. Sweeping a single account can narrow
++    # +periods+ down to the ones it configures, so that its deadlines aren't dragged back by the
++    # shortest period some other account happens to use.
++    scope :due_to_be_postponed, ->(periods: Entropy.auto_postpone_periods) do
++      inactive_for_their_entropy_period(1.., periods: periods)
++    end
++
++    # Cards that are three quarters of the way through their entropy period.
++    scope :postponing_soon, ->(periods: Entropy.auto_postpone_periods) do
++      inactive_for_their_entropy_period(POSTPONING_SOON_SHARE, periods: periods)
+     end
+ 
+     delegate :auto_postpone_period, to: :board
+@@ -25,8 +43,21 @@ module Card::Entropic
+ 
+   class_methods do
+     def auto_postpone_all_due
+-      due_to_be_postponed.find_each do |card|
+-        card.auto_postpone(user: card.account.system_user)
++      Account.find_each do |account|
++        account.auto_postpone_due_cards
++      end
++    end
++
++    # Cards inactive for the given shares of whichever entropy period they run on. Only a handful
++    # of periods are ever in play -- one per account, plus the boards overriding it -- so we ask
++    # for every one of them at once, bounded by the earliest deadline any of them can produce.
++    def inactive_for_their_entropy_period(shares, periods:, now: Time.now)
++      if periods.any?
++        periods.map { |period| active.inactive_for(shares, of: period, now: now) }
++          .reduce(:or)
++          .where(last_active_at: ..(now - periods.min * shares.begin))
++      else
++        none
+       end
+     end
+   end
+diff --git a/app/models/entropy.rb b/app/models/entropy.rb
+index c896fc4..23518af 100644
+--- a/app/models/entropy.rb
++++ b/app/models/entropy.rb
+@@ -10,6 +10,14 @@ class Entropy < ApplicationRecord
+ 
+   after_commit -> { container.cards.touch_all if container }
+ 
++  class << self
++    # The distinct periods configured across accounts and boards. There are only a handful of
++    # them, which is what lets us turn entropy deadlines into plain timestamp comparisons.
++    def auto_postpone_periods
++      distinct.pluck(:auto_postpone_period)
++    end
++  end
++
+   def auto_postpone_period_in_days
+     days = auto_postpone_period / 1.day.to_i
+ 
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 894c57b..61bd65c 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -8,7 +8,7 @@ production: &production
+ 
+   # Application cleanup
+   auto_postpone_all_due:
+-    command: "Card.auto_postpone_all_due"
++    class: Card::AutoPostponeDueJob
+     schedule: every hour at minute 50
+   delete_unused_tags:
+     class: DeleteUnusedTagsJob
+diff --git a/lib/rails_ext/active_record_date_arithmetic.rb b/lib/rails_ext/active_record_date_arithmetic.rb
+deleted file mode 100644
+index 5121c3f..0000000
+--- a/lib/rails_ext/active_record_date_arithmetic.rb
++++ /dev/null
+@@ -1,53 +0,0 @@
+-# frozen_string_literal: true
+-
+-# Adds database-agnostic date arithmetic methods to ActiveRecord adapters.
+-# This allows code to perform date calculations without checking which database adapter is in use.
+-#
+-# Usage:
+-#   connection.date_subtract("created_at", "3600")
+-#   # MySQL/Trilogy: "DATE_SUB(created_at, INTERVAL 3600 SECOND)"
+-#   # SQLite: "datetime(created_at, '-' || (3600) || ' seconds')"
+-
+-# Module for MySQL-based adapters (Trilogy, Mysql2, etc.)
+-module MysqlDateArithmetic
+-  # Generates SQL for subtracting seconds from a date/time column in MySQL.
+-  #
+-  # @param date_column [String] The date/time column or expression
+-  # @param seconds_expression [String] SQL expression that evaluates to number of seconds
+-  # @return [String] MySQL DATE_SUB expression
+-  #
+-  # Example:
+-  #   date_subtract("last_active_at", "COALESCE(auto_postpone_period, 3600)")
+-  #   # => "DATE_SUB(last_active_at, INTERVAL COALESCE(auto_postpone_period, 3600) SECOND)"
+-  def date_subtract(date_column, seconds_expression)
+-    "DATE_SUB(#{date_column}, INTERVAL #{seconds_expression} SECOND)"
+-  end
+-end
+-
+-# Module for SQLite adapter
+-module SqliteDateArithmetic
+-  # Generates SQL for subtracting seconds from a date/time column in SQLite.
+-  #
+-  # @param date_column [String] The date/time column or expression
+-  # @param seconds_expression [String] SQL expression that evaluates to number of seconds
+-  # @return [String] SQLite datetime expression
+-  #
+-  # Example:
+-  #   date_subtract("last_active_at", "COALESCE(auto_postpone_period, 3600)")
+-  #   # => "datetime(last_active_at, '-' || (COALESCE(auto_postpone_period, 3600)) || ' seconds')"
+-  def date_subtract(date_column, seconds_expression)
+-    "datetime(#{date_column}, '-' || (#{seconds_expression}) || ' seconds')"
+-  end
+-end
+-
+-ActiveSupport.on_load(:active_record) do
+-  # Prepend MySQL date arithmetic to AbstractMysqlAdapter (covers Trilogy, Mysql2, etc.)
+-  if defined?(ActiveRecord::ConnectionAdapters::AbstractMysqlAdapter)
+-    ActiveRecord::ConnectionAdapters::AbstractMysqlAdapter.prepend(MysqlDateArithmetic)
+-  end
+-
+-  # Prepend SQLite date arithmetic to SQLite3Adapter
+-  if defined?(ActiveRecord::ConnectionAdapters::SQLite3Adapter)
+-    ActiveRecord::ConnectionAdapters::SQLite3Adapter.prepend(SqliteDateArithmetic)
+-  end
+-end
+diff --git a/test/jobs/card/auto_postpone_due_job_test.rb b/test/jobs/card/auto_postpone_due_job_test.rb
+new file mode 100644
+index 0000000..c7b33ea
+--- /dev/null
++++ b/test/jobs/card/auto_postpone_due_job_test.rb
+@@ -0,0 +1,22 @@
++require "test_helper"
++
++class Card::AutoPostponeDueJobTest < ActiveJob::TestCase
++  test "postpones the cards that have exhausted their entropy period" do
++    cards(:logo).update!(last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period)
++    cards(:shipping).update!(last_active_at: 1.day.from_now - entropies(:writebook_board).auto_postpone_period)
++
++    assert_difference -> { Card.postponed.count }, +1 do
++      Card::AutoPostponeDueJob.perform_now
++    end
++
++    assert cards(:logo).reload.postponed?
++    assert_not cards(:shipping).reload.postponed?
++  end
++
++  test "a sweep that is still running discards the next one" do
++    # limits_concurrency is a Solid Queue feature, so we can only check how it's configured here.
++    assert_equal 1, Card::AutoPostponeDueJob.concurrency_limit
++    assert_equal :discard, Card::AutoPostponeDueJob.concurrency_on_conflict
++    assert Card::AutoPostponeDueJob.new.concurrency_key.present?
++  end
++end
+diff --git a/test/models/account/entropic_test.rb b/test/models/account/entropic_test.rb
+new file mode 100644
+index 0000000..ac1b031
+--- /dev/null
++++ b/test/models/account/entropic_test.rb
+@@ -0,0 +1,32 @@
++require "test_helper"
++
++class Account::EntropicTest < ActiveSupport::TestCase
++  setup do
++    Current.session = sessions(:david)
++  end
++
++  test "postpones the cards that have exhausted their entropy period" do
++    cards(:logo).update!(last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period)
++    cards(:shipping).update!(last_active_at: 1.day.from_now - entropies(:writebook_board).auto_postpone_period)
++
++    accounts("37s").auto_postpone_due_cards
++
++    assert cards(:logo).reload.postponed?
++    assert_equal accounts("37s").system_user, cards(:logo).postponed_by
++    assert_not cards(:shipping).reload.postponed?
++  end
++
++  test "leaves the cards of other accounts alone" do
++    cards(:radio).update!(last_active_at: 1.day.ago - entropies(:miltons_wish_list_board).auto_postpone_period)
++
++    accounts("37s").auto_postpone_due_cards
++
++    assert_not cards(:radio).reload.postponed?
++  end
++
++  test "postpones nothing, and needs no system user, when no card is due" do
++    assert_no_difference -> { Card.postponed.count } do
++      accounts(:acme).auto_postpone_due_cards
++    end
++  end
++end
+diff --git a/test/models/card/entropic_test.rb b/test/models/card/entropic_test.rb
+index 848cfa7..e5ba2d9 100644
+--- a/test/models/card/entropic_test.rb
++++ b/test/models/card/entropic_test.rb
+@@ -85,4 +85,41 @@ class Card::EntropicTest < ActiveSupport::TestCase
+ 
+     assert_equal(cards(:logo, :radio).to_set, Card.postponing_soon.to_set)
+   end
++
++  test "cards are looked up without working out a deadline for every row" do
++    [ Card.due_to_be_postponed, Card.postponing_soon ].each do |scope|
++      assert_no_match(/datetime\(|DATE_SUB/, scope.to_sql, "Entropy deadlines should be worked out upfront, not per row")
++    end
++  end
++
++  test "auto postpone all due honors periods that are not one of the preset options" do
++    entropies(:writebook_board).update_column(:auto_postpone_period, 999.days.to_i)
++
++    cards(:logo).update!(last_active_at: 1000.days.ago)
++    cards(:shipping).update!(last_active_at: 998.days.ago)
++
++    Card.auto_postpone_all_due
++
++    assert cards(:logo).reload.postponed?
++    assert_not cards(:shipping).reload.postponed?
++  end
++
++  test "no cards are due when no entropy is configured at all" do
++    Entropy.delete_all
++
++    assert_empty Card.due_to_be_postponed
++    assert_empty Card.postponing_soon
++  end
++
++  test "auto postpone all due looks the cards up once per account, however many it postpones" do
++    cards(:logo, :layout, :text).each do |card|
++      card.update!(last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period)
++    end
++
++    assert_queries_match(/SELECT [`"]cards[`"].[`"]id[`"] FROM [`"]cards[`"]/, count: Account.joins(:entropies).distinct.count) do
++      Card.auto_postpone_all_due
++    end
++
++    assert cards(:logo, :layout, :text).all? { |card| card.reload.postponed? }
++  end
+ end
+diff --git a/test/models/entropy_test.rb b/test/models/entropy_test.rb
+index 98abb0a..b81eb6b 100644
+--- a/test/models/entropy_test.rb
++++ b/test/models/entropy_test.rb
+@@ -25,4 +25,14 @@ class Entropy::Test < ActiveSupport::TestCase
+       boards(:writebook).entropy.update!(auto_postpone_period: 7.days)
+     end
+   end
++
++  test "auto postpone periods lists the ones configured across accounts and boards" do
++    assert_equal Entropy.pluck(:auto_postpone_period).uniq.sort, Entropy.auto_postpone_periods.sort
++  end
++
++  test "auto postpone periods includes values that are not one of the preset options" do
++    entropies(:writebook_board).update_column(:auto_postpone_period, 999.days.to_i)
++
++    assert_includes Entropy.auto_postpone_periods, 999.days.to_i
++  end
+ end
