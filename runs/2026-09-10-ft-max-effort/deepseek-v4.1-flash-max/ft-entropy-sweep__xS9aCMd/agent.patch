@@ -1,0 +1,266 @@
+diff --git a/app/jobs/card/auto_postpone_all_due_job.rb b/app/jobs/card/auto_postpone_all_due_job.rb
+new file mode 100644
+index 0000000..cf60c70
+--- /dev/null
++++ b/app/jobs/card/auto_postpone_all_due_job.rb
+@@ -0,0 +1,2 @@
++class Card::AutoPostponeAllDueJob < Card::AutoPostponeDueJob
++end
+diff --git a/app/jobs/card/auto_postpone_due_job.rb b/app/jobs/card/auto_postpone_due_job.rb
+new file mode 100644
+index 0000000..b17f465
+--- /dev/null
++++ b/app/jobs/card/auto_postpone_due_job.rb
+@@ -0,0 +1,14 @@
++require "active_job/continuable"
++
++class Card::AutoPostponeDueJob < ApplicationJob
++  include ActiveJob::Continuable
++
++  queue_as :backend
++
++  def perform
++    step :postpone do |step|
++      Card.auto_postpone_all_due
++      step.checkpoint!
++    end
++  end
++end
+diff --git a/app/models/card/entropic.rb b/app/models/card/entropic.rb
+index ebaad78..9ba9b97 100644
+--- a/app/models/card/entropic.rb
++++ b/app/models/card/entropic.rb
+@@ -1,6 +1,10 @@
+ module Card::Entropic
+   extend ActiveSupport::Concern
+ 
++  AUTO_POSTPONE_BATCH_SIZE = 1000
++  AUTO_POSTPONE_COMMENT_BODY = "<strong>Moved</strong> to “Not Now” due to inactivity"
++  AUTO_POSTPONE_COMMENT_TEXT = "Moved to “Not Now” due to inactivity"
++
+   included do
+     scope :due_to_be_postponed, -> do
+       active
+@@ -24,11 +28,206 @@ module Card::Entropic
+   end
+ 
+   class_methods do
+-    def auto_postpone_all_due
+-      due_to_be_postponed.find_each do |card|
+-        card.auto_postpone(user: card.account.system_user)
++    # Auto postponing used to run the full card-level callbacks for every due
++    # card. That issues dozens of queries per card, which doesn't scale: on an
++    # install with 100k+ cards, the hourly sweep can't finish inside its hour.
++    #
++    # Instead, process due cards in batches and write the records they need in
++    # bulk. The resulting records match the ones produced by Card#auto_postpone.
++    def auto_postpone_all_due(batch_size: AUTO_POSTPONE_BATCH_SIZE)
++      due_to_be_postponed.in_batches(of: batch_size) do |batch|
++        auto_postpone_batch batch.pluck(:id, :account_id, :board_id)
+       end
+     end
++
++    private
++      def auto_postpone_batch(cards)
++        return if cards.empty?
++
++        now = Time.current
++        card_ids = cards.map(&:first)
++        board_ids = cards.map { |_, _, board_id| board_id }.uniq
++        system_user_ids = system_user_ids_for(cards)
++
++        events = build_auto_postpone_events(cards, system_user_ids, now)
++        comments = build_auto_postpone_comments(cards, system_user_ids, now)
++
++        transaction do
++          Card::ActivitySpike.where(card_id: card_ids).delete_all
++
++          Card.where(id: card_ids).update_all(column_id: nil, last_active_at: now, updated_at: now)
++          Board.where(id: board_ids).update_all(updated_at: now)
++
++          Card::NotNow.insert_all build_not_nows(cards, system_user_ids, now)
++
++          Event.insert_all events
++          Comment.insert_all comments.map { |comment| comment.except(:board_id) }
++          ActionText::RichText.insert_all build_rich_texts(comments, now)
++
++          insert_search_records(comments, now)
++          create_watches(comments, now)
++        end
++
++        broadcast_board_refreshes board_ids
++        enqueue_webhook_jobs events
++      end
++
++      def system_user_ids_for(cards)
++        account_ids = cards.map { |_, account_id, _| account_id }.uniq
++        users = User.where(account_id: account_ids, role: :system).pluck(:account_id, :id).to_h
++
++        account_ids.each do |account_id|
++          users[account_id] ||= Account.find(account_id).system_user.id
++        end
++
++        users
++      end
++
++      def build_not_nows(cards, system_user_ids, now)
++        cards.map do |card_id, account_id, _|
++          {
++            id: new_uuid,
++            account_id: account_id,
++            card_id: card_id,
++            created_at: now,
++            updated_at: now,
++            user_id: system_user_ids.fetch(account_id)
++          }
++        end
++      end
++
++      def build_auto_postpone_events(cards, system_user_ids, now)
++        cards.map do |card_id, account_id, board_id|
++          {
++            id: new_uuid,
++            account_id: account_id,
++            action: "card_auto_postponed",
++            board_id: board_id,
++            created_at: now,
++            creator_id: system_user_ids.fetch(account_id),
++            eventable_id: card_id,
++            eventable_type: "Card",
++            particulars: {},
++            updated_at: now
++          }
++        end
++      end
++
++      def build_auto_postpone_comments(cards, system_user_ids, now)
++        cards.map do |card_id, account_id, board_id|
++          {
++            id: new_uuid,
++            account_id: account_id,
++            board_id: board_id,
++            card_id: card_id,
++            created_at: now,
++            creator_id: system_user_ids.fetch(account_id),
++            updated_at: now
++          }
++        end
++      end
++
++      def build_rich_texts(comments, now)
++        comments.map do |comment|
++          {
++            id: new_uuid,
++            account_id: comment[:account_id],
++            body: AUTO_POSTPONE_COMMENT_BODY,
++            created_at: now,
++            name: "body",
++            record_id: comment[:id],
++            record_type: "Comment",
++            updated_at: now
++          }
++        end
++      end
++
++      def insert_search_records(comments, now)
++        comments.group_by { |comment| comment[:account_id] }.each do |account_id, account_comments|
++          search_record_class = Search::Record.for(account_id)
++          records = account_comments.map do |comment|
++            {
++              account_id: account_id,
++              board_id: comment[:board_id],
++              card_id: comment[:card_id],
++              content: AUTO_POSTPONE_COMMENT_TEXT,
++              created_at: now,
++              searchable_id: comment[:id],
++              searchable_type: "Comment",
++              title: nil
++            }
++          end
++
++          if search_record_class.columns_hash["id"].type == :uuid
++            records.each do |record|
++              record[:id] = new_uuid
++              record[:account_key] = "account#{account_id}"
++              record[:content] = Search::Stemmer.stem(record[:content])
++            end
++          end
++
++          search_record_class.insert_all records
++          insert_fts_records(account_comments) if Fizzy.db_adapter.sqlite?
++        end
++      end
++
++      def insert_fts_records(comments)
++        searchable_ids = comments.map { |comment| "X'#{serialize_uuid(comment[:id]).unpack1("H*")}'" }.join(",")
++        connection.execute <<~SQL
++          INSERT OR REPLACE INTO search_records_fts (rowid, title, content)
++          SELECT id, title, content FROM search_records
++          WHERE searchable_type = 'Comment' AND searchable_id IN (#{searchable_ids})
++        SQL
++      end
++
++      def create_watches(comments, now)
++        existing_watch_ids = Watch
++          .where(card_id: comments.map { |comment| comment[:card_id] }, user_id: comments.map { |comment| comment[:creator_id] })
++          .pluck(:card_id, :user_id)
++          .to_set
++
++        new_watches, existing_watches = comments.partition do |comment|
++          existing_watch_ids.exclude?([ comment[:card_id], comment[:creator_id] ])
++        end
++
++        if new_watches.any?
++          Watch.insert_all new_watches.map { |comment|
++            {
++              id: new_uuid,
++              account_id: comment[:account_id],
++              card_id: comment[:card_id],
++              user_id: comment[:creator_id],
++              watching: true,
++              created_at: now,
++              updated_at: now
++            }
++          }
++        end
++
++        if existing_watches.any?
++          Watch
++            .where(card_id: existing_watches.map { |comment| comment[:card_id] }, user_id: existing_watches.map { |comment| comment[:creator_id] })
++            .where(watching: false)
++            .update_all(watching: true, updated_at: now)
++        end
++      end
++
++      def broadcast_board_refreshes(board_ids)
++        Board.where(id: board_ids).find_each(&:broadcast_refresh_later)
++      end
++
++      def enqueue_webhook_jobs(events)
++        webhook_jobs = events.map { |event| Event::WebhookDispatchJob.new(Event.new(id: event[:id])) }
++        ActiveJob.perform_all_later webhook_jobs
++      end
++
++      def new_uuid
++        ActiveRecord::Type::Uuid.generate
++      end
++
++      def serialize_uuid(value)
++        ActiveRecord::Type::Uuid.new.serialize(value).to_s
++      end
+   end
+ 
+   def entropy
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 894c57b..61bd65c 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -8,7 +8,7 @@ production: &production
+ 
+   # Application cleanup
+   auto_postpone_all_due:
+-    command: "Card.auto_postpone_all_due"
++    class: Card::AutoPostponeDueJob
+     schedule: every hour at minute 50
+   delete_unused_tags:
+     class: DeleteUnusedTagsJob

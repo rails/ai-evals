@@ -1,0 +1,152 @@
+diff --git a/app/jobs/card/auto_postpone_due_job.rb b/app/jobs/card/auto_postpone_due_job.rb
+new file mode 100644
+index 0000000..b6776f5
+--- /dev/null
++++ b/app/jobs/card/auto_postpone_due_job.rb
+@@ -0,0 +1,12 @@
++class Card::AutoPostponeDueJob < ApplicationJob
++  include ActiveJob::Continuable
++
++  queue_as :backend
++  limits_concurrency to: 1, key: "auto_postpone"
++
++  def perform(batch_size: 1_000)
++    step :postpone do
++      Card.auto_postpone_all_due(batch_size: batch_size)
++    end
++  end
++end
+diff --git a/app/models/card/entropic.rb b/app/models/card/entropic.rb
+index ebaad78..c177524 100644
+--- a/app/models/card/entropic.rb
++++ b/app/models/card/entropic.rb
+@@ -24,11 +24,93 @@ module Card::Entropic
+   end
+ 
+   class_methods do
+-    def auto_postpone_all_due
+-      due_to_be_postponed.find_each do |card|
+-        card.auto_postpone(user: card.account.system_user)
++    # Running the full per-card lifecycle for every due card is prohibitively slow at scale,
++    # so postpone them in batches and create the associated records in bulk.
++    def auto_postpone_all_due(batch_size: 1_000)
++      due_to_be_postponed.in_batches(of: batch_size) do |cards|
++        postpone_due_cards(cards)
+       end
+     end
++
++    private
++      def postpone_due_cards(cards)
++        due_cards = cards.pluck(:id, :account_id, :board_id)
++        return if due_cards.empty?
++
++        now = Time.current
++        system_user_ids = User.where(account_id: due_cards.map(&:second).uniq, role: :system).pluck(:account_id, :id).to_h
++
++        transaction do
++          update_due_cards due_cards, now
++          create_auto_postponed_records due_cards, system_user_ids, now
++        end
++      end
++
++      def update_due_cards(due_cards, now)
++        card_ids = due_cards.map(&:first)
++
++        Card.where(id: card_ids).update_all(column_id: nil, last_active_at: now, updated_at: now)
++        Board.where(id: due_cards.map(&:third).uniq).update_all(updated_at: now)
++        Card::ActivitySpike.where(card_id: card_ids).delete_all
++      end
++
++      def create_auto_postponed_records(due_cards, system_user_ids, now)
++        Card::NotNow.insert_all due_cards.map { |card_id, account_id, _|
++          { id: new_uuid, account_id: account_id, card_id: card_id, created_at: now, updated_at: now, user_id: system_user_ids.fetch(account_id) }
++        }
++
++        events = due_cards.map { |card_id, account_id, board_id|
++          { id: new_uuid, account_id: account_id, action: "card_auto_postponed", board_id: board_id, created_at: now, creator_id: system_user_ids.fetch(account_id), eventable_id: card_id, eventable_type: "Card", particulars: {}, updated_at: now }
++        }
++        Event.insert_all events
++
++        comments = events.map { |event|
++          { id: new_uuid, account_id: event[:account_id], board_id: event[:board_id], card_id: event[:eventable_id], created_at: now, creator_id: event[:creator_id], updated_at: now }
++        }
++        Comment.insert_all comments.map { |comment| comment.except(:board_id) }
++        ActionText::RichText.insert_all comments.map { |comment|
++          { id: new_uuid, account_id: comment[:account_id], body: Card::Eventable::SystemCommenter::AUTO_POSTPONED_COMMENT_BODY, created_at: now, name: "body", record_id: comment[:id], record_type: "Comment", updated_at: now }
++        }
++
++        create_comment_search_records comments, now
++        create_comment_watches comments, system_user_ids, now
++      end
++
++      def create_comment_search_records(comments, now)
++        content = ActionText::Content.new(Card::Eventable::SystemCommenter::AUTO_POSTPONED_COMMENT_BODY).to_plain_text
++
++        comments.group_by { |comment| comment[:account_id] }.each do |account_id, account_comments|
++          search_records = Search::Record.for(account_id)
++          attributes = account_comments.map { |comment|
++            { account_id: account_id, board_id: comment[:board_id], card_id: comment[:card_id], content: content, created_at: now, searchable_id: comment[:id], searchable_type: "Comment", title: nil }
++          }
++
++          if search_records.connection.adapter_name == "SQLite"
++            search_record_ids = search_records.insert_all(attributes, returning: [ :id ]).rows.flatten
++            values = search_record_ids.map { |id| "(#{id}, NULL, #{search_records.connection.quote(content)})" }.join(", ")
++            search_records.connection.execute("INSERT OR REPLACE INTO search_records_fts(rowid, title, content) VALUES #{values}")
++          else
++            search_records.insert_all(attributes)
++          end
++        end
++      end
++
++      def create_comment_watches(comments, system_user_ids, now)
++        watches = comments.map { |comment|
++          [ comment[:card_id], system_user_ids.fetch(comment[:account_id]), comment[:account_id] ]
++        }
++        existing = Watch.where(card_id: watches.map(&:first), user_id: watches.map(&:second)).pluck(:card_id, :user_id).to_set
++
++        Watch.insert_all watches.reject { |card_id, user_id, _| existing.include?([ card_id, user_id ]) }.map { |card_id, user_id, account_id|
++          { id: new_uuid, account_id: account_id, card_id: card_id, created_at: now, updated_at: now, user_id: user_id, watching: true }
++        }
++
++        Watch.where(card_id: watches.map(&:first), user_id: watches.map(&:second), watching: false).update_all(watching: true, updated_at: now)
++      end
++
++      def new_uuid
++        ActiveRecord::Type::Uuid.generate
++      end
+   end
+ 
+   def entropy
+diff --git a/app/models/card/eventable/system_commenter.rb b/app/models/card/eventable/system_commenter.rb
+index 5c7defc..9f1c2fc 100644
+--- a/app/models/card/eventable/system_commenter.rb
++++ b/app/models/card/eventable/system_commenter.rb
+@@ -1,4 +1,6 @@
+ class Card::Eventable::SystemCommenter
++  AUTO_POSTPONED_COMMENT_BODY = "<strong>Moved</strong> to “Not Now” due to inactivity"
++
+   include ERB::Util
+ 
+   attr_reader :card, :event
+@@ -27,7 +29,7 @@ class Card::Eventable::SystemCommenter
+       when "card_postponed"
+         "#{creator_name} <strong>moved</strong> this to “Not Now”"
+       when "card_auto_postponed"
+-        "<strong>Moved</strong> to “Not Now” due to inactivity"
++        AUTO_POSTPONED_COMMENT_BODY
+       when "card_title_changed"
+         "#{creator_name} <strong>changed the title</strong> from “#{old_title}” to “#{new_title}”."
+       when "card_board_changed"
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 894c57b..ec5c2ad 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -8,7 +8,7 @@ production: &production
+ 
+   # Application cleanup
+   auto_postpone_all_due:
+-    command: "Card.auto_postpone_all_due"
++    class: "Card::AutoPostponeDueJob"
+     schedule: every hour at minute 50
+   delete_unused_tags:
+     class: DeleteUnusedTagsJob

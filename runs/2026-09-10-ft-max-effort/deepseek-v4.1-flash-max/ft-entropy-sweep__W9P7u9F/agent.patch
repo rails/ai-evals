@@ -1,0 +1,187 @@
+diff --git a/app/models/card/entropic.rb b/app/models/card/entropic.rb
+index ebaad78..b4d42a6 100644
+--- a/app/models/card/entropic.rb
++++ b/app/models/card/entropic.rb
+@@ -1,6 +1,9 @@
+ module Card::Entropic
+   extend ActiveSupport::Concern
+ 
++  AUTO_POSTPONE_BATCH_SIZE = 1000
++  AUTO_POSTPONE_COMMENT_BODY = "<strong>Moved</strong> to “Not Now” due to inactivity"
++
+   included do
+     scope :due_to_be_postponed, -> do
+       active
+@@ -24,11 +27,170 @@ module Card::Entropic
+   end
+ 
+   class_methods do
++    # Entropy sweeps can touch hundreds of thousands of cards. Instead of loading
++    # each card and running its callbacks, postpone each batch with bulk inserts
++    # and updates, recreating the user-visible side effects explicitly.
+     def auto_postpone_all_due
+-      due_to_be_postponed.find_each do |card|
+-        card.auto_postpone(user: card.account.system_user)
++      due_cards = due_to_be_postponed
++      last_id = nil
++
++      loop do
++        batch = due_cards.order(:id).limit(AUTO_POSTPONE_BATCH_SIZE)
++        batch = batch.where(Card.arel_table[:id].gt(last_id)) if last_id
++        records = batch.pluck(:id, :account_id, :board_id)
++        break if records.empty?
++
++        postpone_due_cards(records)
++        last_id = records.last.first
+       end
+     end
++
++    private
++      def postpone_due_cards(records)
++        account_ids = records.map { |_, account_id, _| account_id }.uniq
++        system_user_ids = User.where(account_id: account_ids, role: :system).pluck(:account_id, :id).to_h
++
++        records.group_by { |_, account_id, _| account_id }.each do |account_id, account_records|
++          system_user_id = system_user_ids[account_id] || User.find_by!(account_id: account_id, role: :system).id
++
++          postpone_due_cards_for_account(account_id, system_user_id, account_records)
++        end
++      end
++
++      def postpone_due_cards_for_account(account_id, system_user_id, records)
++        now = Time.current
++        card_ids = records.map(&:first)
++        board_ids = records.map(&:last).uniq
++        board_id_by_card_id = records.to_h { |card_id, _, board_id| [ card_id, board_id ] }
++        events = nil
++
++        Card.transaction do
++          Card::ActivitySpike.where(card_id: card_ids).delete_all
++          Card::NotNow.where(card_id: card_ids).delete_all
++          Card::NotNow.insert_all!(card_ids.map do |card_id|
++            {
++              id: ActiveRecord::Type::Uuid.generate,
++              account_id: account_id,
++              card_id: card_id,
++              user_id: system_user_id,
++              created_at: now,
++              updated_at: now
++            }
++          end)
++
++          events = records.map do |card_id, _, board_id|
++            {
++              id: ActiveRecord::Type::Uuid.generate,
++              account_id: account_id,
++              action: "card_auto_postponed",
++              board_id: board_id,
++              created_at: now,
++              creator_id: system_user_id,
++              eventable_id: card_id,
++              eventable_type: "Card",
++              particulars: {},
++              updated_at: now
++            }
++          end
++          Event.insert_all!(events)
++
++          comments = records.map do |card_id, _, _|
++            {
++              id: ActiveRecord::Type::Uuid.generate,
++              account_id: account_id,
++              card_id: card_id,
++              creator_id: system_user_id,
++              created_at: now,
++              updated_at: now
++            }
++          end
++          Comment.insert_all!(comments)
++
++          ActionText::RichText.insert_all!(comments.map do |comment|
++            {
++              id: ActiveRecord::Type::Uuid.generate,
++              account_id: account_id,
++              body: AUTO_POSTPONE_COMMENT_BODY,
++              created_at: now,
++              name: "body",
++              record_id: comment[:id],
++              record_type: "Comment",
++              updated_at: now
++            }
++          end)
++
++          index_comment_search_records(account_id, comments, board_id_by_card_id, now)
++
++          Card.where(id: card_ids).update_all(column_id: nil, last_active_at: now, updated_at: now)
++          Board.where(id: board_ids).update_all(updated_at: now)
++        end
++
++        dispatch_webhooks(events)
++      end
++
++      def dispatch_webhooks(events)
++        board_ids = events.map { |event| event[:board_id] }.uniq
++        subscribed_board_ids = Webhook.active
++          .triggered_by_action("card_auto_postponed")
++          .where(board_id: board_ids)
++          .distinct
++          .pluck(:board_id)
++        return if subscribed_board_ids.empty?
++
++        event_ids = events.filter_map do |event|
++          event[:id] if event[:board_id].in?(subscribed_board_ids)
++        end
++
++        Event.where(id: event_ids).find_each do |event|
++          Event::WebhookDispatchJob.perform_later(event)
++        end
++      end
++
++      def index_comment_search_records(account_id, comments, board_id_by_card_id, now)
++        search_record_class = Search::Record.for(account_id)
++        content = ActionText::Content.new(AUTO_POSTPONE_COMMENT_BODY).to_plain_text
++
++        search_records = comments.map do |comment|
++          {
++            account_id: account_id,
++            board_id: board_id_by_card_id[comment[:card_id]],
++            card_id: comment[:card_id],
++            content: content,
++            created_at: now,
++            searchable_id: comment[:id],
++            searchable_type: "Comment",
++            title: nil
++          }
++        end
++
++        if search_record_class.connection.adapter_name == "SQLite"
++          search_record_class.insert_all!(search_records)
++          index_comment_search_records_in_fts(search_record_class, comments)
++        else
++          search_records.each do |search_record|
++            search_record[:account_key] = "account#{account_id}"
++            search_record[:content] = Search::Stemmer.stem(content)
++          end
++
++          search_record_class.insert_all!(search_records)
++        end
++      end
++
++      def index_comment_search_records_in_fts(search_record_class, comments)
++        fts_rows = search_record_class
++          .where(searchable_type: "Comment", searchable_id: comments.map { |comment| comment[:id] })
++          .pluck(:id, :content)
++        return if fts_rows.empty?
++
++        values = fts_rows.map do |id, content|
++          "(#{id}, NULL, #{search_record_class.connection.quote(content)})"
++        end.join(", ")
++
++        search_record_class.connection.execute(<<~SQL.squish, "Search::Record::SQLite::Fts Bulk Upsert")
++          INSERT OR REPLACE INTO search_records_fts (rowid, title, content)
++          VALUES #{values}
++        SQL
++      end
+   end
+ 
+   def entropy
