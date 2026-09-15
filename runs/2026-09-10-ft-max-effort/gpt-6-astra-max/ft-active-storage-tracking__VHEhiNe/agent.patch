@@ -1,0 +1,1219 @@
+diff --git a/app/jobs/storage/reconcile_job.rb b/app/jobs/storage/reconcile_job.rb
+new file mode 100644
+index 0000000..274f1a5
+--- /dev/null
++++ b/app/jobs/storage/reconcile_job.rb
+@@ -0,0 +1,27 @@
++# Initial backfill and periodic repair (including bulk imports/deletions that skip
++# callbacks). Work is resumable and never loads attachment contents into memory.
++class Storage::ReconcileJob < ApplicationJob
++  include ActiveJob::Continuable
++
++  queue_as :backend
++  discard_on ActiveJob::DeserializationError
++  retry_on ActiveRecord::Deadlocked, wait: :polynomially_longer
++
++  def perform(account = nil)
++    step :entries do |step|
++      Storage::Entry.invalidate_all(account: account, start: step.cursor) do |id|
++        step.set! id
++      end
++    end
++
++    step :attachments do |step|
++      scope = account ? ActiveStorage::Attachment.where(account: account) : ActiveStorage::Attachment.all
++      missing = Storage::Attachments.new(scope).all.where.not(id: Storage::Entry.select(:id))
++      Storage::Entry.invalidate_attachments(missing, start: step.cursor) do |id|
++        step.set! id
++      end
++    end
++
++    Storage::Entry.reconcile_later(account: account)
++  end
++end
+diff --git a/app/jobs/storage/update_job.rb b/app/jobs/storage/update_job.rb
+new file mode 100644
+index 0000000..b532420
+--- /dev/null
++++ b/app/jobs/storage/update_job.rb
+@@ -0,0 +1,12 @@
++class Storage::UpdateJob < ApplicationJob
++  queue_as :backend
++
++  discard_on ActiveJob::DeserializationError, ActiveRecord::RecordNotFound
++  retry_on ActiveRecord::Deadlocked, wait: :polynomially_longer
++
++  limits_concurrency to: 1, key: ->(account, shard) { "#{account.id}/#{shard}" }, on_conflict: :discard
++
++  def perform(account, shard)
++    Storage::Entry.reconcile(account, shard)
++  end
++end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index 18d4f42..f661417 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -1,5 +1,5 @@
+ class Account < ApplicationRecord
+-  include Cancellable, Entropic, Incineratable, MultiTenantable, Searchable, Seedeable
++  include Cancellable, Entropic, Incineratable, MultiTenantable, Searchable, Seedeable, StorageTracked
+ 
+   has_one :join_code, dependent: :destroy
+   has_many :users, dependent: :destroy
+diff --git a/app/models/account/import.rb b/app/models/account/import.rb
+index feb41c4..268a470 100644
+--- a/app/models/account/import.rb
++++ b/app/models/account/import.rb
+@@ -51,6 +51,7 @@ class Account::Import < ApplicationRecord
+     reconcile_cards_count
+ 
+     mark_completed
++    account.reconcile_storage_later
+   rescue Account::DataTransfer::RecordSet::ConflictError => e
+     mark_as_failed(:conflict)
+     raise e
+@@ -89,5 +90,4 @@ class Account::Import < ApplicationRecord
+         board.accesses.grant_to(importer)
+       end
+     end
+-
+ end
+diff --git a/app/models/account/storage_tracked.rb b/app/models/account/storage_tracked.rb
+new file mode 100644
+index 0000000..aaeef91
+--- /dev/null
++++ b/app/models/account/storage_tracked.rb
+@@ -0,0 +1,27 @@
++module Account::StorageTracked
++  extend ActiveSupport::Concern
++  include Storage::Usage
++
++  included do
++    before_destroy :lock_storage_accounting, prepend: true
++    after_destroy :delete_storage_accounting
++  end
++
++  def reconcile_storage_later
++    Current.with_account(self) { Storage::ReconcileJob.perform_later(self) }
++  end
++
++  private
++    def lock_storage_accounting
++      # Lock before dependent destroys invalidate attachments, matching workers'
++      # total -> entry lock order. Include shards not yet used by a worker.
++      Storage::Entry::SHARD_COUNT.times do |shard|
++        Storage::Total.for(self, self, shard).lock!
++      end
++    end
++
++    def delete_storage_accounting
++      Storage::Entry.where(account_id: id).delete_all
++      Storage::Total.where(account_id: id).delete_all
++    end
++end
+diff --git a/app/models/board.rb b/app/models/board.rb
+index 9f1bcd5..47d551f 100644
+--- a/app/models/board.rb
++++ b/app/models/board.rb
+@@ -1,5 +1,5 @@
+ class Board < ApplicationRecord
+-  include Accessible, AutoPostponing, Broadcastable, Cards, Entropic, Filterable, Publishable, Triageable
++  include Accessible, AutoPostponing, Broadcastable, Cards, Entropic, Filterable, Publishable, Storage::Usage, Triageable
+ 
+   belongs_to :creator, class_name: "User", default: -> { Current.user }
+   belongs_to :account, default: -> { creator.account }
+diff --git a/app/models/card.rb b/app/models/card.rb
+index 19c3fc2..9d43d29 100644
+--- a/app/models/card.rb
++++ b/app/models/card.rb
+@@ -1,7 +1,7 @@
+ class Card < ApplicationRecord
+   include Accessible, Assignable, Attachments, Broadcastable, Closeable, Colored, Commentable,
+     Entropic, Eventable, Exportable, Golden, Mentions, Multistep, Pinnable, Postponable, Promptable,
+-    Readable, Searchable, Stallable, Statuses, Taggable, Triageable, Watchable
++    Readable, Searchable, Stallable, Statuses, StorageTracked, Taggable, Triageable, Watchable
+ 
+   belongs_to :account, default: -> { board.account }
+   belongs_to :board
+diff --git a/app/models/card/storage_tracked.rb b/app/models/card/storage_tracked.rb
+new file mode 100644
+index 0000000..537bcc0
+--- /dev/null
++++ b/app/models/card/storage_tracked.rb
+@@ -0,0 +1,15 @@
++module Card::StorageTracked
++  extend ActiveSupport::Concern
++
++  included do
++    # Run inside the move transaction, before handle_board_change's nested save
++    # clears saved_changes. Include comments, even when no attachment was edited.
++    after_update :invalidate_moved_storage, if: :saved_change_to_board_id?
++  end
++
++  private
++    def invalidate_moved_storage
++      attachments = Storage::Attachments.new.on_card(self)
++      Storage::Entry.where(id: attachments.select(:id)).update_all(dirty: true)
++    end
++end
+diff --git a/app/models/storage.rb b/app/models/storage.rb
+new file mode 100644
+index 0000000..9c17b7c
+--- /dev/null
++++ b/app/models/storage.rb
+@@ -0,0 +1,5 @@
++module Storage
++  def self.table_name_prefix
++    "storage_"
++  end
++end
+diff --git a/app/models/storage/attachments.rb b/app/models/storage/attachments.rb
+new file mode 100644
+index 0000000..e275607
+--- /dev/null
++++ b/app/models/storage/attachments.rb
+@@ -0,0 +1,64 @@
++# Only original attachments in these four locations count. These queries deliberately
++# never load rich text bodies, blobs, or lists of all the cards/comments on a board.
++class Storage::Attachments
++  def initialize(scope = ActiveStorage::Attachment.all)
++    @scope = scope
++  end
++
++  def all
++    matching(card_images, board_descriptions, card_descriptions, comment_bodies)
++  end
++
++  def on_card(card)
++    matching(*[ card_images, card_descriptions, comment_bodies ].map { |relation| relation.where(cards: { id: card.id }) })
++  end
++
++  def usage
++    [ card_images, board_descriptions, card_descriptions, comment_bodies ].each_with_object({}) do |relation, usage|
++      relation.joins(:blob).pluck("active_storage_attachments.id", "boards.id", "active_storage_blobs.byte_size").each do |id, board_id, byte_size|
++        usage[id] = [ board_id, byte_size ]
++      end
++    end
++  end
++
++  private
++    attr_reader :scope
++
++    def matching(*relations)
++      relations.map { |relation| scope.where(id: relation.select("active_storage_attachments.id")) }.reduce(:or)
++    end
++
++    def card_images
++      scope.where(record_type: "Card", name: "image")
++        .joins("INNER JOIN cards ON cards.id = active_storage_attachments.record_id AND cards.account_id = active_storage_attachments.account_id")
++        .joins(cards_board_join)
++    end
++
++    def board_descriptions
++      embeds("Board", "public_description")
++        .joins("INNER JOIN boards ON boards.id = action_text_rich_texts.record_id AND boards.account_id = active_storage_attachments.account_id")
++    end
++
++    def card_descriptions
++      embeds("Card", "description")
++        .joins("INNER JOIN cards ON cards.id = action_text_rich_texts.record_id AND cards.account_id = active_storage_attachments.account_id")
++        .joins(cards_board_join)
++    end
++
++    def comment_bodies
++      embeds("Comment", "body")
++        .joins("INNER JOIN comments ON comments.id = action_text_rich_texts.record_id AND comments.account_id = active_storage_attachments.account_id")
++        .joins("INNER JOIN cards ON cards.id = comments.card_id AND cards.account_id = comments.account_id")
++        .joins(cards_board_join)
++    end
++
++    def embeds(record_type, name)
++      scope.where(record_type: "ActionText::RichText", name: "embeds")
++        .joins("INNER JOIN action_text_rich_texts ON action_text_rich_texts.id = active_storage_attachments.record_id AND action_text_rich_texts.account_id = active_storage_attachments.account_id")
++        .where(action_text_rich_texts: { record_type: record_type, name: name })
++    end
++
++    def cards_board_join
++      "INNER JOIN boards ON boards.id = cards.board_id AND boards.account_id = cards.account_id"
++    end
++end
+diff --git a/app/models/storage/entry.rb b/app/models/storage/entry.rb
+new file mode 100644
+index 0000000..835c36b
+--- /dev/null
++++ b/app/models/storage/entry.rb
+@@ -0,0 +1,109 @@
++# A durable, coalescing work list and the last accounted state of each attachment.
++# Invalidation and attachment changes share a transaction. Reconciliation locks
++# entries before reading attachments, and commits snapshots and totals together.
++class Storage::Entry < ApplicationRecord
++  SHARD_COUNT = 16
++  BATCH_SIZE = 100
++  MAX_BATCHES = 100
++
++  belongs_to :account
++
++  scope :pending, -> { where(dirty: true) }
++
++  class << self
++    def invalidate_attachment(attachment)
++      upsert_all([ attributes_for(attachment) ], update_only: [ :dirty ])
++    end
++
++    def invalidate_attachments(attachments, start: nil)
++      attachments.select(:id, :account_id).find_in_batches(start: start) do |batch|
++        upsert_all(batch.map { |attachment| attributes_for(attachment) }, update_only: [ :dirty ])
++        yield batch.last.id if block_given?
++      end
++    end
++
++    def invalidate_all(account: nil, start: nil)
++      entries = account ? where(account: account) : all
++      entries.select(:id).find_in_batches(start: start) do |batch|
++        where(id: batch.map(&:id)).update_all(dirty: true)
++        yield batch.last.id if block_given?
++      end
++    end
++
++    def reconcile_later(account: nil)
++      accounts = account ? Account.where(id: account.id) : Account.all
++      accounts.where(id: pending.distinct.select(:account_id)).find_each do |account|
++        Current.with_account(account) do
++          pending.where(account: account).distinct.pluck(:shard).each do |shard|
++            Storage::UpdateJob.perform_later(account, shard)
++          end
++        end
++      end
++    end
++
++    def reconcile(account, shard)
++      entries = pending.where(account: account, shard: shard)
++      if entries.exists?
++        total = Storage::Total.for(account, account, shard)
++
++        # Bound each job as well as each transaction. The next sweep picks up any
++        # remainder, so a constantly busy account cannot monopolize a worker.
++        cursor = nil
++        MAX_BATCHES.times do
++          cursor = reconcile_batch(entries, total, after: cursor)
++          break unless cursor
++        end
++      end
++    end
++
++    private
++      def attributes_for(attachment)
++        { id: attachment.id, account_id: attachment.account_id, shard: attachment.id.to_i(36) % SHARD_COUNT, dirty: true }
++      end
++
++      def reconcile_batch(entries, total, after:)
++        entries = entries.where(id: after..).where.not(id: after) if after
++        uncached do
++          total.with_lock do
++            batch = entries.order(:id).limit(BATCH_SIZE).lock.to_a
++            if batch.any?
++              reconcile_entries(batch, total)
++              batch.last.id
++            else
++              # A worker may have started creating this shard as the account was deleted.
++              total.destroy! unless Account.exists?(total.account_id)
++              nil
++            end
++          end
++        end
++      end
++
++      def reconcile_entries(batch, total)
++        attachments = ActiveStorage::Attachment.where(account_id: total.account_id, id: batch.map(&:id))
++        usage = Storage::Attachments.new(attachments).usage
++        deltas = Hash.new(0)
++        snapshots = []
++        removed_ids = []
++
++        batch.each do |entry|
++          deltas[entry.board_id] -= entry.byte_size if entry.board_id
++
++          if current = usage[entry.id]
++            board_id, byte_size = current
++            deltas[board_id] += byte_size
++            snapshots << entry.attributes.merge("board_id" => board_id, "byte_size" => byte_size, "dirty" => false)
++          else
++            removed_ids << entry.id
++          end
++        end
++
++        deltas.sort.each do |board_id, delta|
++          Storage::Total.adjust_board(total.account, board_id, total.shard, delta)
++        end
++        total.increment!(:bytes_used, deltas.values.sum) unless deltas.values.sum.zero?
++
++        upsert_all(snapshots, update_only: [ :board_id, :byte_size, :dirty ]) if snapshots.any?
++        where(id: removed_ids).delete_all if removed_ids.any?
++      end
++  end
++end
+diff --git a/app/models/storage/total.rb b/app/models/storage/total.rb
+new file mode 100644
+index 0000000..b2b4dae
+--- /dev/null
++++ b/app/models/storage/total.rb
+@@ -0,0 +1,18 @@
++class Storage::Total < ApplicationRecord
++  belongs_to :account
++  belongs_to :record, polymorphic: true
++
++  def self.for(account, record, shard)
++    find_or_create_by!(account: account, record: record, shard: shard)
++  end
++
++  # The account's corresponding shard is always locked before changing a board's
++  # shard. This also serializes concurrent workers without locking Account/Board.
++  def self.adjust_board(account, board_id, shard, delta)
++    if delta != 0
++      total = find_or_create_by!(account: account, record_type: "Board", record_id: board_id, shard: shard)
++      total.increment!(:bytes_used, delta)
++      total.destroy! if total.bytes_used.zero?
++    end
++  end
++end
+diff --git a/app/models/storage/tracked_attachment.rb b/app/models/storage/tracked_attachment.rb
+new file mode 100644
+index 0000000..1e6df99
+--- /dev/null
++++ b/app/models/storage/tracked_attachment.rb
+@@ -0,0 +1,26 @@
++module Storage::TrackedAttachment
++  extend ActiveSupport::Concern
++
++  included do
++    after_create :invalidate_storage_entry
++    after_destroy :invalidate_storage_entry, if: :previously_persisted?
++  end
++
++  # Active Storage's purge, purge_later and singular detach use delete, not destroy.
++  def delete
++    if persisted?
++      transaction do
++        super.tap { invalidate_storage_entry }
++      end
++    else
++      super
++    end
++  end
++
++  private
++    def invalidate_storage_entry
++      if (record_type == "Card" && name == "image") || (record_type == "ActionText::RichText" && name == "embeds")
++        Storage::Entry.invalidate_attachment(self)
++      end
++    end
++end
+diff --git a/app/models/storage/tracked_embeds.rb b/app/models/storage/tracked_embeds.rb
+new file mode 100644
+index 0000000..9de5c28
+--- /dev/null
++++ b/app/models/storage/tracked_embeds.rb
+@@ -0,0 +1,13 @@
++module Storage::TrackedEmbeds
++  # Plural detach uses delete_all, bypassing attachment callbacks altogether.
++  def detach
++    if record.is_a?(ActionText::RichText) && name == "embeds"
++      record.class.transaction do
++        Storage::Entry.invalidate_attachments(record.embeds_attachments)
++        super
++      end
++    else
++      super
++    end
++  end
++end
+diff --git a/app/models/storage/usage.rb b/app/models/storage/usage.rb
+new file mode 100644
+index 0000000..4b8c646
+--- /dev/null
++++ b/app/models/storage/usage.rb
+@@ -0,0 +1,7 @@
++module Storage::Usage
++  # At most SHARD_COUNT rows, regardless of the number of boards or attachments.
++  # Don't memoize: a background worker may have updated usage since the last read.
++  def bytes_used
++    Storage::Total.where(record: self).sum(:bytes_used)
++  end
++end
+diff --git a/config/initializers/action_text.rb b/config/initializers/action_text.rb
+index 6bbdb3e..4978cc9 100644
+--- a/config/initializers/action_text.rb
++++ b/config/initializers/action_text.rb
+@@ -4,6 +4,10 @@ module ActionText
+       extend ActiveSupport::Concern
+ 
+       included do
++        # Action Text only synchronizes embeds for a present body. Clearing it
++        # must detach the old files as well, including their storage usage.
++        before_validation -> { self.embeds = [] }, if: -> { will_save_change_to_body? && body.blank? }
++
+         # This overrides the default :embeds association!
+         has_many_attached :embeds do |attachable|
+           ::Attachments::VARIANTS.each do |variant_name, variant_options|
+diff --git a/config/initializers/storage.rb b/config/initializers/storage.rb
+new file mode 100644
+index 0000000..eb37d4c
+--- /dev/null
++++ b/config/initializers/storage.rb
+@@ -0,0 +1,4 @@
++Rails.application.config.to_prepare do
++  ActiveStorage::Attachment.include Storage::TrackedAttachment
++  ActiveStorage::Attached::Many.prepend Storage::TrackedEmbeds
++end
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 894c57b..cd3773c 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -6,6 +6,14 @@ production: &production
+     command: "Notification::Bundle.deliver_all_later"
+     schedule: every 30 minutes
+ 
++  # Storage accounting: coalesce edits, with a daily backfill/repair safety net.
++  update_storage_usage:
++    command: "Storage::Entry.reconcile_later"
++    schedule: every minute
++  reconcile_storage_usage:
++    class: "Storage::ReconcileJob"
++    schedule: every day at 03:35
++
+   # Application cleanup
+   auto_postpone_all_due:
+     command: "Card.auto_postpone_all_due"
+diff --git a/db/migrate/20260710120000_create_storage_accounting.rb b/db/migrate/20260710120000_create_storage_accounting.rb
+new file mode 100644
+index 0000000..5adb5ad
+--- /dev/null
++++ b/db/migrate/20260710120000_create_storage_accounting.rb
+@@ -0,0 +1,25 @@
++class CreateStorageAccounting < ActiveRecord::Migration[8.2]
++  def change
++    create_table :storage_entries, id: :uuid do |t|
++      # The entry shares its ID with the attachment, but survives its deletion until reconciled.
++      t.uuid :account_id, null: false
++      t.uuid :board_id
++      t.integer :shard, null: false
++      t.bigint :byte_size, null: false, default: 0
++      t.boolean :dirty, null: false, default: true
++
++      t.index [ :dirty, :account_id, :shard, :id ], name: "index_storage_entries_for_reconciliation"
++      t.index :account_id
++    end
++
++    create_table :storage_totals, id: :uuid do |t|
++      t.uuid :account_id, null: false
++      t.references :record, polymorphic: true, type: :uuid, null: false, index: false
++      t.integer :shard, null: false
++      t.bigint :bytes_used, null: false, default: 0
++
++      t.index [ :record_type, :record_id, :shard ], unique: true
++      t.index :account_id
++    end
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 81a3526..bc07eb4 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_07_10_120000) do
+   create_table "accesses", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -731,6 +731,26 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.index ["card_id"], name: "index_steps_on_card_id"
+   end
+ 
++  create_table "storage_entries", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
++    t.uuid "account_id", null: false
++    t.uuid "board_id"
++    t.integer "shard", null: false
++    t.bigint "byte_size", default: 0, null: false
++    t.boolean "dirty", default: true, null: false
++    t.index ["account_id"], name: "index_storage_entries_on_account_id"
++    t.index ["dirty", "account_id", "shard", "id"], name: "index_storage_entries_for_reconciliation"
++  end
++
++  create_table "storage_totals", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
++    t.uuid "account_id", null: false
++    t.string "record_type", null: false
++    t.uuid "record_id", null: false
++    t.integer "shard", null: false
++    t.bigint "bytes_used", default: 0, null: false
++    t.index ["account_id"], name: "index_storage_totals_on_account_id"
++    t.index ["record_type", "record_id", "shard"], name: "index_storage_totals_on_record_type_and_record_id_and_shard", unique: true
++  end
++
+   create_table "taggings", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.uuid "account_id", null: false
+     t.uuid "card_id", null: false
+diff --git a/db/schema_sqlite.rb b/db/schema_sqlite.rb
+index 1c89abe..755dde9 100644
+--- a/db/schema_sqlite.rb
++++ b/db/schema_sqlite.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_07_10_120000) do
+   create_table "accesses", id: :uuid, force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -504,6 +504,26 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.index ["card_id"], name: "index_steps_on_card_id"
+   end
+ 
++  create_table "storage_entries", id: :uuid, force: :cascade do |t|
++    t.uuid "account_id", null: false
++    t.uuid "board_id"
++    t.integer "shard", null: false
++    t.bigint "byte_size", default: 0, null: false
++    t.boolean "dirty", default: true, null: false
++    t.index ["account_id"], name: "index_storage_entries_on_account_id"
++    t.index ["dirty", "account_id", "shard", "id"], name: "index_storage_entries_for_reconciliation"
++  end
++
++  create_table "storage_totals", id: :uuid, force: :cascade do |t|
++    t.uuid "account_id", null: false
++    t.string "record_type", limit: 255, null: false
++    t.uuid "record_id", null: false
++    t.integer "shard", null: false
++    t.bigint "bytes_used", default: 0, null: false
++    t.index ["account_id"], name: "index_storage_totals_on_account_id"
++    t.index ["record_type", "record_id", "shard"], name: "index_storage_totals_on_record_type_and_record_id_and_shard", unique: true
++  end
++
+   create_table "taggings", id: :uuid, force: :cascade do |t|
+     t.uuid "account_id", null: false
+     t.uuid "card_id", null: false
+diff --git a/docs/storage-usage.md b/docs/storage-usage.md
+new file mode 100644
+index 0000000..b5b3d2a
+--- /dev/null
++++ b/docs/storage-usage.md
+@@ -0,0 +1,67 @@
++# Storage usage
++
++`Account#bytes_used` and `Board#bytes_used` return integer byte counts computed in
++background jobs. An empty account or board returns `0`. Reads do not scan
++attachments, load rich text, enqueue jobs, or memoize a stale value on the model.
++
++Counted attachments are:
++
++- Card images (`Card#image`), including draft and closed cards.
++- Files embedded in board public descriptions, card descriptions, and comment bodies.
++
++Avatars, export/import archives, generated variants/previews, remote URLs, and
++unattached uploads do not count. Each attachment association counts once. Reusing
++a blob in another counted location counts it there too; repeated references in a
++single rich-text field use Action Text's single attachment association.
++
++## Background processing
++
++Keep Solid Queue's scheduler and `backend` workers running. The
++`update_storage_usage` recurring task sweeps pending work every minute. Counts are
++eventually consistent: they reflect the last completed rollups, not uploads or
++removals whose jobs have not run yet. Large backlogs may need multiple sweeps.
++
++Attachment mutations mark `Storage::Entry` rows dirty **in the same database
++transaction**. Repeated edits coalesce into one pending entry, so active users do
++not enqueue a recount per edit. Purge/detach paths that bypass Active Record
++destroy callbacks are covered explicitly. Card moves also invalidate their image,
++description, and comment entries in the move transaction.
++
++Each entry stores the last accounted board and byte size. Workers lock entries,
++read current attachment metadata using indexed SQL joins, and atomically commit
++both updated entries and the difference to board/account totals. Removals retain
++an entry until its old usage has been subtracted. Retries and duplicate workers
++cannot count a change twice, and a failed job leaves its work pending for the next
++sweep. Normal rollups cost proportionally to changed attachments, not total
++account/board size.
++
++Totals are divided into 16 fixed shards per account and board. A read sums at most
++16 rows. Workers lock an account **total shard**, not the Account or Board model,
++and serialize matching board-shard updates behind it. Unrelated shards can be
++processed concurrently. Transactions handle at most 100 entries and jobs at most
++100 batches; newer invalidations of already-visited entries wait for the next
++sweep rather than starving later entries. Do not change `SHARD_COUNT` without
++migrating existing entries and totals together.
++
++## Existing data and imports
++
++The daily `reconcile_storage_usage` job backfills pre-existing attachments and
++repairs changes made by bulk operations that bypass callbacks. It is resumable,
++uses bounded batches, and only reads metadata. Imports enqueue an account-scoped
++reconciliation automatically; accounting internals are not exported/imported.
++
++After deploying the migration to an existing installation, start the initial
++backfill immediately rather than waiting for the daily schedule:
++
++```sh
++bin/rails runner 'Storage::ReconcileJob.perform_later'
++```
++
++To reconcile a particular account:
++
++```ruby
++account.reconcile_storage_later
++```
++
++The normal minute-by-minute sweep drains the resulting work. Account deletion
++cleans up both pending entries and totals while coordinating with running workers.
+diff --git a/test/models/account/import_test.rb b/test/models/account/import_test.rb
+index c1e9c2f..083e48f 100644
+--- a/test/models/account/import_test.rb
++++ b/test/models/account/import_test.rb
+@@ -179,12 +179,14 @@ class Account::ImportTest < ActiveSupport::TestCase
+     exporter = users(:david)
+     identity = exporter.identity
+ 
+-    ActiveStorage::Blob.create_and_upload!(
++    source_blob = ActiveStorage::Blob.create_and_upload!(
+       io: StringIO.new("test image data"),
+       filename: "logo.png",
+       content_type: "image/png"
+     )
+ 
++    cards(:logo).image.attach(source_blob)
++
+     source_blob_count = ActiveStorage::Blob.where(account: source_account).count
+     source_blob_keys = ActiveStorage::Blob.where(account: source_account).pluck(:key)
+ 
+@@ -215,6 +217,11 @@ class Account::ImportTest < ActiveSupport::TestCase
+     assert_not_nil imported_blob
+     assert_not_includes source_blob_keys, imported_blob.key
+     assert_equal "test image data", imported_blob.download
++
++    perform_enqueued_jobs(only: Storage::ReconcileJob)
++    perform_enqueued_jobs(only: Storage::UpdateJob)
++    assert_equal source_blob.byte_size, target_account.bytes_used
++    assert_equal source_blob.byte_size, target_account.boards.find_by!(name: "Writebook").bytes_used
+   ensure
+     export_tempfile&.close
+     export_tempfile&.unlink
+diff --git a/test/models/storage/usage_test.rb b/test/models/storage/usage_test.rb
+new file mode 100644
+index 0000000..784cfa7
+--- /dev/null
++++ b/test/models/storage/usage_test.rb
+@@ -0,0 +1,511 @@
++require "test_helper"
++
++class Storage::UsageTest < ActiveSupport::TestCase
++  setup do
++    Current.session = sessions(:david)
++    @account = accounts(:"37s")
++    @board = boards(:writebook)
++    @card = cards(:logo)
++  end
++
++  test "empty accounts and boards use no storage" do
++    assert_equal 0, @account.bytes_used
++    assert_equal 0, @board.bytes_used
++  end
++
++  test "counts card images and files in board descriptions, card descriptions, and comments" do
++    @card.image.attach blob(10)
++    @board.update!(public_description: embed(blob(20)))
++    @card.update!(description: embed(blob(30)))
++    @card.comments.create!(body: embed(blob(40)))
++
++    update_usage
++
++    assert_equal 100, @board.bytes_used
++    assert_equal 100, @account.bytes_used
++  end
++
++  test "usage is updated in the background without memoizing reads" do
++    assert_equal 0, @board.bytes_used
++    @card.image.attach blob(10)
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++    update_usage
++    assert_equal 10, @board.bytes_used
++    assert_equal 10, @account.bytes_used
++  end
++
++  test "rolls up multiple boards and keeps accounts isolated" do
++    @card.image.attach blob(10)
++    boards(:private).update!(public_description: embed(blob(20)))
++    other = boards(:miltons_wish_list)
++    Current.with_account(other.account) do
++      other.update!(public_description: embed(blob(30)))
++    end
++
++    update_usage
++
++    assert_equal 10, @board.bytes_used
++    assert_equal 20, boards(:private).bytes_used
++    assert_equal 30, @account.bytes_used
++    assert_equal 30, other.bytes_used
++    assert_equal 30, other.account.bytes_used
++    assert_equal 0, accounts(:acme).bytes_used
++  end
++
++  test "does not count avatars, exports, imports, variants, previews, or unattached blobs" do
++    users(:david).avatar.attach blob(10)
++    export = Account::Export.create!(account: @account, user: users(:david))
++    export.file.attach blob(20)
++    import = Account::Import.create!(account: @account, identity: identities(:david))
++    import.file.attach blob(30)
++    original = blob(40)
++    original.preview_image.attach blob(50)
++    original.variant_records.create!(variation_digest: "test").image.attach blob(60)
++    blob(70)
++
++    update_usage
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++    assert_empty Storage::Entry.all
++  end
++
++  test "only the specified attachment names and rich text fields count" do
++    ActiveStorage::Attachment.create!(record: @card, name: "other", blob: blob(10))
++    other_text = ActionText::RichText.create!(record: @card, name: "other", body: embed(blob(20)))
++    @card.update!(description: "No files")
++    ActiveStorage::Attachment.create!(record: @card.description, name: "other", blob: blob(30))
++
++    update_usage
++
++    assert_equal 0, @account.bytes_used
++    assert_equal 0, @board.bytes_used
++    assert_empty Storage::Entry.where(id: other_text.embeds_attachments.select(:id))
++  end
++
++  test "counts original attachments but not their generated files" do
++    original = blob(10)
++    @card.image.attach original
++    original.preview_image.attach blob(20)
++    original.variant_records.create!(variation_digest: "test").image.attach blob(30)
++
++    update_usage
++
++    assert_equal 10, @board.bytes_used
++    assert_equal 10, @account.bytes_used
++  end
++
++  test "counts draft and closed cards" do
++    draft = @board.cards.create!
++    draft.image.attach blob(10)
++    cards(:shipping).update!(description: embed(blob(20)))
++
++    update_usage
++
++    assert_equal 30, @board.bytes_used
++    assert_equal 30, @account.bytes_used
++  end
++
++  test "counts each attachment once, including equal sized and reused blobs" do
++    reused = blob(10)
++    @card.image.attach reused
++    @card.update!(description: embed(reused) + embed(reused) + embed(blob(10)))
++    @card.comments.create!(body: embed(reused))
++
++    update_usage
++
++    assert_equal 40, @board.bytes_used
++    assert_equal 40, @account.bytes_used
++  end
++
++  test "replaces images and removes embedded files" do
++    @card.image.attach blob(10)
++    @card.update!(description: embed(blob(20)))
++    @board.update!(public_description: embed(blob(30)))
++    comment = @card.comments.create!(body: embed(blob(40)))
++    update_usage
++
++    @card.image.attach blob(50)
++    @card.update!(description: "No files")
++    @board.update!(public_description: "No files")
++    comment.update!(body: "No files")
++    update_usage
++
++    assert_equal 50, @board.bytes_used
++    assert_equal 50, @account.bytes_used
++  end
++
++  test "purging an image updates usage even though Active Storage skips destroy callbacks" do
++    @card.image.attach blob(10)
++    update_usage
++
++    @card.image.purge
++    update_usage
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++    assert_empty Storage::Entry.all
++  end
++
++  test "purge later removes usage before the blob is purged" do
++    @card.image.attach blob(10)
++    original = @card.image.blob
++    update_usage
++
++    @card.image.purge_later
++    update_usage
++
++    assert ActiveStorage::Blob.exists?(original.id)
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++  end
++
++  test "detaching images and embeds updates usage without deleting blobs" do
++    @card.image.attach blob(10)
++    @card.update!(description: embed(blob(20)))
++    update_usage
++
++    assert_no_difference "ActiveStorage::Blob.count" do
++      @card.image.detach
++      @card.description.embeds.detach
++      update_usage
++    end
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++    assert_empty Storage::Entry.all
++  end
++
++  test "coalesces attachment creation and deletion before reconciliation" do
++    @card.image.attach blob(10)
++    @card.image.purge_later
++    @card.image.attach blob(20)
++
++    update_usage
++
++    assert_equal 20, @board.bytes_used
++    assert_equal 20, @account.bytes_used
++  end
++
++  test "moves images, descriptions, and comments to the new board" do
++    @card.image.attach blob(10)
++    @card.update!(description: embed(blob(20)))
++    @card.comments.create!(body: embed(blob(30)))
++    @board.update!(public_description: embed(blob(40)))
++    update_usage
++
++    @card.move_to(boards(:private))
++    update_usage
++
++    assert_equal 40, @board.bytes_used
++    assert_equal 60, boards(:private).bytes_used
++    assert_equal 100, @account.bytes_used
++  end
++
++  test "a move and edits before reconciliation use the latest board and attachments" do
++    @card.image.attach blob(10)
++    comment = @card.comments.create!(body: embed(blob(20)))
++    update_usage
++
++    @card.move_to(boards(:private))
++    comment.update!(body: embed(blob(30)))
++    @card.image.purge_later
++    @card.update!(description: embed(blob(40)))
++    update_usage
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 70, boards(:private).bytes_used
++    assert_equal 70, @account.bytes_used
++  end
++
++  test "moves attachments that have not yet been counted" do
++    @card.image.attach blob(10)
++    @card.comments.create!(body: embed(blob(20)))
++    @card.move_to(boards(:private))
++    update_usage
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 30, boards(:private).bytes_used
++    assert_equal 30, @account.bytes_used
++  end
++
++  test "deleting comments and cards removes their usage" do
++    @card.image.attach blob(10)
++    @card.update!(description: embed(blob(20)))
++    comment = @card.comments.create!(body: embed(blob(30)))
++    @board.update!(public_description: embed(blob(40)))
++    update_usage
++
++    comment.destroy!
++    update_usage
++    assert_equal 70, @board.bytes_used
++
++    @card.comments.create!(body: embed(blob(50)))
++    update_usage
++    @card.destroy!
++    update_usage
++
++    assert_equal 40, @board.bytes_used
++    assert_equal 40, @account.bytes_used
++  end
++
++  test "deleting a board removes its entire usage from the account" do
++    @card.image.attach blob(10)
++    @card.comments.create!(body: embed(blob(20)))
++    @board.update!(public_description: embed(blob(30)))
++    boards(:private).update!(public_description: embed(blob(40)))
++    update_usage
++
++    @board.destroy!
++    update_usage
++
++    assert_equal 40, @account.bytes_used
++    assert_empty Storage::Total.where(record: @board)
++    assert_empty Storage::Entry.where(board_id: @board.id)
++  end
++
++  test "deleting an account cleans up both pending and accounted usage" do
++    @card.image.attach blob(10)
++    update_usage
++    @board.update!(public_description: embed(blob(20)))
++    Storage::Entry.reconcile_later
++
++    @account.destroy!
++    perform_enqueued_jobs(only: Storage::UpdateJob)
++
++    assert_empty Storage::Total.where(account_id: @account.id)
++    assert_empty Storage::Entry.where(account_id: @account.id)
++  end
++
++  test "rolled back attachment changes and moves do not change usage" do
++    @card.image.attach blob(10)
++    update_usage
++
++    Card.transaction(requires_new: true) do
++      @card.move_to(boards(:private))
++      @card.image.purge_later
++      @card.update!(description: embed(blob(20)))
++      raise ActiveRecord::Rollback
++    end
++    update_usage
++
++    assert_equal 10, @board.bytes_used
++    assert_equal 0, boards(:private).bytes_used
++    assert_equal 10, @account.bytes_used
++  end
++
++  test "reconciliation and repeated jobs are idempotent" do
++    @card.image.attach blob(10)
++    update_usage
++    entry = Storage::Entry.first
++
++    2.times do
++      Storage::Entry.invalidate_attachment(@card.image.attachment)
++      Storage::UpdateJob.perform_now(@account, entry.shard)
++      Storage::UpdateJob.perform_now(@account, entry.shard)
++    end
++
++    assert_equal 10, @board.bytes_used
++    assert_equal 10, @account.bytes_used
++  end
++
++  test "reconciliation backfills old attachments and repairs bulk deletions" do
++    @card.image.attach blob(10)
++    @card.update!(description: embed(blob(20)))
++    @card.comments.create!(body: embed(blob(30)))
++    @board.update!(public_description: embed(blob(40)))
++    Storage::Entry.delete_all # Simulate data present before storage accounting was installed.
++
++    perform_enqueued_jobs(only: Storage::UpdateJob) do
++      Storage::ReconcileJob.perform_now
++    end
++    assert_equal 100, @account.bytes_used
++    assert_equal 100, @board.bytes_used
++
++    ActiveStorage::Attachment.where(record: @card, name: "image").delete_all
++    perform_enqueued_jobs(only: Storage::UpdateJob) do
++      Storage::ReconcileJob.perform_now(@account)
++    end
++
++    assert_equal 90, @account.bytes_used
++    assert_equal 90, @board.bytes_used
++  end
++
++  test "supports byte counts larger than a signed 32 bit integer" do
++    original = ActiveStorage::Blob.create_before_direct_upload!(filename: "large.dat", byte_size: 5.terabytes, checksum: "test", content_type: "application/octet-stream", metadata: { identified: true, analyzed: true })
++    @card.image.attach original
++    update_usage
++
++    assert_equal 5.terabytes, @board.bytes_used
++    assert_equal 5.terabytes, @account.bytes_used
++  end
++
++  test "rollup failures leave totals and snapshots unchanged and preserve pending work" do
++    @card.image.attach blob(10)
++    entry = Storage::Entry.first
++    Storage::Entry.expects(:upsert_all).raises(RuntimeError, "interrupted")
++
++    assert_raises(RuntimeError) { Storage::Entry.reconcile(@account, entry.shard) }
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++    assert entry.reload.dirty?
++    assert_equal 0, entry.byte_size
++
++    Storage::Entry.unstub(:upsert_all)
++    update_usage
++
++    assert_equal 10, @board.bytes_used
++    assert_equal 10, @account.bytes_used
++    assert_not entry.reload.dirty?
++  end
++
++  test "reconciles large attachment collections in bounded batches" do
++    attachments = attach_in_shard(Storage::Entry::BATCH_SIZE + 1, 0)
++    Storage::Entry.invalidate_attachments(attachments)
++
++    stub_const(Storage::Entry, :MAX_BATCHES, 1) do
++      Storage::Entry.reconcile(@account, 0)
++      assert_equal Storage::Entry::BATCH_SIZE, @account.bytes_used
++      assert_equal 1, Storage::Entry.pending.count
++
++      Storage::Entry.reconcile(@account, 0)
++      assert_equal Storage::Entry::BATCH_SIZE + 1, @board.bytes_used
++      assert_equal Storage::Entry::BATCH_SIZE + 1, @account.bytes_used
++      assert_empty Storage::Entry.pending
++    end
++  end
++
++  test "concurrent invalidations and duplicate workers do not lose or duplicate usage" do
++    attachments = attach_in_shard(10, 0)
++    5.times.map do
++      Thread.new { Storage::Entry.invalidate_attachments(attachments) }
++    end.each(&:value)
++
++    assert_equal 10, Storage::Entry.pending.count
++
++    5.times.map do
++      Thread.new { Storage::Entry.reconcile(@account, 0) }
++    end.each(&:value)
++
++    assert_equal 10, @board.bytes_used
++    assert_equal 10, @account.bytes_used
++    assert_empty Storage::Entry.pending
++  end
++
++  test "non attachment edits do not schedule recounts" do
++    @card.image.attach blob(10)
++    update_usage
++
++    @card.update!(title: "Changed title")
++    @card.comments.create!(body: "No attachments")
++    @board.update!(name: "Changed name")
++
++    assert_empty Storage::Entry.pending
++  end
++
++  test "reading usage only queries the small totals table" do
++    @card.image.attach blob(10)
++    update_usage
++    queries = []
++    subscriber = ->(_name, _start, _finish, _id, payload) { queries << payload[:sql] unless payload[:name] == "SCHEMA" }
++
++    ActiveSupport::Notifications.subscribed(subscriber, "sql.active_record") do
++      assert_equal 10, @board.bytes_used
++      assert_equal 10, @account.bytes_used
++    end
++
++    assert_equal 2, queries.size
++    assert queries.all? { |sql| sql.include?("storage_totals") && sql.include?("SUM") }
++  end
++
++  test "account backfills carry the account context rather than the caller's account" do
++    @card.image.attach blob(10)
++    Storage::Entry.delete_all
++
++    Current.with_account(accounts(:initech)) { @account.reconcile_storage_later }
++    job = enqueued_jobs.find { |job| job[:job] == Storage::ReconcileJob }
++    assert_equal @account.to_gid.to_s, job["account"].to_s
++
++    perform_enqueued_jobs(only: Storage::ReconcileJob)
++    perform_enqueued_jobs(only: Storage::UpdateJob)
++
++    assert_equal 10, @account.bytes_used
++    assert_equal 0, accounts(:initech).bytes_used
++  end
++
++  test "reconciliation of one account does not dirty another account's entries" do
++    @card.image.attach blob(10)
++    other = boards(:miltons_wish_list)
++    Current.with_account(other.account) { other.update!(public_description: embed(blob(20))) }
++    update_usage
++
++    Storage::ReconcileJob.perform_now(@account)
++
++    assert Storage::Entry.where(account: @account).pending.exists?
++    assert_empty Storage::Entry.where(account: other.account).pending
++  end
++
++  test "clearing rich text to empty or nil removes its embedded storage" do
++    @card.update!(description: embed(blob(10)))
++    @board.update!(public_description: embed(blob(20)))
++    comment = @card.comments.create!(body: embed(blob(30)))
++    update_usage
++
++    @card.update!(description: nil)
++    @board.update!(public_description: "")
++    comment.update!(body: "")
++    update_usage
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++  end
++
++  test "remote images do not count as stored files" do
++    @card.update!(description: '<action-text-attachment content-type="image/png" url="https://example.com/image.png"></action-text-attachment>')
++    update_usage
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++  end
++
++  test "discarding unsaved attachments does not create accounting entries" do
++    assert_no_difference "Storage::Entry.count" do
++      ActiveStorage::Attachment.new(record: @card, name: "image", blob: blob(10)).delete
++      ActiveStorage::Attachment.new(record: @card, name: "image", blob: blob(20)).destroy!
++    end
++
++    assert_equal 0, @account.bytes_used
++  end
++
++  private
++    def attach_in_shard(count, shard)
++      @card.update!(description: "Files")
++      rows = count.times.map do
++        # Keep UUIDv7 ordering while assigning the random low bits to one shard.
++        id = (ActiveRecord::Type::Uuid.generate.to_i(36) & ~15 | shard).to_s(36).rjust(25, "0")
++        {
++          id: id, account_id: @account.id, record_type: "ActionText::RichText",
++          record_id: @card.description.id, name: "embeds", blob_id: blob(1).id, created_at: Time.current
++        }
++      end
++      ActiveStorage::Attachment.insert_all!(rows)
++      ActiveStorage::Attachment.where(id: rows.map { |row| row[:id] })
++    end
++
++    def blob(size)
++      ActiveStorage::Blob.create_and_upload!(io: StringIO.new("x" * size), filename: "file.txt", content_type: "text/plain")
++    end
++
++    def embed(blob)
++      ActionText::Attachment.from_attachable(blob).to_html
++    end
++
++    def update_usage
++      perform_enqueued_jobs(only: Storage::UpdateJob) do
++        Storage::Entry.reconcile_later
++      end
++    end
++end

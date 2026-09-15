@@ -1,0 +1,286 @@
+diff --git a/app/jobs/card/auto_postpone_job.rb b/app/jobs/card/auto_postpone_job.rb
+new file mode 100644
+index 0000000..57266af
+--- /dev/null
++++ b/app/jobs/card/auto_postpone_job.rb
+@@ -0,0 +1,9 @@
++class Card::AutoPostponeJob < ApplicationJob
++  queue_as :backend
++
++  # Cards are checked again here: they may well have come back to life between
++  # the sweep that queued them and this job getting around to them.
++  def perform(card_ids)
++    Card.auto_postpone_all_due Card.where(id: card_ids)
++  end
++end
+diff --git a/app/models/card/entropic.rb b/app/models/card/entropic.rb
+index ebaad78..04f10a5 100644
+--- a/app/models/card/entropic.rb
++++ b/app/models/card/entropic.rb
+@@ -1,34 +1,83 @@
+ module Card::Entropic
+   extend ActiveSupport::Concern
+ 
++  # Cards start warning about their upcoming postponement once they have burned
++  # through this much of their entropy period.
++  POSTPONING_SOON_RATIO = 0.75
++
++  # How many cards each auto postponing job takes care of.
++  AUTO_POSTPONE_BATCH_SIZE = 250
++
++  # A card inherits the entropy period of its board, or of its account when the
++  # board doesn't override it.
++  ENTROPY_PERIOD = "COALESCE(board_entropies.auto_postpone_period, account_entropies.auto_postpone_period)".freeze
++
++  # Joined straight against the cards table: detouring through boards and
++  # accounts just to reach their entropies costs two extra lookups per row.
++  ENTROPIES_JOIN = <<~SQL.squish.freeze
++    LEFT OUTER JOIN entropies AS board_entropies
++      ON board_entropies.container_type = 'Board' AND board_entropies.container_id = cards.board_id
++    LEFT OUTER JOIN entropies AS account_entropies
++      ON account_entropies.container_type = 'Account' AND account_entropies.container_id = cards.account_id
++  SQL
++
+   included do
+-    scope :due_to_be_postponed, -> do
+-      active
+-        .joins(board: :account)
+-        .left_outer_joins(board: :entropy)
+-        .joins("LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.account_id = accounts.id AND account_entropies.container_type = 'Account' AND account_entropies.container_id = accounts.id")
+-        .where("last_active_at <= #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)')}", Time.now)
+-    end
++    scope :with_entropies, -> { joins(ENTROPIES_JOIN) }
+ 
+-    scope :postponing_soon, -> do
+-      now = Time.now
+-      active
+-        .joins(board: :account)
+-        .left_outer_joins(board: :entropy)
+-        .joins("LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.account_id = accounts.id AND account_entropies.container_type = 'Account' AND account_entropies.container_id = accounts.id")
+-        .where("last_active_at > #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)')}", now)
+-        .where("last_active_at <= #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period) * 0.75')}", now)
+-    end
++    scope :due_to_be_postponed, -> { active.with_entropy_elapsed(1..) }
++    scope :postponing_soon,     -> { active.with_entropy_elapsed(POSTPONING_SOON_RATIO...1) }
+ 
+     delegate :auto_postpone_period, to: :board
+   end
+ 
+   class_methods do
+-    def auto_postpone_all_due
+-      due_to_be_postponed.find_each do |card|
+-        card.auto_postpone(user: card.account.system_user)
++    # Cards that have burned through the given fraction of their entropy period:
++    # `1..` for the ones that are due to be postponed, `0.75...1` for the ones
++    # getting close to it.
++    #
++    # The handful of entropy periods in play are resolved once and turned into
++    # plain last_active_at cutoffs. That way the database compares timestamps
++    # against constants, and can lean on the last_active_at indexes, instead of
++    # deriving a deadline for every single row of the cards table.
++    def with_entropy_elapsed(fractions, now: Time.current)
++      periods = Entropy.auto_postpone_periods
++
++      if periods.any?
++        with_entropies
++          .where(last_active_at: ..(now - periods.min * fractions.begin))
++          .where(periods.map { |period| entropy_elapsed_condition(period, fractions, now) }.join(" OR "))
++      else
++        none
+       end
+     end
++
++    # Postpones every card whose entropy period has run out. Sweeping a whole
++    # installation is more work than a single job can chew through, so the
++    # recurring task uses #auto_postpone_all_due_later instead.
++    def auto_postpone_all_due(cards = all)
++      system_users = Hash.new { |users, account_id| users[account_id] = Account.find(account_id).system_user }
++
++      cards.due_to_be_postponed.find_each do |card|
++        card.auto_postpone(user: system_users[card.account_id])
++      end
++    end
++
++    # Spreads the postponing over the queue in batches, so that one sweep is a
++    # handful of quick jobs instead of a single one that outlives its schedule.
++    def auto_postpone_all_due_later
++      due_to_be_postponed.in_batches(of: AUTO_POSTPONE_BATCH_SIZE) do |cards|
++        Card::AutoPostponeJob.perform_later(cards.ids)
++      end
++    end
++
++    private
++      def entropy_elapsed_condition(period, fractions, now)
++        conditions = { "#{ENTROPY_PERIOD} = ?" => period }
++        conditions["cards.last_active_at <= ?"] = now - period * fractions.begin if fractions.begin
++        conditions["cards.last_active_at > ?"]  = now - period * fractions.end   if fractions.end
++
++        "(#{sanitize_sql_array([ conditions.keys.join(" AND "), *conditions.values ])})"
++      end
+   end
+ 
+   def entropy
+diff --git a/app/models/entropy.rb b/app/models/entropy.rb
+index c896fc4..368786d 100644
+--- a/app/models/entropy.rb
++++ b/app/models/entropy.rb
+@@ -10,6 +10,15 @@ class Entropy < ApplicationRecord
+ 
+   after_commit -> { container.cards.touch_all if container }
+ 
++  class << self
++    # The periods actually in use, so that deadlines can be precomputed instead
++    # of being derived from every single card at query time. Imports can bring
++    # in periods outside of AUTO_POSTPONE_PERIODS_IN_SECONDS, so ask the table.
++    def auto_postpone_periods
++      distinct.pluck(:auto_postpone_period).compact.sort
++    end
++  end
++
+   def auto_postpone_period_in_days
+     days = auto_postpone_period / 1.day.to_i
+ 
+diff --git a/config/brakeman.ignore b/config/brakeman.ignore
+index 25441a6..e166799 100644
+--- a/config/brakeman.ignore
++++ b/config/brakeman.ignore
+@@ -1,28 +1,5 @@
+ {
+   "ignored_warnings": [
+-    {
+-      "warning_type": "SQL Injection",
+-      "warning_code": 0,
+-      "fingerprint": "4ea2e6d704b817af1d896dcdf148a89da8b9e428b3327497631ef8d9ed587307",
+-      "check_name": "SQL",
+-      "message": "Possible SQL injection",
+-      "file": "app/models/card/entropic.rb",
+-      "line": 19,
+-      "link": "https://brakemanscanner.org/docs/warning_types/sql_injection/",
+-      "code": "active.joins(:board => :account).left_outer_joins(:board => :entropy).joins(\"LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.account_id = accounts.id AND account_entropies.container_type = 'Account' AND account_entropies.container_id = accounts.id\").where(\"last_active_at > #{connection.date_subtract(\"?\", \"COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)\")}\", Time.now)",
+-      "render_path": null,
+-      "location": {
+-        "type": "method",
+-        "class": "Card::Entropic",
+-        "method": null
+-      },
+-      "user_input": "connection.date_subtract(\"?\", \"COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)\")",
+-      "confidence": "Weak",
+-      "cwe_id": [
+-        89
+-      ],
+-      "note": "No user input allowed"
+-    },
+     {
+       "warning_type": "Dangerous Send",
+       "warning_code": 23,
+@@ -114,29 +91,6 @@
+         470
+       ],
+       "note": ""
+-    },
+-    {
+-      "warning_type": "SQL Injection",
+-      "warning_code": 0,
+-      "fingerprint": "bbd8fe3cbbc6b393df770d3142d6fa46e2b9441b21f48a52175211acaae4efad",
+-      "check_name": "SQL",
+-      "message": "Possible SQL injection",
+-      "file": "app/models/card/entropic.rb",
+-      "line": 10,
+-      "link": "https://brakemanscanner.org/docs/warning_types/sql_injection/",
+-      "code": "active.joins(:board => :account).left_outer_joins(:board => :entropy).joins(\"LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.account_id = accounts.id AND account_entropies.container_type = 'Account' AND account_entropies.container_id = accounts.id\").where(\"last_active_at <= #{connection.date_subtract(\"?\", \"COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)\")}\", Time.now)",
+-      "render_path": null,
+-      "location": {
+-        "type": "method",
+-        "class": "Card::Entropic",
+-        "method": null
+-      },
+-      "user_input": "connection.date_subtract(\"?\", \"COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)\")",
+-      "confidence": "Weak",
+-      "cwe_id": [
+-        89
+-      ],
+-      "note": "No user input allowed"
+     }
+   ],
+   "brakeman_version": "8.0.1"
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 894c57b..d4da1b6 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -8,7 +8,7 @@ production: &production
+ 
+   # Application cleanup
+   auto_postpone_all_due:
+-    command: "Card.auto_postpone_all_due"
++    command: "Card.auto_postpone_all_due_later"
+     schedule: every hour at minute 50
+   delete_unused_tags:
+     class: DeleteUnusedTagsJob
+diff --git a/test/models/card/entropic_test.rb b/test/models/card/entropic_test.rb
+index 848cfa7..0a3c94b 100644
+--- a/test/models/card/entropic_test.rb
++++ b/test/models/card/entropic_test.rb
+@@ -85,4 +85,63 @@ class Card::EntropicTest < ActiveSupport::TestCase
+ 
+     assert_equal(cards(:logo, :radio).to_set, Card.postponing_soon.to_set)
+   end
++
++  test "auto postpone all due handles entropy periods that came in from an import" do
++    entropies(:writebook_board).update_column :auto_postpone_period, 45.days.to_i
++    cards(:logo).update!(last_active_at: 46.days.ago)
++    cards(:shipping).update!(last_active_at: 44.days.ago)
++
++    Card.auto_postpone_all_due
++
++    assert cards(:logo).reload.postponed?
++    assert_not cards(:shipping).reload.postponed?
++  end
++
++  test "auto postpone all due ignores cards whose board and account have no entropy" do
++    entropies(:writebook_board).destroy
++    entropies("37s_account").destroy
++    cards(:logo).update!(last_active_at: 10.years.ago)
++
++    assert_no_difference -> { Card.postponed.count } do
++      Card.auto_postpone_all_due
++    end
++  end
++
++  test "entropy deadlines are resolved once instead of once per card" do
++    assert_no_match(/datetime\(|DATE_SUB/, Card.due_to_be_postponed.to_sql)
++    assert_no_match(/datetime\(|DATE_SUB/, Card.postponing_soon.to_sql)
++  end
++
++  test "auto postpone all due later hands the postponing over to batched jobs" do
++    cards(:logo).update!(last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period)
++
++    assert_enqueued_with job: Card::AutoPostponeJob, args: [ [ cards(:logo).id ] ] do
++      Card.auto_postpone_all_due_later
++    end
++
++    assert_not cards(:logo).reload.postponed?
++
++    perform_enqueued_jobs
++
++    assert cards(:logo).reload.postponed?
++    assert_equal accounts("37s").system_user, cards(:logo).postponed_by
++  end
++
++  test "auto postpone all due later enqueues one job per batch, not per card" do
++    cards(:logo, :shipping).each { |card| card.update!(last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period) }
++
++    assert_enqueued_jobs 1, only: Card::AutoPostponeJob do
++      Card.auto_postpone_all_due_later
++    end
++  end
++
++  test "batched auto postponing skips cards that became active again in the meantime" do
++    cards(:logo).update!(last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period)
++    Card.auto_postpone_all_due_later
++
++    cards(:logo).update!(last_active_at: Time.current)
++    perform_enqueued_jobs
++
++    assert_not cards(:logo).reload.postponed?
++  end
+ end

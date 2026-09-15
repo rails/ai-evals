@@ -1,0 +1,476 @@
+diff --git a/app/jobs/card/auto_postpone_due_job.rb b/app/jobs/card/auto_postpone_due_job.rb
+new file mode 100644
+index 0000000..75e06bf
+--- /dev/null
++++ b/app/jobs/card/auto_postpone_due_job.rb
+@@ -0,0 +1,11 @@
++# Sweeps the cards that have been quiet for longer than their entropy period. The sweep is
++# idempotent, so when a big backlog keeps one run going past the hour, we drop the run that was
++# due to start rather than stacking a second sweep on top of it.
++class Card::AutoPostponeDueJob < ApplicationJob
++  queue_as :backend
++  limits_concurrency to: 1, key: :auto_postpone_due, duration: 1.hour, on_conflict: :discard
++
++  def perform
++    Card.auto_postpone_all_due
++  end
++end
+diff --git a/app/models/account/data_transfer/manifest.rb b/app/models/account/data_transfer/manifest.rb
+index 11aaf6a..ed2d438 100644
+--- a/app/models/account/data_transfer/manifest.rb
++++ b/app/models/account/data_transfer/manifest.rb
+@@ -36,8 +36,10 @@ class Account::DataTransfer::Manifest
+         *record_sets_for(
+           ::Board::Publication,
+           ::Webhook,
+-          ::Access,
+-          ::Card,
++          ::Access
++        ),
++        card_record_set,
++        *record_sets_for(
+           ::Comment,
+           ::Step,
+           ::Assignment,
+@@ -65,6 +67,13 @@ class Account::DataTransfer::Manifest
+       ].then { set_importable_model_names(it) }
+     end
+ 
++    # Whether a card can be auto postponed is a cache the import rebuilds for itself, so it
++    # doesn't travel with the export. That also keeps exports from older installs importable.
++    def card_record_set
++      Account::DataTransfer::RecordSet.new account: account, model: ::Card,
++        attributes: ::Card.column_names - [ "auto_postponable" ]
++    end
++
+     def record_sets_for(*models)
+       models.map do |model|
+         record_set_for(model)
+diff --git a/app/models/account/import.rb b/app/models/account/import.rb
+index 2bf1b88..04794f4 100644
+--- a/app/models/account/import.rb
++++ b/app/models/account/import.rb
+@@ -49,6 +49,7 @@ class Account::Import < ApplicationRecord
+ 
+     add_importer_to_all_access_boards
+     reconcile_cards_count
++    reconcile_cards_postponability
+     reconcile_account_storage
+ 
+     mark_completed
+@@ -83,6 +84,10 @@ class Account::Import < ApplicationRecord
+       account.update_column :cards_count, [ account.cards_count, account.cards.maximum(:number).to_i ].max
+     end
+ 
++    def reconcile_cards_postponability
++      account.cards.reconcile_auto_postponability
++    end
++
+     def add_importer_to_all_access_boards
+       importer = account.users.find_by!(identity: identity)
+ 
+diff --git a/app/models/card/entropic.rb b/app/models/card/entropic.rb
+index ebaad78..02adef9 100644
+--- a/app/models/card/entropic.rb
++++ b/app/models/card/entropic.rb
+@@ -1,32 +1,57 @@
+ module Card::Entropic
+   extend ActiveSupport::Concern
+ 
++  ENTROPY_PERIOD = "COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)"
++
+   included do
+-    scope :due_to_be_postponed, -> do
+-      active
+-        .joins(board: :account)
++    # Whether a card is still in play — published, open, and not already postponed — hangs on
++    # rows in other tables, so the sweep had to join them all and look at every card in the
++    # install to find the few it could act on. We cache it here, and let the sweep start from an
++    # index instead. The flag is only ever a hint: the conditions below still have the last word,
++    # so a stale flag may cost the sweep a few extra rows, but it can never hide a card from it.
++    scope :auto_postponable, -> { where(auto_postponable: true) }
++
++    scope :with_entropy_periods, -> do
++      joins(board: :account)
+         .left_outer_joins(board: :entropy)
+         .joins("LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.account_id = accounts.id AND account_entropies.container_type = 'Account' AND account_entropies.container_id = accounts.id")
+-        .where("last_active_at <= #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)')}", Time.now)
++    end
++
++    scope :due_to_be_postponed, -> do
++      auto_postponable.active.with_entropy_periods
++        .where("last_active_at <= #{connection.date_subtract('?', ENTROPY_PERIOD)}", Time.now)
+     end
+ 
+     scope :postponing_soon, -> do
+       now = Time.now
+-      active
+-        .joins(board: :account)
+-        .left_outer_joins(board: :entropy)
+-        .joins("LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.account_id = accounts.id AND account_entropies.container_type = 'Account' AND account_entropies.container_id = accounts.id")
+-        .where("last_active_at > #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)')}", now)
+-        .where("last_active_at <= #{connection.date_subtract('?', 'COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period) * 0.75')}", now)
++
++      auto_postponable.active.with_entropy_periods
++        .where("last_active_at > #{connection.date_subtract('?', ENTROPY_PERIOD)}", now)
++        .where("last_active_at <= #{connection.date_subtract('?', "#{ENTROPY_PERIOD} * 0.75")}", now)
+     end
+ 
++    before_save :assign_auto_postponability, if: -> { new_record? || status_changed? }
++
+     delegate :auto_postpone_period, to: :board
+   end
+ 
+   class_methods do
+     def auto_postpone_all_due
+-      due_to_be_postponed.find_each do |card|
+-        card.auto_postpone(user: card.account.system_user)
++      system_users = {}
++
++      due_to_be_postponed.includes(:account).find_each do |card|
++        card.auto_postpone(user: system_users[card.account_id] ||= card.account.system_user)
++      end
++    end
++
++    # Bulk inserts — imports, backfills — skip the callbacks that keep the cached flag current,
++    # which leaves the sweep looking at cards it can't act on. Recompute it for these cards.
++    def reconcile_auto_postponability
++      in_batches do |cards|
++        postponable_ids = cards.active.ids
++
++        cards.where(id: postponable_ids).update_all(auto_postponable: true)
++        cards.where.not(id: postponable_ids).update_all(auto_postponable: false)
+       end
+     end
+   end
+@@ -38,4 +63,16 @@ module Card::Entropic
+   def entropic?
+     entropy.present?
+   end
++
++  # Closures and not nows report in here as they come and go, so that cards leave the sweep as
++  # soon as they're closed or postponed, and join it again when they're reopened or resumed.
++  def reconcile_auto_postponability
++    update_column :auto_postponable, self.class.active.where(id: id).exists?
++  end
++
++  private
++    def assign_auto_postponability
++      # A card that's just being created can't have been closed or postponed yet.
++      self.auto_postponable = new_record? ? published? : active?
++    end
+ end
+diff --git a/app/models/card/not_now.rb b/app/models/card/not_now.rb
+index f99aaee..0d5d294 100644
+--- a/app/models/card/not_now.rb
++++ b/app/models/card/not_now.rb
+@@ -2,4 +2,7 @@ class Card::NotNow < ApplicationRecord
+   belongs_to :account, default: -> { card.account }
+   belongs_to :card, class_name: "::Card", touch: true
+   belongs_to :user, optional: true
++
++  after_create  -> { card.reconcile_auto_postponability }
++  after_destroy -> { card.reconcile_auto_postponability }, unless: :destroyed_by_association
+ end
+diff --git a/app/models/closure.rb b/app/models/closure.rb
+index 512de66..a18d2f7 100644
+--- a/app/models/closure.rb
++++ b/app/models/closure.rb
+@@ -2,4 +2,7 @@ class Closure < ApplicationRecord
+   belongs_to :account, default: -> { card.account }
+   belongs_to :card, touch: true
+   belongs_to :user, optional: true
++
++  after_create  -> { card.reconcile_auto_postponability }
++  after_destroy -> { card.reconcile_auto_postponability }, unless: :destroyed_by_association
+ end
+diff --git a/config/brakeman.ignore b/config/brakeman.ignore
+index 25441a6..fe49ee8 100644
+--- a/config/brakeman.ignore
++++ b/config/brakeman.ignore
+@@ -3,13 +3,13 @@
+     {
+       "warning_type": "SQL Injection",
+       "warning_code": 0,
+-      "fingerprint": "4ea2e6d704b817af1d896dcdf148a89da8b9e428b3327497631ef8d9ed587307",
++      "fingerprint": "af9d5f4dbaf167bb5d72c6a2c2af76ace47f332663fed7cc99f384a13c6b4925",
+       "check_name": "SQL",
+       "message": "Possible SQL injection",
+       "file": "app/models/card/entropic.rb",
+-      "line": 19,
++      "line": 29,
+       "link": "https://brakemanscanner.org/docs/warning_types/sql_injection/",
+-      "code": "active.joins(:board => :account).left_outer_joins(:board => :entropy).joins(\"LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.account_id = accounts.id AND account_entropies.container_type = 'Account' AND account_entropies.container_id = accounts.id\").where(\"last_active_at > #{connection.date_subtract(\"?\", \"COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)\")}\", Time.now)",
++      "code": "auto_postponable.active.with_entropy_periods.where(\"last_active_at > #{connection.date_subtract(\"?\", \"COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)\")}\", Time.now)",
+       "render_path": null,
+       "location": {
+         "type": "method",
+@@ -118,13 +118,13 @@
+     {
+       "warning_type": "SQL Injection",
+       "warning_code": 0,
+-      "fingerprint": "bbd8fe3cbbc6b393df770d3142d6fa46e2b9441b21f48a52175211acaae4efad",
++      "fingerprint": "ed9a31560546fb407d0f0fc45ba1c57ec005b8a485ceedffd42610ea453dd74b",
+       "check_name": "SQL",
+       "message": "Possible SQL injection",
+       "file": "app/models/card/entropic.rb",
+-      "line": 10,
++      "line": 22,
+       "link": "https://brakemanscanner.org/docs/warning_types/sql_injection/",
+-      "code": "active.joins(:board => :account).left_outer_joins(:board => :entropy).joins(\"LEFT OUTER JOIN entropies AS account_entropies ON account_entropies.account_id = accounts.id AND account_entropies.container_type = 'Account' AND account_entropies.container_id = accounts.id\").where(\"last_active_at <= #{connection.date_subtract(\"?\", \"COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)\")}\", Time.now)",
++      "code": "auto_postponable.active.with_entropy_periods.where(\"last_active_at <= #{connection.date_subtract(\"?\", \"COALESCE(entropies.auto_postpone_period, account_entropies.auto_postpone_period)\")}\", Time.now)",
+       "render_path": null,
+       "location": {
+         "type": "method",
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 894c57b..ec5c2ad 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -8,7 +8,7 @@ production: &production
+ 
+   # Application cleanup
+   auto_postpone_all_due:
+-    command: "Card.auto_postpone_all_due"
++    class: "Card::AutoPostponeDueJob"
+     schedule: every hour at minute 50
+   delete_unused_tags:
+     class: DeleteUnusedTagsJob
+diff --git a/db/migrate/20260220120000_add_auto_postponable_to_cards.rb b/db/migrate/20260220120000_add_auto_postponable_to_cards.rb
+new file mode 100644
+index 0000000..f0d484f
+--- /dev/null
++++ b/db/migrate/20260220120000_add_auto_postponable_to_cards.rb
+@@ -0,0 +1,14 @@
++class AddAutoPostponableToCards < ActiveRecord::Migration[8.2]
++  def up
++    add_column :cards, :auto_postponable, :boolean, default: true, null: false
++    add_index :cards, [ :auto_postponable, :last_active_at ]
++
++    Card.reset_column_information
++    Card.reconcile_auto_postponability
++  end
++
++  def down
++    remove_index :cards, [ :auto_postponable, :last_active_at ]
++    remove_column :cards, :auto_postponable
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 99e6be9..1fdd76e 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_02_18_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_02_20_120000) do
+   create_table "accesses", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -227,8 +227,10 @@ ActiveRecord::Schema[8.2].define(version: 2026_02_18_120000) do
+     t.string "status", default: "drafted", null: false
+     t.string "title"
+     t.datetime "updated_at", null: false
++    t.boolean "auto_postponable", default: true, null: false
+     t.index ["account_id", "last_active_at", "status"], name: "index_cards_on_account_id_and_last_active_at_and_status"
+     t.index ["account_id", "number"], name: "index_cards_on_account_id_and_number", unique: true
++    t.index ["auto_postponable", "last_active_at"], name: "index_cards_on_auto_postponable_and_last_active_at"
+     t.index ["board_id"], name: "index_cards_on_board_id"
+     t.index ["column_id"], name: "index_cards_on_column_id"
+   end
+diff --git a/db/schema_sqlite.rb b/db/schema_sqlite.rb
+index 00125d1..2abced0 100644
+--- a/db/schema_sqlite.rb
++++ b/db/schema_sqlite.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_02_18_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_02_20_120000) do
+   create_table "accesses", id: :uuid, force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -227,8 +227,10 @@ ActiveRecord::Schema[8.2].define(version: 2026_02_18_120000) do
+     t.string "status", limit: 255, default: "drafted", null: false
+     t.string "title", limit: 255
+     t.datetime "updated_at", null: false
++    t.boolean "auto_postponable", default: true, null: false
+     t.index ["account_id", "last_active_at", "status"], name: "index_cards_on_account_id_and_last_active_at_and_status"
+     t.index ["account_id", "number"], name: "index_cards_on_account_id_and_number", unique: true
++    t.index ["auto_postponable", "last_active_at"], name: "index_cards_on_auto_postponable_and_last_active_at"
+     t.index ["board_id"], name: "index_cards_on_board_id"
+     t.index ["column_id"], name: "index_cards_on_column_id"
+   end
+diff --git a/test/jobs/card/auto_postpone_due_job_test.rb b/test/jobs/card/auto_postpone_due_job_test.rb
+new file mode 100644
+index 0000000..318a43f
+--- /dev/null
++++ b/test/jobs/card/auto_postpone_due_job_test.rb
+@@ -0,0 +1,19 @@
++require "test_helper"
++
++class Card::AutoPostponeDueJobTest < ActiveJob::TestCase
++  test "postpones the cards that are due" do
++    due = cards(:logo)
++    due.update!(last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period)
++
++    assert_difference -> { Card.postponed.count }, +1 do
++      Card::AutoPostponeDueJob.perform_now
++    end
++
++    assert due.reload.postponed?
++  end
++
++  test "a sweep that's still running discards the next one instead of stacking it" do
++    assert_equal 1, Card::AutoPostponeDueJob.concurrency_limit
++    assert_equal :discard, Card::AutoPostponeDueJob.concurrency_on_conflict
++  end
++end
+diff --git a/test/models/account/import_test.rb b/test/models/account/import_test.rb
+index c1e9c2f..090b850 100644
+--- a/test/models/account/import_test.rb
++++ b/test/models/account/import_test.rb
+@@ -220,6 +220,37 @@ class Account::ImportTest < ActiveSupport::TestCase
+     export_tempfile&.unlink
+   end
+ 
++  test "import reconciles the in play flag so the sweep skips closed cards" do
++    source_account = accounts("37s")
++    exporter = users(:david)
++    identity = exporter.identity
++    closed_card_number = cards(:shipping).number
++
++    export = Account::Export.create!(account: source_account, user: exporter)
++    export.build
++
++    export_tempfile = Tempfile.new([ "export", ".zip" ])
++    export.file.open { |f| FileUtils.cp(f.path, export_tempfile.path) }
++
++    source_account.destroy!
++
++    target_account = Account.create_with_owner(account: { name: "Import Test" }, owner: { identity: identity, name: exporter.name })
++    import = Account::Import.create!(identity: identity, account: target_account)
++    Current.set(account: target_account) do
++      import.file.attach(io: File.open(export_tempfile.path), filename: "export.zip", content_type: "application/zip")
++    end
++
++    import.check
++    import.process
++
++    imported_closed_card = target_account.cards.find_by!(number: closed_card_number)
++    assert imported_closed_card.closed?
++    assert_not imported_closed_card.auto_postponable?
++  ensure
++    export_tempfile&.close
++    export_tempfile&.unlink
++  end
++
+   private
+     def account_digest(account)
+       {
+diff --git a/test/models/card/entropic_test.rb b/test/models/card/entropic_test.rb
+index 848cfa7..c4f8320 100644
+--- a/test/models/card/entropic_test.rb
++++ b/test/models/card/entropic_test.rb
+@@ -85,4 +85,99 @@ class Card::EntropicTest < ActiveSupport::TestCase
+ 
+     assert_equal(cards(:logo, :radio).to_set, Card.postponing_soon.to_set)
+   end
++
++  test "cards leave the sweep when they are closed and rejoin it when they are reopened" do
++    card = cards(:logo)
++    card.update!(last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period)
++    assert_includes Card.due_to_be_postponed, card
++
++    card.close
++    assert_not card.reload.auto_postponable?
++    assert_not_includes Card.due_to_be_postponed, card
++
++    card.reopen
++    assert card.reload.auto_postponable?
++
++    # Reopening counts as activity, so the card only falls due again once it goes quiet.
++    card.update!(last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period)
++    assert_includes Card.due_to_be_postponed, card
++  end
++
++  test "cards leave the sweep when they are postponed and rejoin it when they are resumed" do
++    card = cards(:logo)
++    card.update!(last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period)
++
++    card.postpone
++    assert_not card.reload.auto_postponable?
++    assert_not_includes Card.due_to_be_postponed, card
++
++    card.resume
++    assert card.reload.auto_postponable?
++
++    card.update!(last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period)
++    assert_includes Card.due_to_be_postponed, card
++  end
++
++  test "drafts stay out of the sweep until they are published" do
++    card = boards(:writebook).cards.create!(creator: users(:david), status: "drafted",
++      last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period)
++
++    assert_not card.auto_postponable?
++    assert_not_includes Card.due_to_be_postponed, card
++
++    card.publish
++    assert card.reload.auto_postponable?
++    assert_includes Card.due_to_be_postponed, card
++  end
++
++  test "cards inserted in bulk are swept even though they skipped the callbacks" do
++    card = insert_card last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period
++
++    assert card.auto_postponable?
++    assert_includes Card.due_to_be_postponed, card
++
++    Card.auto_postpone_all_due
++    assert card.reload.postponed?
++  end
++
++  test "an out of date in play flag never hides a card from the sweep" do
++    card = insert_card last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period
++    insert_closure_for card
++
++    assert card.reload.auto_postponable?, "the flag is out of date after a bulk insert"
++    assert_not_includes Card.due_to_be_postponed, card
++
++    assert_no_difference -> { Card.postponed.count } do
++      Card.auto_postpone_all_due
++    end
++  end
++
++  test "reconciling recomputes the in play flag for cards inserted in bulk" do
++    postponable = insert_card
++    closed = insert_card
++    insert_closure_for closed
++
++    accounts("37s").cards.reconcile_auto_postponability
++
++    assert postponable.reload.auto_postponable?
++    assert_not closed.reload.auto_postponable?
++    assert_not cards(:shipping).reload.auto_postponable?
++  end
++
++  private
++    def insert_card(**attributes)
++      id = ActiveRecord::Type::Uuid.generate
++
++      Card.insert_all! [ { id: id, account_id: accounts("37s").id, board_id: boards(:writebook).id,
++        creator_id: users(:david).id, number: Card.maximum(:number).to_i + 1, status: "published",
++        title: "Bulk inserted", created_at: 1.week.ago, updated_at: 1.week.ago,
++        last_active_at: 1.week.ago }.merge(attributes) ]
++
++      Card.find(id)
++    end
++
++    def insert_closure_for(card)
++      Closure.insert_all! [ { id: ActiveRecord::Type::Uuid.generate, account_id: card.account_id,
++        card_id: card.id, user_id: users(:david).id, created_at: Time.current, updated_at: Time.current } ]
++    end
+ end
