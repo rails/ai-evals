@@ -7,7 +7,7 @@ FROM docker.io/library/ruby:$RUBY_VERSION-slim
 WORKDIR /app
 
 RUN apt-get update -qq && \
-    apt-get install --no-install-recommends -y build-essential chromium chromium-driver curl ffmpeg git libssl-dev libyaml-dev libvips pkg-config sqlite3 && \
+    apt-get install --no-install-recommends -y build-essential chromium chromium-driver curl ffmpeg git iproute2 libssl-dev libyaml-dev libvips pkg-config sqlite3 && \
     rm -rf /var/lib/apt/lists /var/cache/apt/archives
 
 # Chromium needs --no-sandbox to run as root, and --disable-dev-shm-usage to minimize the risk of a small /dev/shm crashing it.

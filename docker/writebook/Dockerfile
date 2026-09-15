@@ -7,7 +7,7 @@ FROM docker.io/library/ruby:$RUBY_VERSION-slim
 WORKDIR /app
 
 RUN apt-get update -qq && \
-    apt-get install --no-install-recommends -y build-essential git libyaml-dev libvips pkg-config && \
+    apt-get install --no-install-recommends -y build-essential git iproute2 libyaml-dev libvips pkg-config && \
     rm -rf /var/lib/apt/lists /var/cache/apt/archives
 
 # Fetch the tagged release and keep only its files

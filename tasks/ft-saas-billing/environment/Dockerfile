@@ -1,5 +1,9 @@
 FROM ghcr.io/evilmartians/lemans-fizzy@sha256:606372223ae2b1184a5973a8bbf4faa6fdfa16e039d3256b1234e9eeabf489a1
 
+RUN apt-get update -qq && \
+    apt-get install --no-install-recommends -y iproute2 && \
+    rm -rf /var/lib/apt/lists /var/cache/apt/archives
+
 # SaaS mode on SQLite: the private queenbee client replaced by a local stand-in,
 # a SQLite arm for the saas database, MySQL-only middleware guarded.
 COPY saas-environment.patch /tmp/saas-environment.patch
