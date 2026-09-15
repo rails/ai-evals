@@ -1,0 +1,236 @@
+diff --git a/app/models/card/auto_postponer.rb b/app/models/card/auto_postponer.rb
+new file mode 100644
+index 0000000..c99a65b
+--- /dev/null
++++ b/app/models/card/auto_postponer.rb
+@@ -0,0 +1,165 @@
++# Moves all cards from a `due_to_be_postponed` scope to "Not Now" in bulk.
++#
++# The per-card version works through the regular domain callbacks, which is what
++# we want for a single card but is needlessly expensive when the entropy sweep
++# has to process tens of thousands of them: every card triggers a full event,
++# system comment, search indexing, watch, activity spike cleanup, and several
++# notifications/jobs.
++#
++# This class performs those writes per batch instead, preserving the resulting
++# state while bypassing the callback cascade.
++class Card::AutoPostponer
++  BATCH_SIZE = 1_000
++
++  EVENT_ACTION = "card_auto_postponed"
++  COMMENT_BODY = "<strong>Moved</strong> to “Not Now” due to inactivity"
++  COMMENT_PLAIN_BODY = "Moved to “Not Now” due to inactivity"
++
++  def initialize(scope)
++    @scope = scope
++  end
++
++  def call
++    @scope.in_batches(of: BATCH_SIZE) do |batch|
++      postpone batch
++    end
++  end
++
++  private
++    def postpone(batch)
++      cards = batch.pluck(:id, :board_id, :account_id)
++      return if cards.empty?
++
++      now = Time.current
++      system_users = system_users_for(cards)
++
++      Card.transaction do
++        create_not_nows cards, system_users, now
++        create_events cards, system_users, now
++        create_comments cards, system_users, now
++        create_watches cards, system_users, now
++
++        touch_cards_and_boards cards, now
++        destroy_activity_spikes cards
++      end
++      dispatch_webhooks cards, now
++    end
++
++    def system_users_for(cards)
++      account_ids = cards.map(&:last).uniq
++      User.where(account_id: account_ids, role: :system).pluck(:account_id, :id).to_h
++    end
++
++    def create_not_nows(cards, system_users, now)
++      rows = cards.map do |card_id, _board_id, account_id|
++        { id: uuid, account_id: account_id, card_id: card_id,
++          user_id: system_users.fetch(account_id), created_at: now, updated_at: now }
++      end
++
++      Card::NotNow.insert_all rows, unique_by: :card_id
++    end
++
++    def create_events(cards, system_users, now)
++      rows = cards.map do |card_id, board_id, account_id|
++        { id: uuid, account_id: account_id, board_id: board_id,
++          creator_id: system_users.fetch(account_id), eventable_type: "Card", eventable_id: card_id,
++          action: EVENT_ACTION, created_at: now, updated_at: now }
++      end
++
++      Event.insert_all rows
++    end
++
++    def dispatch_webhooks(cards, now)
++      board_ids = cards.map { |card| card[1] }.uniq
++      subscribed_board_ids = Webhook.active.where(board_id: board_ids).triggered_by_action(EVENT_ACTION).distinct.pluck(:board_id)
++      return if subscribed_board_ids.empty?
++
++      events = Event.where(board_id: subscribed_board_ids, eventable_type: "Card", eventable_id: cards.map(&:first), action: EVENT_ACTION, created_at: now..)
++      ActiveJob.perform_all_later events.map { |event| Event::WebhookDispatchJob.new(event) }
++    end
++
++    def create_comments(cards, system_users, now)
++      board_ids = cards.to_h { |card_id, board_id, _account_id| [ card_id, board_id ] }
++
++      comments = cards.map do |card_id, _board_id, account_id|
++        { id: uuid, account_id: account_id, card_id: card_id,
++          creator_id: system_users.fetch(account_id), created_at: now, updated_at: now }
++      end
++      Comment.insert_all comments
++
++      rich_texts = comments.map do |comment|
++        { id: uuid, account_id: comment[:account_id], body: COMMENT_BODY, name: "body",
++          record_id: comment[:id], record_type: "Comment", created_at: now, updated_at: now }
++      end
++      ActionText::RichText.insert_all rich_texts
++
++      index_comments comments, board_ids
++    end
++
++    def index_comments(comments, board_ids)
++      if Search::Record.connection.adapter_name == "SQLite"
++        index_comments_in_sqlite comments, board_ids
++      else
++        index_comments_in_search_shards comments, board_ids
++      end
++    end
++
++    def index_comments_in_sqlite(comments, board_ids)
++      rows = comments.map do |comment|
++        { account_id: comment[:account_id], board_id: board_ids.fetch(comment[:card_id]),
++          card_id: comment[:card_id], searchable_type: "Comment", searchable_id: comment[:id],
++          title: nil, content: COMMENT_PLAIN_BODY, created_at: comment[:created_at] }
++      end
++
++      ids = Search::Record.insert_all(rows).rows.flatten
++      Search::Record::SQLite::Fts.bulk_upsert ids.map { |id| [ id, nil, COMMENT_PLAIN_BODY ] }
++    end
++
++    def index_comments_in_search_shards(comments, board_ids)
++      comments.group_by { |comment| comment[:account_id] }.each do |account_id, account_comments|
++        rows = account_comments.map do |comment|
++          { id: uuid, account_id: account_id, account_key: "account#{account_id}",
++            board_id: board_ids.fetch(comment[:card_id]), card_id: comment[:card_id],
++            searchable_type: "Comment", searchable_id: comment[:id], title: nil,
++            content: Search::Stemmer.stem(COMMENT_PLAIN_BODY), created_at: comment[:created_at] }
++        end
++
++        Search::Record.for(account_id).insert_all rows
++      end
++    end
++
++    def create_watches(cards, system_users, now)
++      user_ids = system_users.values
++      card_ids = cards.map(&:first)
++      existing_watches = Watch.where(card_id: card_ids, user_id: user_ids).pluck(:id, :card_id, :user_id)
++      existing_watch_pairs = existing_watches.map { |_id, card_id, user_id| [ card_id, user_id ] }.to_set
++
++      rows = cards.filter_map do |card_id, _board_id, account_id|
++        user_id = system_users.fetch(account_id)
++        next if existing_watch_pairs.include?([ card_id, user_id ])
++
++        { id: uuid, account_id: account_id, card_id: card_id, user_id: user_id,
++          watching: true, created_at: now, updated_at: now }
++      end
++      Watch.insert_all rows if rows.any?
++      if existing_watches.any?
++        Watch.where(id: existing_watches.map(&:first)).update_all watching: true
++      end
++    end
++
++    def touch_cards_and_boards(cards, now)
++      card_ids = cards.map(&:first)
++      board_ids = cards.map { |card| card[1] }.uniq
++
++      Card.where(id: card_ids).update_all column_id: nil, last_active_at: now, updated_at: now
++      Board.where(id: board_ids).update_all updated_at: now
++    end
++
++    def destroy_activity_spikes(cards)
++      Card::ActivitySpike.where(card_id: cards.map(&:first)).delete_all
++    end
++
++    def uuid
++      ActiveRecord::Type::Uuid.generate
++    end
++end
+diff --git a/app/models/card/entropic.rb b/app/models/card/entropic.rb
+index ebaad78..c7dad34 100644
+--- a/app/models/card/entropic.rb
++++ b/app/models/card/entropic.rb
+@@ -25,9 +25,7 @@ module Card::Entropic
+ 
+   class_methods do
+     def auto_postpone_all_due
+-      due_to_be_postponed.find_each do |card|
+-        card.auto_postpone(user: card.account.system_user)
+-      end
++      Card::AutoPostponer.new(due_to_be_postponed).call
+     end
+   end
+ 
+diff --git a/app/models/search/record/sqlite/fts.rb b/app/models/search/record/sqlite/fts.rb
+index ed7b378..1453ec6 100644
+--- a/app/models/search/record/sqlite/fts.rb
++++ b/app/models/search/record/sqlite/fts.rb
+@@ -18,4 +18,17 @@ class Search::Record::SQLite::Fts < ApplicationRecord
+       [ rowid, title, content ]
+     )
+   end
++
++  def self.bulk_upsert(records)
++    return if records.empty?
++
++    placeholders = Array.new(records.size, "(?, ?, ?)").join(", ")
++    values = records.flat_map { |rowid, title, content| [ rowid, title, content ] }
++
++    connection.exec_query(
++      "INSERT OR REPLACE INTO search_records_fts(rowid, title, content) VALUES #{placeholders}",
++      "Search::Record::SQLite::Fts Bulk Upsert",
++      values
++    )
++  end
+ end
+diff --git a/test/models/card/entropic_test.rb b/test/models/card/entropic_test.rb
+index 848cfa7..0f2e67a 100644
+--- a/test/models/card/entropic_test.rb
++++ b/test/models/card/entropic_test.rb
+@@ -58,6 +58,23 @@ class Card::EntropicTest < ActiveSupport::TestCase
+     assert cards(:logo).reload.postponed?
+     assert_not cards(:shipping).reload.postponed?
+   end
++  test "auto postpone all due records the system activity for each card" do
++    card = cards(:logo)
++    card.update!(last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period)
++
++    assert_difference -> { Card.postponed.count }, +1 do
++      assert_difference -> { Event.where(action: "card_auto_postponed").count }, +1 do
++        assert_difference -> { card.comments.count }, +1 do
++          Card.auto_postpone_all_due
++        end
++      end
++    end
++
++    assert_equal "card_auto_postponed", card.reload.events.last.action
++    assert_equal accounts("37s").system_user, card.postponed_by
++    assert_equal "Moved to “Not Now” due to inactivity", card.comments.last.body.to_plain_text
++    assert Search::Record.exists?(searchable_type: "Comment", searchable_id: card.comments.last.id)
++  end
+ 
+   test "postponing soon scope" do
+     cards(:logo, :shipping).each(&:published!)
