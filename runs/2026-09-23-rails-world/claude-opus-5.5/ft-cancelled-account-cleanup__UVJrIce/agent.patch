@@ -1,0 +1,250 @@
+diff --git a/app/jobs/account/incinerate_due_job.rb b/app/jobs/account/incinerate_due_job.rb
+new file mode 100644
+index 0000000..f2b1c65
+--- /dev/null
++++ b/app/jobs/account/incinerate_due_job.rb
+@@ -0,0 +1,18 @@
++class Account::IncinerateDueJob < ApplicationJob
++  queue_as :backend
++
++  def perform
++    Account.due_for_incineration.find_each do |account|
++      incinerate(account)
++    end
++  end
++
++  private
++    def incinerate(account)
++      account.incinerate
++    rescue => error
++      # Don't let one failing account prevent the others from being incinerated.
++      # It will be retried on the next run.
++      Rails.error.report(error, context: { account_id: account.id })
++    end
++end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index a6a70b1..92590d9 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -1,5 +1,5 @@
+ class Account < ApplicationRecord
+-  include Account::Storage, Cancellable, Entropic, MultiTenantable, Seedeable
++  include Account::Storage, Cancellable, Entropic, Incineratable, MultiTenantable, Seedeable
+ 
+   has_one :join_code, dependent: :destroy
+   has_many :users, dependent: :destroy
+diff --git a/app/models/account/incineratable.rb b/app/models/account/incineratable.rb
+index 2357b99..6fd9dc3 100644
+--- a/app/models/account/incineratable.rb
++++ b/app/models/account/incineratable.rb
+@@ -1,3 +1,37 @@
++# Permanently removes all data belonging to accounts that were cancelled more
++# than INCINERATION_GRACE_PERIOD ago. Until then, a cancelled account can be
++# reactivated.
+ module Account::Incineratable
++  extend ActiveSupport::Concern
++
+   INCINERATION_GRACE_PERIOD = 30.days
++
++  included do
++    scope :due_for_incineration, -> do
++      joins(:cancellation).where(account_cancellations: { created_at: ..INCINERATION_GRACE_PERIOD.ago })
++    end
++  end
++
++  def due_for_incineration?
++    cancelled? && cancellation.created_at <= INCINERATION_GRACE_PERIOD.ago
++  end
++
++  def incinerate
++    Current.with_account(self) do
++      Storage::Entry.without_tracking do
++        destroy!
++        delete_leftover_data
++      end
++    end
++  end
++
++  private
++    # Destroying the account cascades through its associations, but a few records
++    # can outlive it: storage ledger entries and totals aren't dependents of the
++    # account, and blobs are otherwise only purged asynchronously.
++    def delete_leftover_data
++      Storage::Entry.where(account_id: id).delete_all
++      Storage::Total.where(owner_type: self.class.name, owner_id: id).delete_all
++      ActiveStorage::Blob.where(account_id: id).find_each(&:purge)
++    end
+ end
+diff --git a/app/models/storage/entry.rb b/app/models/storage/entry.rb
+index d5ed775..de7780b 100644
+--- a/app/models/storage/entry.rb
++++ b/app/models/storage/entry.rb
+@@ -5,11 +5,25 @@ class Storage::Entry < ApplicationRecord
+ 
+   scope :pending, ->(last_entry_id) { where.not(id: ..last_entry_id) if last_entry_id }
+ 
++  # Skip ledger entries entirely, e.g. while incinerating a whole account, when
++  # detach callbacks would otherwise try to record entries for a deleted account.
++  def self.without_tracking
++    previous, ActiveSupport::IsolatedExecutionState[:storage_tracking_disabled] = ActiveSupport::IsolatedExecutionState[:storage_tracking_disabled], true
++    yield
++  ensure
++    ActiveSupport::IsolatedExecutionState[:storage_tracking_disabled] = previous
++  end
++
++  def self.tracking?
++    !ActiveSupport::IsolatedExecutionState[:storage_tracking_disabled]
++  end
++
+   # Records may be destroyed (during cascading deletes) but .id still works.
+   # Skip entirely if account is destroyed - no need to track storage for deleted accounts.
+   # Skip materialize jobs for destroyed boards since there's nothing to update.
+   def self.record(delta:, operation:, account:, board: nil, recordable: nil, blob: nil)
+     return if delta.zero?
++    return unless tracking?
+     return if account.destroyed?
+     entry = create! \
+       account_id: account.id,
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 549f6ae..cf11915 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -30,6 +30,9 @@ production: &production
+   cleanup_imports:
+     command: "Account::Import.cleanup"
+     schedule: every hour at minute 25
++  incinerate_due_accounts:
++    class: Account::IncinerateDueJob
++    schedule: every day at 03:15
+ <% if Fizzy.saas? %>
+   # Metrics
+   yabeda_actioncable:
+diff --git a/test/jobs/account/incinerate_due_job_test.rb b/test/jobs/account/incinerate_due_job_test.rb
+new file mode 100644
+index 0000000..8a1d83d
+--- /dev/null
++++ b/test/jobs/account/incinerate_due_job_test.rb
+@@ -0,0 +1,54 @@
++require "test_helper"
++
++class Account::IncinerateDueJobTest < ActiveJob::TestCase
++  setup do
++    @account = accounts(:"37s")
++    @user = users(:david)
++  end
++
++  test "incinerates accounts cancelled more than 30 days ago" do
++    @account.cancel(initiated_by: @user)
++
++    travel 31.days do
++      Account::IncinerateDueJob.perform_now
++    end
++
++    assert_not Account.exists?(@account.id)
++    assert_not User.exists?(account_id: @account.id)
++    assert_not Card.exists?(account_id: @account.id)
++    assert Account.exists?(accounts(:initech).id)
++  end
++
++  test "does not incinerate accounts cancelled recently" do
++    @account.cancel(initiated_by: @user)
++
++    travel 29.days do
++      Account::IncinerateDueJob.perform_now
++    end
++
++    assert Account.exists?(@account.id)
++    assert Card.exists?(account_id: @account.id)
++  end
++
++  test "does not incinerate active accounts" do
++    assert_no_difference -> { Account.count } do
++      Account::IncinerateDueJob.perform_now
++    end
++  end
++
++  test "keeps going when one account fails to incinerate" do
++    other = accounts(:initech)
++    @account.cancel(initiated_by: @user)
++    other.cancel(initiated_by: other.users.where.not(role: :system).first)
++
++    Account.any_instance.stubs(:incinerate).raises(StandardError).then.returns(true)
++    travel 31.days do
++      assert_nothing_raised { Account::IncinerateDueJob.perform_now }
++    end
++  end
++
++  test "is scheduled as a recurring task" do
++    config = ActiveSupport::ConfigurationFile.parse(Rails.root.join("config/recurring.yml"))
++    assert_equal "Account::IncinerateDueJob", config.dig("production", "incinerate_due_accounts", "class")
++  end
++end
+diff --git a/test/models/account/incineratable_test.rb b/test/models/account/incineratable_test.rb
+new file mode 100644
+index 0000000..dc70b16
+--- /dev/null
++++ b/test/models/account/incineratable_test.rb
+@@ -0,0 +1,63 @@
++require "test_helper"
++
++class Account::IncineratableTest < ActiveSupport::TestCase
++  setup do
++    @account = accounts(:"37s")
++    @user = users(:david)
++  end
++
++  test "due_for_incineration includes only accounts cancelled more than the grace period ago" do
++    @account.cancel(initiated_by: @user)
++    assert_not_includes Account.due_for_incineration, @account
++    assert_not @account.due_for_incineration?
++
++    travel Account::INCINERATION_GRACE_PERIOD + 1.minute do
++      assert_includes Account.due_for_incineration, @account
++      assert @account.reload.due_for_incineration?
++      assert_not_includes Account.due_for_incineration, accounts(:initech)
++    end
++  end
++
++  test "reactivated accounts are not due for incineration" do
++    @account.cancel(initiated_by: @user)
++    @account.reactivate
++
++    travel Account::INCINERATION_GRACE_PERIOD + 1.minute do
++      assert_not_includes Account.due_for_incineration, @account
++    end
++  end
++
++  test "incinerate removes all data associated with the account" do
++    Current.session = sessions(:david)
++    card = @account.cards.first
++    card.image.attach(io: file_fixture("moon.jpg").open, filename: "moon.jpg", content_type: "image/jpeg")
++    @account.materialize_storage
++
++    other_account = accounts(:initech)
++    other_counts = account_scoped_models.to_h { |model| [ model, model.where(account_id: other_account.id).count ] }
++
++    assert account_scoped_models.any? { |model| model.where(account_id: @account.id).exists? }
++    @account.incinerate
++
++    assert_not Account.exists?(@account.id)
++    account_scoped_models.each do |model|
++      assert_not model.where(account_id: @account.id).exists?, "Expected no #{model.name} records left for the incinerated account"
++    end
++    assert_not Storage::Total.exists?(owner_type: "Account", owner_id: @account.id)
++
++    account_scoped_models.each do |model|
++      assert_equal other_counts[model], model.where(account_id: other_account.id).count, "#{model.name} of other accounts should be untouched"
++    end
++  end
++
++  private
++    def account_scoped_models
++      Rails.application.eager_load!
++      ActiveRecord::Base.descendants
++        .reject(&:abstract_class?)
++        .select { |model| model.table_exists? && model.column_names.include?("account_id") }
++        .uniq(&:table_name)
++        .map(&:unscoped)
++        .map(&:klass)
++    end
++end
