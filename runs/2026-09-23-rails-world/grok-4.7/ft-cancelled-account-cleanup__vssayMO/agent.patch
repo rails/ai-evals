@@ -1,0 +1,381 @@
+diff --git a/app/jobs/account/incinerate_due_job.rb b/app/jobs/account/incinerate_due_job.rb
+new file mode 100644
+index 0000000..9388e10
+--- /dev/null
++++ b/app/jobs/account/incinerate_due_job.rb
+@@ -0,0 +1,14 @@
++class Account::IncinerateDueJob < ApplicationJob
++  queue_as :backend
++
++  # Recurring and global: never pin this job to whatever account happened
++  # to be current when it was enqueued. That account may already be gone.
++  def initialize(...)
++    super
++    @account = nil
++  end
++
++  def perform
++    Account.incinerate_due
++  end
++end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index a6a70b1..92590d9 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -1,5 +1,5 @@
+ class Account < ApplicationRecord
+-  include Account::Storage, Cancellable, Entropic, MultiTenantable, Seedeable
++  include Account::Storage, Cancellable, Entropic, Incineratable, MultiTenantable, Seedeable
+ 
+   has_one :join_code, dependent: :destroy
+   has_many :users, dependent: :destroy
+diff --git a/app/models/account/incineratable.rb b/app/models/account/incineratable.rb
+index 2357b99..0db500a 100644
+--- a/app/models/account/incineratable.rb
++++ b/app/models/account/incineratable.rb
+@@ -1,3 +1,30 @@
+ module Account::Incineratable
++  extend ActiveSupport::Concern
++
++  # Canceled accounts are kept for this long so they can be reactivated,
++  # then permanently removed.
+   INCINERATION_GRACE_PERIOD = 30.days
++
++  included do
++    scope :due_for_incineration, -> {
++      joins(:cancellation).where(account_cancellations: { created_at: ...INCINERATION_GRACE_PERIOD.ago })
++    }
++  end
++
++  class_methods do
++    def incinerate_due
++      due_for_incineration.find_each(&:incinerate)
++    end
++  end
++
++  def incinerate
++    with_lock do
++      Incineration.new(self).run if due_for_incineration?
++    end
++  end
++
++  def due_for_incineration?
++    cancellation = Account::Cancellation.find_by(account_id: id)
++    cancellation.present? && cancellation.created_at.before?(INCINERATION_GRACE_PERIOD.ago)
++  end
+ end
+diff --git a/app/models/account/incineratable/incineration.rb b/app/models/account/incineratable/incineration.rb
+new file mode 100644
+index 0000000..46626f4
+--- /dev/null
++++ b/app/models/account/incineratable/incineration.rb
+@@ -0,0 +1,122 @@
++class Account::Incineratable::Incineration
++  # Join tables that reference account-owned records but do not themselves
++  # carry an account_id.
++  USER_FILTER_JOINS = {
++    "assignees_filters" => "assignee_id",
++    "assigners_filters" => "assigner_id",
++    "creators_filters" => "creator_id",
++    "closers_filters" => "closer_id"
++  }.freeze
++
++  def initialize(account)
++    @account = account
++  end
++
++  def run
++    Current.without_account do
++      identity_ids = account.users.where.not(identity_id: nil).distinct.pluck(:identity_id)
++
++      purge_stored_files
++      delete_auxiliary_records
++      delete_account_scoped_records
++      delete_orphaned_identities(identity_ids)
++      account.delete
++    end
++  end
++
++  private
++    attr_reader :account
++
++    def purge_stored_files
++      ActiveStorage::Blob.where(account_id: account.id).find_each do |blob|
++        blob.service.delete(blob.key)
++        blob.service.delete_prefixed("variants/#{blob.key}/")
++        blob.service.delete_prefixed("previews/#{blob.key}/")
++      end
++    end
++
++    def delete_auxiliary_records
++      delete_filter_joins
++      delete_storage_totals
++      delete_search_index
++    end
++
++    def delete_filter_joins
++      filter_ids = ids_for(Filter)
++      user_ids = ids_for(User)
++      board_ids = ids_for(Board)
++      tag_ids = ids_for(Tag)
++
++      delete_matching("filters_tags", "filter_id", filter_ids)
++      delete_matching("filters_tags", "tag_id", tag_ids)
++      delete_matching("boards_filters", "filter_id", filter_ids)
++      delete_matching("boards_filters", "board_id", board_ids)
++
++      USER_FILTER_JOINS.each do |table, column|
++        delete_matching(table, "filter_id", filter_ids)
++        delete_matching(table, column, user_ids)
++      end
++    end
++
++    def delete_storage_totals
++      Storage::Total.where(owner_type: "Account", owner_id: account.id).delete_all
++      Storage::Total.where(owner_type: "Board", owner_id: ids_for(Board)).delete_all
++    end
++
++    def delete_search_index
++      return unless Fizzy.db_adapter.sqlite?
++      return unless defined?(Search::Record::SQLite::Fts)
++
++      Search::Record.where(account_id: account.id).in_batches do |records|
++        Search::Record::SQLite::Fts.where(rowid: records.pluck(:id)).delete_all
++      end
++    end
++
++    def delete_account_scoped_records
++      connection.tables.each do |table|
++        next if table == Account.table_name
++        next unless connection.column_exists?(table, :account_id)
++
++        self.class.deleter_for(table).where(account_id: account.id).delete_all
++      end
++    end
++
++    def delete_orphaned_identities(identity_ids)
++      return if identity_ids.empty?
++
++      Identity.where(id: identity_ids).where.missing(:users).find_each do |identity|
++        Account::Import.where(identity: identity).find_each(&:destroy)
++        identity.destroy
++      end
++    end
++
++    def ids_for(model)
++      model.where(account_id: account.id).reorder(nil).select(:id)
++    end
++
++    def delete_matching(table, column, ids)
++      return unless connection.data_source_exists?(table)
++
++      connection.delete(<<~SQL.squish)
++        DELETE FROM #{connection.quote_table_name(table)}
++        WHERE #{connection.quote_column_name(column)} IN (#{ids.to_sql})
++      SQL
++    end
++
++    def connection
++      Account.connection
++    end
++
++    class << self
++      def deleter_for(table_name)
++        deleters[table_name] ||= Class.new(ApplicationRecord) do
++          self.table_name = table_name
++          self.inheritance_column = :_type_disabled
++        end
++      end
++
++      def deleters
++        @deleters ||= {}
++      end
++    end
++end
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 549f6ae..d48c1cd 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -14,6 +14,11 @@ production: &production
+     class: DeleteUnusedTagsJob
+     schedule: every day at 04:02
+ 
++  incinerate_due_accounts:
++    class: Account::IncinerateDueJob
++    queue: backend
++    schedule: every day at 03:17
++
+   # Operations cleanup and backups
+   clear_solid_queue_finished_jobs:
+     command: "SolidQueue::Job.clear_finished_in_batches(sleep_between_batches: 0.3)"
+diff --git a/test/jobs/account/incinerate_due_job_test.rb b/test/jobs/account/incinerate_due_job_test.rb
+new file mode 100644
+index 0000000..65c2978
+--- /dev/null
++++ b/test/jobs/account/incinerate_due_job_test.rb
+@@ -0,0 +1,165 @@
++require "test_helper"
++
++class Account::IncinerateDueJobTest < ActiveJob::TestCase
++  setup do
++    @account = accounts(:"37s")
++    @kept = accounts(:initech)
++    @owner = users(:jason)
++  end
++
++  test "permanently removes accounts canceled more than 30 days ago and their data" do
++    card = cards(:logo)
++    card.image.attach(io: File.open(file_fixture("moon.jpg")), filename: "moon.jpg", content_type: "image/jpeg")
++    blob = card.image.blob
++    assert_equal @account.id, blob.account_id
++    assert blob.service.exist?(blob.key)
++
++    search_record = Search::Record.for(card.account_id).find_by!(searchable: card)
++    david_id = users(:david).id
++    david_identity_id = identities(:david).id
++    writebook_id = boards(:writebook).id
++    jz_id = users(:jz).id
++    filter_id = filters(:jz_assignments).id
++
++    Storage::Total.create!(owner: @account, bytes_stored: 10)
++    Storage::Total.create!(owner: boards(:writebook), bytes_stored: 5)
++
++    kept_user = users(:mike)
++    kept_identity = identities(:mike)
++
++    cancel_at(@account, 31.days.ago)
++
++    assert_difference -> { Account.count }, -1 do
++      Account::IncinerateDueJob.perform_now
++    end
++
++    assert_not Account.exists?(@account.id)
++    assert_not User.exists?(david_id)
++    assert_not Board.exists?(writebook_id)
++    assert_not Card.exists?(card.id)
++    assert_not Comment.where(account_id: @account.id).exists?
++    assert_not Event.where(account_id: @account.id).exists?
++    assert_not Notification.where(account_id: @account.id).exists?
++    assert_not Tag.where(account_id: @account.id).exists?
++    assert_not Account::Cancellation.exists?(account_id: @account.id)
++    assert_not Account::JoinCode.exists?(account_id: @account.id)
++    assert_not ActiveStorage::Blob.exists?(blob.id)
++    assert_not blob.service.exist?(blob.key)
++    assert_not Search::Record.for(@account.id).exists?(account_id: @account.id)
++    assert_not Search::Record::SQLite::Fts.exists?(rowid: search_record.id)
++    assert_not ActionText::RichText.exists?(account_id: @account.id)
++    assert_not Storage::Entry.exists?(account_id: @account.id)
++    assert_not Storage::Total.where(owner_type: "Account", owner_id: @account.id).exists?
++    assert_not Storage::Total.where(owner_type: "Board", owner_id: writebook_id).exists?
++    assert_not Identity.exists?(david_identity_id)
++    assert_not Session.exists?(identity_id: david_identity_id)
++    assert_not Identity::AccessToken.exists?(identity_id: david_identity_id)
++    assert_no_rows_with_account_id(@account.id)
++    assert_equal 0, join_count("assignees_filters", "assignee_id", jz_id)
++    assert_equal 0, join_count("filters_tags", "filter_id", filter_id)
++
++    assert Account.exists?(@kept.id)
++    assert User.exists?(kept_user.id)
++    assert Identity.exists?(kept_identity.id)
++    assert Session.exists?(identity: kept_identity)
++  end
++
++  test "does not incinerate accounts canceled within the grace period" do
++    cancel_at(@account, 29.days.ago)
++
++    assert_no_difference -> { Account.count } do
++      Account::IncinerateDueJob.perform_now
++    end
++
++    assert Account.exists?(@account.id)
++    assert @account.reload.cancelled?
++    assert User.exists?(users(:david).id)
++  end
++
++  test "does not incinerate an account canceled exactly at the grace period boundary" do
++    freeze_time do
++      cancel_at(@account, Account::Incineratable::INCINERATION_GRACE_PERIOD.ago)
++
++      assert_not @account.due_for_incineration?
++      assert_no_difference -> { Account.count } do
++        Account::IncinerateDueJob.perform_now
++      end
++    end
++  end
++
++  test "does not incinerate active accounts" do
++    assert_no_difference -> { Account.count } do
++      Account::IncinerateDueJob.perform_now
++    end
++
++    assert Account.exists?(@account.id)
++    assert Account.exists?(@kept.id)
++  end
++
++  test "keeps an identity that still belongs to another account" do
++    shared = identities(:david)
++    david_id = users(:david).id
++    other = @kept.users.create!(name: "David Elsewhere", identity: shared, role: :member, verified_at: Time.current)
++    cancel_at(@account, 31.days.ago)
++
++    Account::IncinerateDueJob.perform_now
++
++    assert Identity.exists?(shared.id)
++    assert User.exists?(other.id)
++    assert_not User.exists?(david_id)
++  end
++
++  test "reactivation prevents incineration" do
++    cancel_at(@account, 31.days.ago)
++    @account.reactivate
++
++    assert_no_difference -> { Account.count } do
++      Account::IncinerateDueJob.perform_now
++    end
++
++    assert_not @account.reload.cancelled?
++  end
++
++  test "is safe to run twice" do
++    cancel_at(@account, 31.days.ago)
++
++    Account::IncinerateDueJob.perform_now
++
++    assert_nothing_raised do
++      Account::IncinerateDueJob.perform_now
++    end
++  end
++
++  test "is registered as a recurring job" do
++    source = File.read(Rails.root.join("config/recurring.yml"))
++    assert_match(/class: Account::IncinerateDueJob/, source)
++    assert_match(/incinerate_due_accounts:/, source)
++  end
++
++  private
++    def cancel_at(account, created_at)
++      account.cancel(initiated_by: @owner)
++      account.cancellation.update_column(:created_at, created_at)
++    end
++
++    def assert_no_rows_with_account_id(account_id)
++      connection = Account.connection
++      connection.tables.each do |table|
++        next unless connection.column_exists?(table, :account_id)
++
++        count = connection.select_value(<<~SQL.squish)
++          SELECT COUNT(*) FROM #{connection.quote_table_name(table)}
++          WHERE account_id = #{quoted_id(account_id)}
++        SQL
++        assert_equal 0, count.to_i, "expected no rows in #{table} for incinerated account"
++      end
++    end
++
++    def join_count(table, column, id)
++      Account.connection.select_value("SELECT COUNT(*) FROM #{table} WHERE #{column} = #{quoted_id(id)}").to_i
++    end
++
++    def quoted_id(id)
++      Account.connection.quote(Account.type_for_attribute("id").serialize(id))
++    end
++end

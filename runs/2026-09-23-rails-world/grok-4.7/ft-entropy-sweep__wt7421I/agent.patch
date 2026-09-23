@@ -1,0 +1,232 @@
+diff --git a/app/jobs/card/auto_postpone_due_job.rb b/app/jobs/card/auto_postpone_due_job.rb
+new file mode 100644
+index 0000000..6f37f07
+--- /dev/null
++++ b/app/jobs/card/auto_postpone_due_job.rb
+@@ -0,0 +1,11 @@
++class Card::AutoPostponeDueJob < ApplicationJob
++  queue_as :backend
++
++  # Discard a new sweep if the previous one is still running so hourly
++  # schedules cannot pile up and hold the SQLite writer.
++  limits_concurrency to: 1, key: "Card::AutoPostponeDueJob", duration: 30.minutes, on_conflict: :discard
++
++  def perform
++    Card.auto_postpone_all_due
++  end
++end
+diff --git a/app/models/card/entropic.rb b/app/models/card/entropic.rb
+index ebaad78..360d9cd 100644
+--- a/app/models/card/entropic.rb
++++ b/app/models/card/entropic.rb
+@@ -1,6 +1,11 @@
+ module Card::Entropic
+   extend ActiveSupport::Concern
+ 
++  # SQLite has a single writer. Keep each transaction short so the hourly
++  # sweep does not pin the database for the rest of the hour.
++  AUTO_POSTPONE_BATCH_SIZE = 250
++  BOARD_ID_SLICE_SIZE = 500
++
+   included do
+     scope :due_to_be_postponed, -> do
+       active
+@@ -25,10 +30,106 @@ module Card::Entropic
+ 
+   class_methods do
+     def auto_postpone_all_due
+-      due_to_be_postponed.find_each do |card|
+-        card.auto_postpone(user: card.account.system_user)
++      Account.find_each do |account|
++        postpone_due_cards_for(account)
+       end
+     end
++
++    private
++      def postpone_due_cards_for(account)
++        user = nil
++
++        boards_by_period(account).each do |period, board_ids|
++          next if period.nil?
++
++          board_ids.each_slice(BOARD_ID_SLICE_SIZE) do |ids|
++            due_cards_for(account, ids, period).in_batches(of: AUTO_POSTPONE_BATCH_SIZE) do |batch|
++              user ||= account.users.find_by!(role: :system)
++              postpone_batch(batch, user)
++            end
++          end
++        end
++      end
++
++      def boards_by_period(account)
++        account_period = account.entropy&.auto_postpone_period
++        grouped = Hash.new { |periods, period| periods[period] = [] }
++
++        account.boards.left_outer_joins(:entropy).pluck("boards.id", "entropies.auto_postpone_period").each do |board_id, period|
++          grouped[period || account_period] << board_id
++        end
++
++        grouped
++      end
++
++      # Compare last_active_at to a constant cutoff so SQLite can use
++      # index_cards_on_account_id_and_last_active_at_and_status instead of
++      # evaluating datetime() across a join of every card.
++      def due_cards_for(account, board_ids, period)
++        Card.active.where(account_id: account.id, board_id: board_ids).where(last_active_at: ..Time.current - period.to_i)
++      end
++
++      def postpone_batch(batch, user)
++        rows = batch.reselect("cards.id", "cards.board_id", "cards.account_id").distinct.pluck("cards.id", "cards.board_id", "cards.account_id")
++        return if rows.empty?
++
++        ids = rows.map(&:first)
++        ids -= Card::NotNow.where(card_id: ids).pluck(:card_id)
++        rows.select! { |id, _, _| ids.include?(id) }
++        return if rows.empty?
++
++        now = Time.current
++        account_id = rows.first.last
++        events = []
++        comments = []
++
++        Card.transaction do
++          Card::ActivitySpike.where(card_id: ids).delete_all
++          Card.where(id: ids).update_all(column_id: nil, last_active_at: now, updated_at: now)
++          Board.where(id: rows.map { |_, board_id, _| board_id }.uniq).update_all(updated_at: now)
++
++          Card::NotNow.insert_all!(rows.map { |id, _, row_account_id|
++            { id: ActiveRecord::Type::Uuid.generate, account_id: row_account_id, card_id: id, user_id: user.id, created_at: now, updated_at: now }
++          })
++
++          events = rows.map { |id, board_id, row_account_id|
++            { id: ActiveRecord::Type::Uuid.generate, account_id: row_account_id, action: "card_auto_postponed", board_id: board_id, creator_id: user.id, eventable_id: id, eventable_type: "Card", particulars: {}, created_at: now, updated_at: now }
++          }
++          Event.insert_all!(events)
++
++          comments = rows.map { |id, _, row_account_id|
++            { id: ActiveRecord::Type::Uuid.generate, account_id: row_account_id, card_id: id, creator_id: user.id, created_at: now, updated_at: now }
++          }
++          Comment.insert_all!(comments)
++
++          ActionText::RichText.insert_all!(comments.map { |comment|
++            { id: ActiveRecord::Type::Uuid.generate, account_id: comment[:account_id], name: "body", body: Card::Eventable::SystemCommenter::AUTO_POSTPONED_BODY, record_type: "Comment", record_id: comment[:id], created_at: now, updated_at: now }
++          })
++        end
++
++        enqueue_auto_postpone_followups(events, account_id)
++        index_auto_postpone_comments(comments)
++      rescue ActiveRecord::RecordNotUnique
++        # A concurrent postpone won the unique not_now insert. The next sweep
++        # picks up whatever is still due.
++      end
++
++      def index_auto_postpone_comments(comments)
++        Comment.where(id: comments.map { |comment| comment[:id] }).includes(:rich_text_body, :card).find_each do |comment|
++          comment.reindex
++        end
++      end
++
++      def enqueue_auto_postpone_followups(events, account_id)
++        records = Event.where(id: events.map { |event| event[:id] }).to_a
++        return if records.empty?
++
++        jobs = records.map { |event| NotifyRecipientsJob.new(event) }
++        if Webhook.active.where(account_id: account_id).exists?
++          jobs.concat(records.map { |event| Event::WebhookDispatchJob.new(event) })
++        end
++        ActiveJob.perform_all_later(jobs)
++      end
+   end
+ 
+   def entropy
+diff --git a/app/models/card/eventable/system_commenter.rb b/app/models/card/eventable/system_commenter.rb
+index 5c7defc..bb8fcb3 100644
+--- a/app/models/card/eventable/system_commenter.rb
++++ b/app/models/card/eventable/system_commenter.rb
+@@ -1,6 +1,8 @@
+ class Card::Eventable::SystemCommenter
+   include ERB::Util
+ 
++  AUTO_POSTPONED_BODY = "<strong>Moved</strong> to “Not Now” due to inactivity"
++
+   attr_reader :card, :event
+ 
+   def initialize(card, event)
+@@ -27,7 +29,7 @@ class Card::Eventable::SystemCommenter
+       when "card_postponed"
+         "#{creator_name} <strong>moved</strong> this to “Not Now”"
+       when "card_auto_postponed"
+-        "<strong>Moved</strong> to “Not Now” due to inactivity"
++        AUTO_POSTPONED_BODY
+       when "card_title_changed"
+         "#{creator_name} <strong>changed the title</strong> from “#{old_title}” to “#{new_title}”."
+       when "card_board_changed"
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 894c57b..61bd65c 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -8,7 +8,7 @@ production: &production
+ 
+   # Application cleanup
+   auto_postpone_all_due:
+-    command: "Card.auto_postpone_all_due"
++    class: Card::AutoPostponeDueJob
+     schedule: every hour at minute 50
+   delete_unused_tags:
+     class: DeleteUnusedTagsJob
+diff --git a/test/models/card/entropic_test.rb b/test/models/card/entropic_test.rb
+index 848cfa7..8f1f7c4 100644
+--- a/test/models/card/entropic_test.rb
++++ b/test/models/card/entropic_test.rb
+@@ -85,4 +85,50 @@ class Card::EntropicTest < ActiveSupport::TestCase
+ 
+     assert_equal(cards(:logo, :radio).to_set, Card.postponing_soon.to_set)
+   end
++
++  test "auto postpone all due clears the column and records the system comment" do
++    cards(:logo).update!(last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period)
++    assert cards(:logo).column_id.present?
++
++    Card.auto_postpone_all_due
++
++    card = cards(:logo).reload
++    assert card.postponed?
++    assert_nil card.column_id
++    assert card.events.last.action.card_auto_postponed?
++    assert_equal accounts("37s").system_user, card.postponed_by
++
++    comment = card.comments.order(:created_at).last
++    assert_match /Moved to .Not Now. due to inactivity/, comment.body.to_plain_text
++    assert_equal accounts("37s").system_user, comment.creator
++  end
++
++  test "auto postpone all due includes the cutoff instant and excludes a newer card" do
++    period = entropies(:writebook_board).auto_postpone_period
++    cards(:logo).update!(last_active_at: Time.current - period)
++    cards(:shipping).update!(last_active_at: Time.current - period + 1.second)
++
++    Card.auto_postpone_all_due
++
++    assert cards(:logo).reload.postponed?
++    assert_not cards(:shipping).reload.postponed?
++  end
++
++  test "auto postpone all due leaves closed and already postponed cards alone" do
++    period = entropies(:writebook_board).auto_postpone_period
++    cards(:logo).update!(last_active_at: 1.day.ago - period)
++    cards(:logo).postpone
++    cards(:shipping).update!(last_active_at: 1.day.ago - period)
++    cards(:shipping).close
++
++    assert_no_difference -> { cards(:logo).events.count } do
++      assert_no_difference -> { Card::NotNow.count } do
++        Card.auto_postpone_all_due
++      end
++    end
++
++    assert cards(:logo).reload.postponed?
++    assert cards(:shipping).reload.closed?
++    assert_not cards(:shipping).postponed?
++  end
+ end
