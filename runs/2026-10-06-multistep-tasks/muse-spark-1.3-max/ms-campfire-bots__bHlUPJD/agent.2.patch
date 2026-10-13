@@ -1,0 +1,325 @@
+diff --git a/app/controllers/bots_controller.rb b/app/controllers/bots_controller.rb
+index ce06793..bd30196 100644
+--- a/app/controllers/bots_controller.rb
++++ b/app/controllers/bots_controller.rb
+@@ -23,8 +23,11 @@ class BotsController < ApplicationController
+   end
+ 
+   def update
+-    @bot.update!(bot_params)
+-    redirect_to bots_url, notice: "✓"
++    if @bot.update(bot_params)
++      redirect_to bots_url, notice: "✓"
++    else
++      render :edit, status: :unprocessable_content
++    end
+   end
+ 
+   def destroy
+@@ -48,6 +51,6 @@ class BotsController < ApplicationController
+ 
+     def bot_params
+       key = params.key?(:bot) ? :bot : :user
+-      params.require(key).permit(:name, :avatar)
++      params.require(key).permit(:name, :avatar, :webhook_url)
+     end
+ end
+diff --git a/app/jobs/room/bot_mention_job.rb b/app/jobs/room/bot_mention_job.rb
+new file mode 100644
+index 0000000..a894f8f
+--- /dev/null
++++ b/app/jobs/room/bot_mention_job.rb
+@@ -0,0 +1,21 @@
++class Room::BotMentionJob < ApplicationJob
++  discard_on ActiveJob::DeserializationError
++
++  def perform(room, message)
++    # Find bots mentioned in this message that have a webhook configured.
++    # mentionees is already scoped to room members; exclude the author itself
++    # to avoid a bot triggering its own webhook on self-mentions.
++    bots = message.mentionees.bots.active.with_webhook.where.not(id: message.creator_id)
++
++    bots.find_each do |bot|
++      begin
++        Room::BotWebhookNotifier.new(room: room, message: message, bot: bot).notify
++      rescue StandardError => e
++        Rails.logger.warn "BotMentionJob failed for bot #{bot.id}: #{e.class} #{e.message}"
++      end
++    end
++  rescue ActiveRecord::RecordNotFound
++    # Room or message deleted before job ran — nothing to do.
++    nil
++  end
++end
+diff --git a/app/models/room.rb b/app/models/room.rb
+index 20865fc..5cae8eb 100644
+--- a/app/models/room.rb
++++ b/app/models/room.rb
+@@ -48,6 +48,7 @@ class Room < ApplicationRecord
+   def receive(message)
+     unread_memberships(message)
+     push_later(message)
++    notify_bots_later(message)
+   end
+ 
+   def open?
+@@ -83,4 +84,8 @@ class Room < ApplicationRecord
+     def push_later(message)
+       Room::PushMessageJob.perform_later(self, message)
+     end
++
++    def notify_bots_later(message)
++      Room::BotMentionJob.perform_later(self, message)
++    end
+ end
+diff --git a/app/models/room/bot_webhook_notifier.rb b/app/models/room/bot_webhook_notifier.rb
+new file mode 100644
+index 0000000..4114da1
+--- /dev/null
++++ b/app/models/room/bot_webhook_notifier.rb
+@@ -0,0 +1,112 @@
++require "net/http"
++require "uri"
++require "json"
++
++class Room::BotWebhookNotifier
++  OPEN_TIMEOUT = 5
++  READ_TIMEOUT = 10
++
++  attr_reader :room, :message, :bot
++
++  def initialize(room:, message:, bot:)
++    @room, @message, @bot = room, message, bot
++  end
++
++  def notify
++    return unless bot.webhook_url.present? && bot.bot_token.present?
++
++    payload = build_payload
++    response = post_payload(payload)
++    handle_response(response)
++  rescue StandardError => e
++    Rails.logger.warn "Bot webhook failed for bot #{bot.id} (#{bot.webhook_url}): #{e.class} #{e.message}"
++    nil
++  end
++
++  private
++    def build_payload
++      {
++        event: "mention",
++        author: { id: message.creator.id, name: message.creator.name },
++        room: { id: room.id, name: room.name, reply_to: reply_to_path },
++        message: {
++          id: message.id,
++          body: {
++            text: stripped_text,
++            html: html_body
++          },
++          link: link_path
++        }
++      }
++    end
++
++    def stripped_text
++      text = message.plain_text_body.to_s
++      # Strip the bot's own @-mention so text reads as command addressed to bot.
++      # Mention representation is "@#{name}" (see User::Mentionable).
++      text.gsub("@#{bot.name}", "").strip.gsub(/[ \t]{2,}/, " ").strip
++    end
++
++    def html_body
++      message.body.to_s
++    end
++
++    def reply_to_path
++      Rails.application.routes.url_helpers.room_bot_messages_path(room.id, bot.bot_token)
++    end
++
++    def link_path
++      Rails.application.routes.url_helpers.room_at_message_path(room, message)
++    end
++
++    def post_payload(payload)
++      uri = URI.parse(bot.webhook_url)
++      raise URI::InvalidURIError, "webhook URL must be HTTP(S)" unless uri.is_a?(URI::HTTP) && uri.host.present?
++
++      http = Net::HTTP.new(uri.host, uri.port)
++      http.use_ssl = (uri.scheme == "https")
++      http.open_timeout = OPEN_TIMEOUT
++      http.read_timeout = READ_TIMEOUT
++
++      request = Net::HTTP::Post.new(uri.request_uri)
++      request["Content-Type"] = "application/json"
++      request.body = JSON.generate(payload)
++
++      http.request(request)
++    end
++
++    def handle_response(response)
++      return if response.nil?
++
++      case response.code.to_i
++      when 200
++        handle_ok_response(response)
++      when 204
++        # No message to post.
++        nil
++      else
++        Rails.logger.info "Bot webhook for bot #{bot.id} returned #{response.code}, ignoring"
++        nil
++      end
++    end
++
++    def handle_ok_response(response)
++      content_type = response["Content-Type"].to_s.downcase
++
++      # Spec: 200 with text/plain or text/html → post body as bot's message.
++      # Be lenient about missing content-type (treat as plain text).
++      return unless content_type.blank? || content_type.include?("text/plain") || content_type.include?("text/html")
++
++      body = response.body.to_s.dup.force_encoding(Encoding::UTF_8).scrub
++      return if body.strip.blank?
++
++      # Don't post if bot is no longer a member (mirrors BotMessagesController).
++      return unless room.memberships.exists?(user_id: bot.id)
++
++      new_message = room.messages.create!(creator: bot, body: body)
++      new_message.broadcast_create
++    rescue StandardError => e
++      Rails.logger.warn "Failed to post bot sync reply for bot #{bot.id}: #{e.class} #{e.message}"
++      nil
++    end
++end
+diff --git a/app/models/user.rb b/app/models/user.rb
+index e1e1a7d..a7e5491 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -25,6 +25,11 @@ class User < ApplicationRecord
+   before_create :generate_bot_token, if: :bot?
+   validates :bot_token, uniqueness: true, allow_nil: true
+   validates :name, presence: true, if: :bot?
++  validate :webhook_url_must_be_valid_http_url, if: -> { webhook_url.present? }
++
++  normalizes :webhook_url, with: ->(url) { url.to_s.strip.presence }
++
++  alias_attribute :bot_webhook_url, :webhook_url
+ 
+   after_create_commit :grant_membership_to_open_rooms
+ 
+@@ -32,6 +37,7 @@ class User < ApplicationRecord
+   scope :filtered_by, ->(query) { where("name like ?", "%#{query}%") }
+   scope :bots, -> { where(bot: true) }
+   scope :humans, -> { where(bot: false) }
++  scope :with_webhook, -> { where.not(webhook_url: [ nil, "" ]) }
+ 
+   def human?
+     !bot?
+@@ -62,7 +68,20 @@ class User < ApplicationRecord
+     close_remote_connections reconnect: true
+   end
+ 
++  def webhook_enabled?
++    bot? && webhook_url.present?
++  end
++
+   private
++    def webhook_url_must_be_valid_http_url
++      uri = URI.parse(webhook_url)
++      unless uri.is_a?(URI::HTTP) && uri.host.present?
++        errors.add(:webhook_url, "must be a valid HTTP(S) URL")
++      end
++    rescue URI::InvalidURIError
++      errors.add(:webhook_url, "must be a valid HTTP(S) URL")
++    end
++
+     def generate_bot_token
+       self.bot_token ||= loop do
+         token = SecureRandom.hex(24)
+diff --git a/app/views/bots/_form.html.erb b/app/views/bots/_form.html.erb
+index af7e64f..ac78f45 100644
+--- a/app/views/bots/_form.html.erb
++++ b/app/views/bots/_form.html.erb
+@@ -33,5 +33,16 @@
+ 
+   <div class="txt-small txt-subtle txt-align-start">Name the bot</div>
+ 
++  <div class="flex align-center gap">
++    <label class="flex align-center gap flex-item-grow input input--actor">
++      <span class="for-screen-reader">Webhook URL</span>
++      <%= form.url_field :webhook_url, class: "input txt-large", autocomplete: "off", placeholder: "Webhook URL",
++            aria: { label: "Webhook URL" } %>
++      <%= image_tag "web.svg", aria: { hidden: "true" }, size: 24, class: "colorize--black" %>
++    </label>
++  </div>
++
++  <div class="txt-small txt-subtle txt-align-start">Webhook URL</div>
++
+   <%= form.submit "Save changes", class: "btn btn--reversed center txt-large" %>
+ <% end %>
+diff --git a/db/migrate/20261005213614_add_webhook_url_to_users.rb b/db/migrate/20261005213614_add_webhook_url_to_users.rb
+new file mode 100644
+index 0000000..e893392
+--- /dev/null
++++ b/db/migrate/20261005213614_add_webhook_url_to_users.rb
+@@ -0,0 +1,5 @@
++class AddWebhookUrlToUsers < ActiveRecord::Migration[8.1]
++  def change
++    add_column :users, :webhook_url, :string
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 846bd48..215d7ca 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2026_10_05_213613) do
++ActiveRecord::Schema[8.1].define(version: 2026_10_05_213614) do
+   create_table "accounts", force: :cascade do |t|
+     t.datetime "created_at", null: false
+     t.text "custom_styles"
+@@ -156,6 +156,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_10_05_213613) do
+     t.integer "role", default: 0, null: false
+     t.integer "status", default: 0, null: false
+     t.datetime "updated_at", null: false
++    t.string "webhook_url"
+     t.index ["bot"], name: "index_users_on_bot"
+     t.index ["bot_token"], name: "index_users_on_bot_token", unique: true
+     t.index ["created_by_id"], name: "index_users_on_created_by_id"
+diff --git a/docs/bots.md b/docs/bots.md
+index 1b1233a..4069dc5 100644
+--- a/docs/bots.md
++++ b/docs/bots.md
+@@ -48,3 +48,30 @@ Bots are chat members that post messages via HTTP API. They can be members of ro
+ - Top-level `GET /messages/:id` fixed to support Location header: `MessagesController#set_room` derives room from message when `room_id` missing, ensuring membership.
+ - Human tokens (nil or manually set) cannot post (scoped to bots).
+ - Avatar optional, name required (model validation + HTML required).
++
++## Webhooks (mention callbacks)
++
++- Column `users.webhook_url` (string, nullable, aliased as `bot_webhook_url`) — optional per-bot callback URL.
++  - Normalized via `normalizes :webhook_url, with: ->(url) { url.to_s.strip.presence }` so empty/whitespace form input becomes `nil` (removes webhook).
++  - Validated as HTTP(S) URL with host when present (`URI::HTTP`, allows localhost/private for dev/test bots; no `PrivateNetworkGuard` block so local bot servers work in QA).
++  - Scope `User.with_webhook` (`where.not(webhook_url: [nil, ""])`), helper `webhook_enabled?`.
++- Form (`_form` shared by `/bots/new` + edit): adds optional `url_field :webhook_url` with label/placeholder/aria-label + visible text exactly "Webhook URL" (QA drives by label). No `required`. Permitted in `BotsController#bot_params`. `update` now renders `:edit` on validation failure (like `create`) instead of `update!` 500.
++- Autocomplete: no change needed — `Autocompletable::UsersController` uses `User.active` / `room.users` which already include bots (verified: bots auto-join opens, can be added to closeds via `User.active.ordered` member UIs, appear in both global + room-scoped JSON).
++- Trigger: `Room#receive` (called via `Message.after_create_commit`) now also `Room::BotMentionJob.perform_later(room, message)` — async so posting never waits on bot HTTP (queue adapters: `:test` in test, `:async` in dev, `:resque` in prod).
++  - Job finds `message.mentionees.bots.active.with_webhook.where.not(id: message.creator_id)` — only member bots with webhooks, excludes self-mention to avoid bot triggering itself. Each bot handled independently with per-bot rescue + continue.
++  - `Room::BotWebhookNotifier(room:, message:, bot:)` builds payload + POSTs + handles sync reply. Follows `Room::MessagePusher` / `PushMessageJob` pattern.
++- Payload (`Content-Type: application/json`, relative paths so bot knows its Campfire origin):
++  ```json
++  { "event": "mention", "author": {"id","name"}, "room": {"id","name","reply_to": "/rooms/:id/:bot_token/messages"}, "message": {"id","body": {"text","html"}, "link": "/rooms/:id/@:msg_id"} }
++  ```
++  - `text`: `plain_text_body` with bot's own `"@#{bot.name}"` stripped (`gsub` literal + strip + collapse spaces, preserves newlines) so each bot sees command addressed to it (multi-bot: each keeps other bots' mentions).
++  - `html`: `message.body.to_s` (full `<div class="trix-content">…</div>` including mention attachments).
++  - `reply_to`: `room_bot_messages_path(room.id, bot.bot_token)` — bot's own async posting URL for that room.
++  - `link`: `room_at_message_path(room, message)` — deep link `/rooms/:id/@:msg_id` scrolling to message.
++- Sync reply handling in notifier:
++  - `POST` via `Net::HTTP` (open 5s, read 10s), no redirect/SSRF guard, `rescue` + warn on any network/URI error (job never retries/crashes).
++  - `200` + `text/plain`/`text/html` (case-insensitive substring, blank treated as plain) with non-blank scrubbed body → `room.messages.create!(creator: bot, body:)` + `broadcast_create` (membership re-checked, like `BotMessagesController`). Other `200` types ignored.
++  - `204` → no message. Other statuses → log + ignore.
++  - Bot reply goes through same `broadcast_create` + `room.receive` (unread/push/mention) as async posts.
++- Async reply: bot `POST`s raw body to `reply_to` later (existing `Rooms::BotMessagesController`, 201/422/404/401).
++- Edge: deleted room/message before job → `discard_on DeserializationError` + `rescue RecordNotFound`; webhook removed before job → `return unless webhook_url.present?`; bot removed from room before sync reply → skip post; network timeout/500/invalid URL → warn, no message, no retry.

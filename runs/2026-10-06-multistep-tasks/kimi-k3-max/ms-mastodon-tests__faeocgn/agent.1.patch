@@ -1,0 +1,167 @@
+diff --git a/config/environments/test.rb b/config/environments/test.rb
+index 12709d5..fb74a63 100644
+--- a/config/environments/test.rb
++++ b/config/environments/test.rb
+@@ -48,6 +48,11 @@ Rails.application.configure do
+   # Print deprecation notices to the stderr.
+   config.active_support.deprecation = :stderr
+ 
++  # Avoid the overhead of debug-level logging (mostly SQL query logs) during
++  # the test suite: it writes hundreds of megabytes of logs per run. Override
++  # with RAILS_LOG_LEVEL when debugging.
++  config.log_level = ENV.fetch("RAILS_LOG_LEVEL", "info").to_sym
++
+   # Generate random VAPID keys when needed
+   Webpush.generate_key.tap do |vapid_key|
+     config.x.vapid.private_key ||= vapid_key.private_key
+diff --git a/docs/test_suite_optimization.md b/docs/test_suite_optimization.md
+new file mode 100644
+index 0000000..025248a
+--- /dev/null
++++ b/docs/test_suite_optimization.md
+@@ -0,0 +1,80 @@
++# Test Suite Optimization Log
++
++Goal: make `spec/models` + `spec/requests` run at least 2x faster overall on CI (no parallelization).
++Constraints: config/setup-level changes preferred (tags, shared setup, execution wrapping);
++keep example-level assertions unchanged; no app runtime behavior changes; factories untouched for now.
++
++Environment used for measurements: local container, PG + Redis local, single process,
++`bundle exec rspec <dir> --no-color --order defined` (defined order used to reduce variance).
++
++## Phase 1: `spec/models`
++
++### Baseline (commit: Initial commit)
++- Command: `bundle exec rspec spec/models --no-color --order defined`
++- **2m41.6s wall / 2m38.5s rspec time; 1795 examples, 0 failures** (files took 2.66s to load)
++- Top-30 slowest examples: 35.4s (22.3% of total). => ~78% of time is spread across
++  ordinary examples => per-example overhead (setup/teardown, callbacks, inline jobs)
++  dominates, so configuration-level fixes are the highest leverage.
++
++### Per-example overhead suspects identified (from rails_helper.rb)
++1. `config.before { Sidekiq.testing!(:inline) }` — EVERY example runs Sidekiq jobs inline.
++   Model callbacks enqueue jobs on nearly every fabrication:
++   - `User` create -> `TriggerWebhookWorker` x2 (account.created/account.approved) + `BootstrapTimelineWorker`
++   - `Account` update -> `TriggerWebhookWorker` (account.updated)
++   - `Status` create -> `TriggerWebhookWorker` (status.created)
++   - `TriggerWebhookWorker` -> `WebhookService` **serializes the whole record with AMS
++     even when no webhooks exist** (serialize_event runs unconditionally) — expensive per fabrication.
++   Specs that need enqueue assertions already opt into `Sidekiq.testing!(:fake)` locally.
++2. `config.after { redis.del(redis.keys) }` — KEYS scan + DEL per example (2 round trips).
++3. `config.after { Rails.cache.clear }` — memory store, cheap.
++4. `config.before { Rails.application.reload_routes_unless_loaded }` — cheap once loaded.
++
++### Known factory-level overhead (do NOT touch in phase 1, flagged for later phase)
++- `Fabricator(:status)` has `after_create { Fabricate(:bookmark, ...) }` — extra insert per status.
++- `Fabricator(:user)` has `after_create { 2.times { Fabricate(:login_activity, ...) } }`.
++
++### Slow hotspots seen in --profile (mostly intrinsic, low priority)
++- trends/statuses_spec (sleep-based decays), media_attachment_spec (mp3/image processing),
++  account_statuses_cleanup_policy_spec, notification_spec.
++
++## Phase 1 results
++
++| Change | rspec time (spec/models, 1795 ex.) |
++|---|---|
++| Baseline | 2m38.5s (wall 2m41.6s) |
++| + Sidekiq `fake!` for `type: :model` | 1m54.4s (-27.8%) |
++| + `config.log_level = :info` in test env | **53.2s (-66.4% vs baseline, 0 failures)** |
++
++### Changes made
++1. `spec/rails_helper.rb`:
++   - model specs now run Sidekiq in `fake!` mode (enqueue-only) instead of `inline`;
++     queues cleared (`Sidekiq::Queues.clear_all`) after each model example for isolation.
++   - opt-in `:sidekiq_inline` metadata tag for examples that need jobs to actually run.
++   - Tagged 3 examples that assert real email delivery (`capture_emails`):
++     `spec/models/admin/account_action_spec.rb:90`, `spec/models/user_spec.rb:504`,
++     `spec/models/email_subscription_spec.rb:30`.
++2. `config/environments/test.rb`: `config.log_level = ENV.fetch("RAILS_LOG_LEVEL", "info")`.
++   Debug-level SQL logging was the single biggest cost: ~40MB written to log/test.log
++   per spec/models run (with ANSI formatting per query). This alone: 1m54s -> 53s.
++
++### Verification
++- Full spec/models: 0 failures (defined + random order).
++- `execute_queries` matcher uses AS::Notifications (independent of log level) — unaffected.
++- Other spec types unchanged: still Sidekiq `inline` by default; only log level differs.
++
++### Notes for future phases
++- RDIS on heavy subset: remaining time is dominated by fabrication (`let`/`before`):
++  e.g. MediaAttachment `media` let 4.1s/27ex, AccountStatusesCleanupPolicy before 3.6s/36ex,
++  Notification `notifications` let 1.5s/8ex. => factory phase should focus here
++  (`status` fabricator creates a bookmark per status; `user` fabricator creates 2 login_activities).
++- Remaining per-example hooks are cheap: rails routes reload check, Resolv::DNS stub,
++  Rails.cache.clear (memory store), redis KEYS+DEL (~2 round trips, could become flushdb).
++- Boot is ~2.6-2.7s (bootsnap enabled already).
++
++### Final verification (phase 1)
++- `rspec spec/models --seed 12345` (random order, like CI): 1795 examples, 0 failures, 55.7s wall.
++- Tagged email examples re-run with `--seed 999`: 0 failures.
++- Spot check other types still on inline Sidekiq: `spec/services/post_status_service_spec.rb`
++  + `spec/requests/api/v1/statuses_spec.rb`: 0 failures.
++- Net result for phase 1: **~158.5s -> ~53s for spec/models (~3x faster, -66%)**,
++  exceeding the 30-35% target for this phase.
+diff --git a/spec/models/admin/account_action_spec.rb b/spec/models/admin/account_action_spec.rb
+index 5339084..6dafbb3 100644
+--- a/spec/models/admin/account_action_spec.rb
++++ b/spec/models/admin/account_action_spec.rb
+@@ -87,7 +87,7 @@ RSpec.describe Admin::AccountAction do
+       end
+     end
+ 
+-    it 'sends email to target account user' do
++    it 'sends email to target account user', :sidekiq_inline do
+       emails = capture_emails { subject }
+ 
+       expect(emails).to contain_exactly(
+diff --git a/spec/models/email_subscription_spec.rb b/spec/models/email_subscription_spec.rb
+index 3730b5c..148fa75 100644
+--- a/spec/models/email_subscription_spec.rb
++++ b/spec/models/email_subscription_spec.rb
+@@ -27,7 +27,7 @@ RSpec.describe EmailSubscription do
+   describe 'Callbacks' do
+     subject { Fabricate(:email_subscription) }
+ 
+-    it 'generates token and delivers confirmation email' do
++    it 'generates token and delivers confirmation email', :sidekiq_inline do
+       emails = capture_emails { subject }
+ 
+       expect(subject.confirmed_at).to be_nil
+diff --git a/spec/models/user_spec.rb b/spec/models/user_spec.rb
+index 3a1964b..1b7990c 100644
+--- a/spec/models/user_spec.rb
++++ b/spec/models/user_spec.rb
+@@ -501,7 +501,7 @@ RSpec.describe User do
+     context 'when user is new' do
+       let(:confirmed_at) { nil }
+ 
+-      it 'confirms user and delivers welcome email' do
++      it 'confirms user and delivers welcome email', :sidekiq_inline do
+         emails = capture_emails { subject }
+ 
+         expect(user.confirmed_at).to be_present
+diff --git a/spec/rails_helper.rb b/spec/rails_helper.rb
+index a91461b..48bfee7 100644
+--- a/spec/rails_helper.rb
++++ b/spec/rails_helper.rb
+@@ -109,6 +109,21 @@ RSpec.configure do |config|
+     Sidekiq.testing!(:inline)
+   end
+ 
++  # Model specs barely depend on jobs actually running, while many model callbacks
++  # enqueue jobs on creation/update (e.g. `TriggerWebhookWorker` serializes the record
++  # even when no webhooks are configured). Running those jobs inline for every example
++  # adds a large per-example overhead, so use `fake!` (enqueue-only) mode instead and
++  # clear the in-memory queues between examples to avoid cross-example leakage.
++  #
++  # Examples/groups that genuinely need jobs to run can be tagged with `:sidekiq_inline`.
++  config.before :each, type: :model do |example|
++    Sidekiq.testing!(example.metadata[:sidekiq_inline] ? :inline : :fake)
++  end
++
++  config.after :each, type: :model do
++    Sidekiq::Queues.clear_all
++  end
++
+   config.before :each, type: :cli do
+     stub_reset_connection_pools
+   end
