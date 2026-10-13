@@ -1,0 +1,730 @@
+diff --git a/README.md b/README.md
+index 55b555c..5855b12 100644
+--- a/README.md
++++ b/README.md
+@@ -225,6 +225,31 @@ Lists are paginated with `page` and `per_page` (defaults 1 and 25) and return
+ records. Tickets and requests are ordered recently active first, comments
+ oldest first.
+ 
++Every list also supports cursor (keyset) pagination, which stays fast however
++deep you browse and doesn't skip or repeat records while other people create
++or update rows. Ask for it with bracket page params:
++
++```http
++GET /api/v1/tickets?page[size]=25&status=open
++```
++
++The response then carries a `meta` object with `has_more`, `after_cursor`
++(the cursor of the page's last record), and `before_cursor` (the cursor of
++its first record), plus `links` with ready-to-follow `next` and `prev` URLs
++that preserve the request's filters and page size:
++
++```json
++{"tickets":[],"meta":{"has_more":false,"after_cursor":null,"before_cursor":null},"links":{"next":null,"prev":null}}
++```
++
++Follow `next`/`prev`, or send `page[after]` / `page[before]` yourself with
++`page[size]`. `has_more` tells you whether more records exist in the
++direction you're browsing: past the last record when going forward, before
++the first record when going backward. An empty page has null cursors and
++null links. Cursors are opaque and positioned in the collection's ordering,
++so navigation is stable while other people work; an unrecognized cursor is
++rejected with `400` and an `invalid_cursor` error.
++
+ `GET /api/v1/tickets` filters combine, e.g.
+ `GET /api/v1/tickets?status=open&assignee_id=unassigned&priority=high&q=receipt`:
+ 
+diff --git a/app/controllers/api/v1/base_controller.rb b/app/controllers/api/v1/base_controller.rb
+index e0bdc31..942989d 100644
+--- a/app/controllers/api/v1/base_controller.rb
++++ b/app/controllers/api/v1/base_controller.rb
+@@ -1,6 +1,10 @@
+ module Api
+   module V1
+     class BaseController < ActionController::API
++      include CursorPagination
++
++      rescue_from CursorPagination::InvalidCursor, with: :render_invalid_cursor
++
+       private
+ 
+       # --- Authentication ---------------------------------------------
+@@ -101,36 +105,19 @@ module Api
+         value
+       end
+ 
+-      # --- Pagination ---------------------------------------------------
+-
+-      DEFAULT_PAGE = 1
+-      DEFAULT_PER_PAGE = 25
+-
+-      # Paginates a scope using the page/per_page params and returns the page
+-      # of records together with the pagination metadata.
+-      def paginate(scope)
+-        page = params[:page].to_i
+-        page = DEFAULT_PAGE if page < 1
+-
+-        per_page = params[:per_page].to_i
+-        per_page = DEFAULT_PER_PAGE if per_page < 1
+-
+-        count = scope.count
+-        records = scope.offset((page - 1) * per_page).limit(per_page)
++      # Pagination lives in the CursorPagination concern: `page`/`per_page`
++      # keep the original page-number behavior, while `page[size]` /
++      # `page[after]` / `page[before]` switch to cursor (keyset) pagination.
+ 
+-        meta = {
+-          count: count,
+-          page: page,
+-          per_page: per_page,
+-          next_page: (page * per_page < count ? page + 1 : nil),
+-          previous_page: (page > 1 ? page - 1 : nil)
+-        }
++      # --- Rendering helpers ------------------------------------------
+ 
+-        [records, meta]
++      def render_invalid_cursor
++        render json: {
++          error: "invalid_cursor",
++          message: "The page cursor is not valid."
++        }, status: :bad_request
+       end
+ 
+-      # --- Rendering helpers ------------------------------------------
+-
+       def render_unauthorized
+         render json: {
+           error: "unauthorized",
+diff --git a/app/controllers/concerns/cursor_pagination.rb b/app/controllers/concerns/cursor_pagination.rb
+new file mode 100644
+index 0000000..90640c4
+--- /dev/null
++++ b/app/controllers/concerns/cursor_pagination.rb
+@@ -0,0 +1,296 @@
++require "base64"
++require "json"
++
++# Pagination for the collection endpoints, in two interchangeable flavors.
++#
++# The page-number API keeps working unchanged: `?page=2&per_page=25` returns
++# `count`, `page`, `per_page`, `next_page`, and `previous_page` alongside the
++# records. It relies on OFFSET, which gets slower the deeper you browse and
++# can skip or repeat records while other people create or update rows.
++#
++# Cursor (keyset) pagination avoids both problems. Clients ask for it with
++# bracket page params:
++#
++#   GET /api/v1/tickets?page[size]=25&status=open
++#   GET /api/v1/tickets?page[size]=25&page[after]=CURSOR
++#   GET /api/v1/tickets?page[size]=25&page[before]=CURSOR
++#
++# Cursor responses carry the records plus a `meta` object with `has_more`,
++# `after_cursor` (cursor of the page's last record) and `before_cursor`
++# (cursor of its first record), and `links` with ready-to-follow `next` and
++# `prev` URLs that preserve the request's filters. `has_more` tells whether
++# more records exist in the direction the client is browsing: past the last
++# record when going forward (initial request or `page[after]`), before the
++# first record when going backward (`page[before]`).
++#
++# Cursors encode the record's position in the collection's own ordering
++# (e.g. `updated_at DESC, id DESC` for tickets), so navigation stays stable
++# while other people work: records added or moved ahead of the cursor never
++# shift what comes after it.
++module CursorPagination
++  extend ActiveSupport::Concern
++
++  # Raised when page[after]/page[before] doesn't decode to a usable cursor.
++  class InvalidCursor < StandardError; end
++
++  DEFAULT_PAGE = 1
++  DEFAULT_PAGE_SIZE = 25
++
++  private
++
++  # Paginates a scope, choosing keyset (cursor) pagination when the page
++  # param is an object (`page[size]`/`page[after]`/`page[before]`) and the
++  # classic page-number pagination otherwise. Returns [records, meta] where
++  # meta is spread into the response next to the records.
++  def paginate(scope)
++    page = params[:page]
++
++    if page.is_a?(ActionController::Parameters) || page.is_a?(Hash)
++      cursor_paginate(scope, page)
++    else
++      offset_paginate(scope)
++    end
++  end
++
++  # --- Page-number pagination (original API) ---------------------------
++
++  def offset_paginate(scope)
++    page = params[:page].to_s.to_i
++    page = DEFAULT_PAGE if page < 1
++
++    per_page = params[:per_page].to_s.to_i
++    per_page = DEFAULT_PAGE_SIZE if per_page < 1
++
++    count = scope.count
++    records = scope.offset((page - 1) * per_page).limit(per_page)
++
++    meta = {
++      count: count,
++      page: page,
++      per_page: per_page,
++      next_page: (page * per_page < count ? page + 1 : nil),
++      previous_page: (page > 1 ? page - 1 : nil)
++    }
++
++    [records, meta]
++  end
++
++  # --- Cursor pagination -------------------------------------------------
++
++  def cursor_paginate(scope, page)
++    size = cursor_page_size(page)
++    spec = cursor_order_spec(scope)
++
++    after = decode_cursor(cursor_page_value(page, :after), scope, spec)
++    before = after.nil? ? decode_cursor(cursor_page_value(page, :before), scope, spec) : nil
++    backward = !before.nil?
++
++    relation = scope.reorder(cursor_order(scope, spec, reverse: backward))
++    if backward
++      relation = relation.where(cursor_condition(scope, spec, before, :backward))
++    elsif after
++      relation = relation.where(cursor_condition(scope, spec, after, :forward))
++    end
++
++    # One extra row tells us whether more records exist past this page.
++    records = relation.limit(size + 1).to_a
++    has_more = records.size > size
++    records = records.first(size)
++    records.reverse! if backward
++
++    after_cursor = records.any? ? encode_cursor(records.last, spec) : nil
++    before_cursor = records.any? ? encode_cursor(records.first, spec) : nil
++
++    meta = {
++      meta: {
++        has_more: has_more,
++        after_cursor: after_cursor,
++        before_cursor: before_cursor
++      },
++      links: cursor_links(
++        size: size,
++        after_cursor: after_cursor,
++        before_cursor: before_cursor,
++        has_more: has_more,
++        backward: backward,
++        positioned: !after.nil?
++      )
++    }
++
++    [records, meta]
++  end
++
++  def cursor_page_size(page)
++    size = cursor_page_value(page, :size).to_s.to_i
++    size = params[:per_page].to_s.to_i if size < 1 && params[:per_page].present?
++    size = DEFAULT_PAGE_SIZE if size < 1
++    size
++  end
++
++  # Reads one of the bracket page params whether they arrived as query
++  # params (ActionController::Parameters) or a plain Hash.
++  def cursor_page_value(page, key)
++    page[key] || page[key.to_s]
++  end
++
++  # Reads the scope's ORDER BY into [[column, direction], ...] and appends
++  # the primary key as tiebreaker when it isn't part of the order, so every
++  # record occupies a unique, stable position in the collection.
++  def cursor_order_spec(scope)
++    spec = scope.order_values.flat_map do |value|
++      case value
++      when Arel::Nodes::Ascending
++        [[cursor_order_column(value.expr), :asc]]
++      when Arel::Nodes::Descending
++        [[cursor_order_column(value.expr), :desc]]
++      when Symbol
++        [[value.to_s, :asc]]
++      when String
++        value.scan(/"?(\w+)"?(?:\s+(asc|desc))?/i).map do |column, direction|
++          [column, (direction || "asc").downcase.to_sym]
++        end
++      when Hash
++        value.map { |column, direction| [column.to_s, direction.to_s.downcase.to_sym] }
++      else
++        raise ArgumentError, "Cursor pagination cannot follow the scope's ordering"
++      end
++    end
++
++    primary_key = scope.klass.primary_key.to_s
++    spec << [primary_key, spec.last&.last || :asc] unless spec.any? { |column, _| column == primary_key }
++    spec
++  end
++
++  def cursor_order_column(expr)
++    unless expr.is_a?(Arel::Attributes::Attribute)
++      raise ArgumentError, "Cursor pagination cannot follow the scope's ordering"
++    end
++    expr.name.to_s
++  end
++
++  # Builds ORDER BY nodes for the spec, flipping every direction when
++  # browsing backward (rows before the cursor are fetched in reverse and
++  # restored to the collection's order afterwards).
++  def cursor_order(scope, spec, reverse:)
++    table = scope.klass.arel_table
++    spec.map do |column, direction|
++      direction = (direction == :asc ? :desc : :asc) if reverse
++      table[column].public_send(direction)
++    end
++  end
++
++  # Keyset comparison matching rows strictly after (forward) or strictly
++  # before (backward) the cursor position. For `updated_at DESC, id DESC`
++  # going forward this is `updated_at < v1 OR (updated_at = v1 AND id < v2)`.
++  def cursor_condition(scope, spec, values, direction)
++    table = scope.klass.arel_table
++    condition = nil
++
++    spec.each_with_index do |(column, column_direction), index|
++      comparison =
++        if (column_direction == :asc) == (direction == :forward)
++          table[column].gt(values[index])
++        else
++          table[column].lt(values[index])
++        end
++
++      spec.first(index).each_with_index do |(previous_column, _), previous_index|
++        comparison = table[previous_column].eq(values[previous_index]).and(comparison)
++      end
++
++      condition = condition ? condition.or(comparison) : comparison
++    end
++
++    condition
++  end
++
++  # A cursor is the record's ordering values encoded as URL-safe Base64 JSON,
++  # e.g. ["2026-10-05T05:00:00.123456Z", 42] for a ticket. Opaque to clients.
++  def encode_cursor(record, spec)
++    values = spec.map do |column, _|
++      value = record.read_attribute(column)
++      case value
++      when ActiveSupport::TimeWithZone, Time, DateTime then value.iso8601(6)
++      when Date then value.iso8601
++      else value
++      end
++    end
++    Base64.urlsafe_encode64(JSON.generate(values), padding: false)
++  end
++
++  def decode_cursor(raw, scope, spec)
++    return nil if raw.blank?
++
++    padded = raw.to_s
++    padded = "#{padded}#{"=" * (-padded.length % 4)}"
++    values = JSON.parse(Base64.urlsafe_decode64(padded))
++    unless values.is_a?(Array) && values.size == spec.size
++      raise InvalidCursor, "The page cursor is not valid."
++    end
++
++    values.each_with_index.map do |value, index|
++      type = scope.klass.type_for_attribute(spec[index].first)
++      cast_cursor_value(value, type)
++    end
++  rescue ArgumentError, TypeError, JSON::ParserError, EncodingError
++    raise InvalidCursor, "The page cursor is not valid."
++  end
++
++  # Casts one cursor value to its column type, accepting only the JSON shape
++  # encode_cursor could have written for it (ISO strings for dates and
++  # timestamps, numbers for numeric columns, ...). Anything else means the
++  # cursor was tampered with, and it also guarantees the value can be quoted
++  # in the keyset comparison.
++  def cast_cursor_value(value, type)
++    casted =
++      case type.type
++      when :datetime, :timestamp, :time
++        value.is_a?(String) ? type.cast(value) : nil
++      when :date
++        value.is_a?(String) ? type.cast(value) : nil
++      when :integer, :bigint
++        value.is_a?(Integer) ? type.cast(value) : nil
++      when :float, :decimal
++        value.is_a?(Numeric) ? type.cast(value) : nil
++      when :boolean
++        (value == true || value == false) ? type.cast(value) : nil
++      else
++        value.is_a?(String) ? value : nil
++      end
++
++    casted = nil unless casted.is_a?(String) || casted.is_a?(Numeric) ||
++      casted == true || casted == false ||
++      casted.is_a?(Time) || casted.is_a?(Date) || casted.is_a?(ActiveSupport::TimeWithZone)
++
++    raise InvalidCursor, "The page cursor is not valid." if casted.nil?
++    casted
++  end
++
++  # Ready-to-follow navigation URLs. When browsing backward the records
++  # after the page exist by construction (the cursor we came from does), and
++  # the same holds for records before the page when browsing forward from a
++  # cursor; in the direction being browsed we rely on `has_more`.
++  def cursor_links(size:, after_cursor:, before_cursor:, has_more:, backward:, positioned:)
++    return { next: nil, prev: nil } if after_cursor.nil? && before_cursor.nil?
++
++    if backward
++      {
++        next: cursor_link(size: size, after: after_cursor),
++        prev: has_more ? cursor_link(size: size, before: before_cursor) : nil
++      }
++    else
++      {
++        next: has_more ? cursor_link(size: size, after: after_cursor) : nil,
++        prev: positioned ? cursor_link(size: size, before: before_cursor) : nil
++      }
++    end
++  end
++
++  # Rebuilds the current URL with the page param replaced by the given
++  # cursor position, keeping filters (status, q, ...) and the page size.
++  def cursor_link(size:, **position)
++    query = request.query_parameters.deep_dup
++    query["page"] = position.stringify_keys.merge("size" => size)
++    "#{request.base_url}#{request.path}?#{query.to_query}"
++  end
++end
+diff --git a/test/integration/cursor_pagination_test.rb b/test/integration/cursor_pagination_test.rb
+new file mode 100644
+index 0000000..c47e4c1
+--- /dev/null
++++ b/test/integration/cursor_pagination_test.rb
+@@ -0,0 +1,325 @@
++require "test_helper"
++
++class CursorPaginationTest < ActionDispatch::IntegrationTest
++  setup do
++    @subdomain = "testco-#{SecureRandom.hex(4)}"
++    @headers = { "X-Helpdesk-Account" => @subdomain }
++
++    post "/api/v1/account/create", params: {
++      account: {
++        name: "Test Co", subdomain: @subdomain,
++        admin: { name: "Jo", email: "jo@testco.test", password: "my-first-password" }
++      }
++    }, as: :json
++    assert_response :created
++    post "/api/v1/email_verifications/confirm", params: {
++      email_verification: { token: EmailVerification.order(:id).last.token }
++    }, as: :json
++    assert_response :success
++    @staff_token = sign_in!("jo@testco.test", "my-first-password")
++
++    register_customer!("Avery", "avery@example.test", "my-customer-password")
++    @customer_token = sign_in!("avery@example.test", "my-customer-password")
++  end
++
++  def register_customer!(name, email, password)
++    post "/api/v1/registrations", params: {
++      user: { name: name, email: email, password: password }
++    }, headers: @headers, as: :json
++    assert_response :created
++    post "/api/v1/email_verifications/confirm", params: {
++      email_verification: { token: EmailVerification.order(:id).last.token }
++    }, as: :json
++    assert_response :success
++  end
++
++  def sign_in!(email, password)
++    post "/api/v1/sessions", params: { session: { email: email, password: password } },
++      headers: @headers, as: :json
++    assert_response :created
++    response.parsed_body.dig("session", "token")
++  end
++
++  def auth(token)
++    { "Authorization" => "Bearer #{token}" }
++  end
++
++  def create_request!(token, subject: "Cannot download my receipt", body: "The download button does nothing.")
++    post "/api/v1/requests", params: {
++      request: { subject: subject, comment: { body: body } }
++    }, headers: auth(token), as: :json
++    assert_response :created
++    response.parsed_body["request"]
++  end
++
++  def create_requests!(count)
++    count.times { |i| create_request!(@customer_token, subject: "Issue #{i}") }
++  end
++
++  test "empty collection returns null cursors and links" do
++    get "/api/v1/tickets", params: { page: { size: 25 }, status: "open" }, headers: auth(@staff_token)
++    assert_response :success
++    assert_equal(
++      { "tickets" => [],
++        "meta" => { "has_more" => false, "after_cursor" => nil, "before_cursor" => nil },
++        "links" => { "next" => nil, "prev" => nil } },
++      response.parsed_body
++    )
++  end
++
++  test "first page exposes cursors, links, and has_more" do
++    create_requests!(3)
++    get "/api/v1/tickets", params: { page: { size: 2 } }, headers: auth(@staff_token)
++    assert_response :success
++    body = response.parsed_body
++
++    assert_equal 2, body["tickets"].size
++    assert_equal true, body.dig("meta", "has_more")
++    assert body.dig("meta", "after_cursor").present?
++    assert body.dig("meta", "before_cursor").present?
++    assert body.dig("links", "next").present?
++    assert_nil body.dig("links", "prev")
++  end
++
++  test "following next walks the whole collection without gaps or repeats" do
++    create_requests!(7)
++    expected = Ticket.recently_active.pluck(:id)
++
++    seen = []
++    url = "/api/v1/tickets?page[size]=3"
++    loop do
++      get url, headers: auth(@staff_token)
++      assert_response :success
++      body = response.parsed_body
++      seen.concat(body["tickets"].map { |t| t["id"] })
++      break unless body.dig("meta", "has_more")
++      url = body.dig("links", "next")
++      assert url.present?
++    end
++
++    assert_equal expected, seen
++  end
++
++  test "following prev walks back to the start" do
++    create_requests!(7)
++
++    get "/api/v1/tickets", params: { page: { size: 3 } }, headers: auth(@staff_token)
++    first_page = response.parsed_body["tickets"].map { |t| t["id"] }
++
++    get response.parsed_body.dig("links", "next"), headers: auth(@staff_token)
++    second_page = response.parsed_body["tickets"].map { |t| t["id"] }
++
++    prev = response.parsed_body.dig("links", "prev")
++    assert prev.present?
++    get prev, headers: auth(@staff_token)
++    assert_equal first_page, response.parsed_body["tickets"].map { |t| t["id"] }
++
++    # back on the first page: nothing before it
++    assert_nil response.parsed_body.dig("links", "prev")
++    assert_equal false, response.parsed_body.dig("meta", "has_more")
++    assert_equal 3, second_page.size
++  end
++
++  test "page[before] reports has_more for the browsing direction" do
++    create_requests!(9)
++    ids = Ticket.recently_active.pluck(:id)
++
++    cursor = nil
++    get "/api/v1/tickets", params: { page: { size: 3 } }, headers: auth(@staff_token)
++    cursor = response.parsed_body.dig("meta", "after_cursor")
++
++    # page 2 forward, then page[before] from page 3's first record
++    get "/api/v1/tickets", params: { page: { size: 3, after: cursor } }, headers: auth(@staff_token)
++    get "/api/v1/tickets", params: { page: { size: 3, after: response.parsed_body.dig("meta", "after_cursor") } }, headers: auth(@staff_token)
++    assert_equal ids[6, 3], response.parsed_body["tickets"].map { |t| t["id"] }
++
++    get "/api/v1/tickets", params: { page: { size: 3, before: response.parsed_body.dig("meta", "before_cursor") } }, headers: auth(@staff_token)
++    body = response.parsed_body
++    assert_equal ids[3, 3], body["tickets"].map { |t| t["id"] }
++    assert_equal true, body.dig("meta", "has_more") # more records before this page
++    assert body.dig("links", "prev").present?
++    assert body.dig("links", "next").present?
++
++    get body.dig("links", "prev"), headers: auth(@staff_token)
++    body = response.parsed_body
++    assert_equal ids[0, 3], body["tickets"].map { |t| t["id"] }
++    assert_equal false, body.dig("meta", "has_more")
++    assert_nil body.dig("links", "prev")
++  end
++
++  test "navigation stays stable while records are added and updated" do
++    create_requests!(6)
++    ids = Ticket.recently_active.pluck(:id)
++
++    get "/api/v1/tickets", params: { page: { size: 2 } }, headers: auth(@staff_token)
++    page1 = response.parsed_body
++    assert_equal ids[0, 2], page1["tickets"].map { |t| t["id"] }
++
++    # Other people work meanwhile: a brand new ticket and a reply bumping an
++    # old one to the top of the inbox.
++    create_request!(@customer_token, subject: "New arrival")
++    bumped = Ticket.order(:id).last(2).first
++    bumped.touch
++
++    get page1.dig("links", "next"), headers: auth(@staff_token)
++    page2 = response.parsed_body
++    assert_equal ids[2, 2], page2["tickets"].map { |t| t["id"] }
++
++    get page2.dig("links", "next"), headers: auth(@staff_token)
++    page3 = response.parsed_body
++    assert_equal ids[4, 2], page3["tickets"].map { |t| t["id"] }
++    assert_equal false, page3.dig("meta", "has_more")
++    assert_nil page3.dig("links", "next")
++  end
++
++  test "links preserve filters and page size" do
++    create_requests!(4)
++    patch "/api/v1/tickets/#{Ticket.order(:id).first.id}", params: {
++      ticket: { status: "pending" }
++    }, headers: auth(@staff_token), as: :json
++    assert_response :success
++
++    get "/api/v1/tickets", params: { page: { size: 2 }, status: "open" }, headers: auth(@staff_token)
++    body = response.parsed_body
++    assert body.dig("links", "next").include?("status=open")
++    assert body.dig("links", "next").include?("page%5Bsize%5D=2")
++
++    get body.dig("links", "next"), headers: auth(@staff_token)
++    assert response.parsed_body["tickets"].all? { |t| t["status"] == "open" }
++  end
++
++  test "cursor after the last record returns an empty page" do
++    create_requests!(2)
++    get "/api/v1/tickets", params: { page: { size: 5 } }, headers: auth(@staff_token)
++    cursor = response.parsed_body.dig("meta", "after_cursor")
++
++    get "/api/v1/tickets", params: { page: { size: 5, after: cursor } }, headers: auth(@staff_token)
++    assert_equal [], response.parsed_body["tickets"]
++    assert_equal false, response.parsed_body.dig("meta", "has_more")
++    assert_nil response.parsed_body.dig("meta", "after_cursor")
++  end
++
++  test "invalid cursors are rejected" do
++    get "/api/v1/tickets", params: { page: { size: 5, after: "not-a-cursor" } }, headers: auth(@staff_token)
++    assert_response :bad_request
++    assert_equal "invalid_cursor", response.parsed_body["error"]
++  end
++
++  test "page-number pagination keeps working" do
++    create_requests!(30)
++    get "/api/v1/tickets", params: { page: 2, per_page: 10 }, headers: auth(@staff_token)
++    body = response.parsed_body
++    assert_equal 30, body["count"]
++    assert_equal 2, body["page"]
++    assert_equal 10, body["per_page"]
++    assert_equal 3, body["next_page"]
++    assert_equal 1, body["previous_page"]
++    assert_equal 10, body["tickets"].size
++    assert_nil body["meta"]
++  end
++
++  test "cursors work on requests, comments, and the admin collections" do
++    create_requests!(3)
++    ticket = Ticket.order(:id).first
++    4.times do |i|
++      post "/api/v1/tickets/#{ticket.id}", params: {
++        ticket: { comment: { body: "note #{i}", public: i.even? } }
++      }, headers: auth(@staff_token), as: :json
++    end
++    2.times { |i| create_request!(@customer_token, subject: "extra #{i}") }
++
++    collect = lambda do |url, key, token|
++      seen = []
++      loop do
++        get url, headers: auth(token)
++        assert_response :success
++        body = response.parsed_body
++        assert body.key?("meta"), "expected meta in #{url}"
++        seen.concat(body[key].map { |r| r["id"] })
++        break unless body.dig("meta", "has_more")
++        url = body.dig("links", "next")
++      end
++      seen
++    end
++
++    customer = User.find_by(email: "avery@example.test")
++    assert_equal customer.tickets.recently_active.pluck(:id),
++      collect.call("/api/v1/requests?page[size]=2", "requests", @customer_token)
++    assert_equal ticket.comments.order(created_at: :asc, id: :asc).pluck(:id),
++      collect.call("/api/v1/tickets/#{ticket.id}/comments?page[size]=2", "comments", @staff_token)
++    assert_equal ticket.comments.where(public: true).order(created_at: :asc, id: :asc).pluck(:id),
++      collect.call("/api/v1/requests/#{ticket.id}/comments?page[size]=1", "comments", @customer_token)
++    assert_equal User.by_id.pluck(:id),
++      collect.call("/api/v1/users?page[size]=1", "users", @staff_token)
++    assert_equal User.staff.active.by_id.pluck(:id),
++      collect.call("/api/v1/staff?page[size]=1", "staff", @staff_token)
++    assert_equal Group.by_id.pluck(:id),
++      collect.call("/api/v1/groups?page[size]=1", "groups", @staff_token)
++    assert_equal GroupMembership.by_id.pluck(:id),
++      collect.call("/api/v1/group_memberships?page[size]=1", "group_memberships", @staff_token)
++    assert_equal Invitation.by_id.pluck(:id),
++      collect.call("/api/v1/invitations?page[size]=1", "invitations", @staff_token)
++  end
++
++  test "cursors disambiguate records sharing the same updated_at" do
++    create_requests!(4)
++    same = Time.current.change(usec: 123_456)
++    Ticket.update_all(updated_at: same)
++
++    seen = []
++    url = "/api/v1/tickets?page[size]=1"
++    6.times do
++      get url, headers: auth(@staff_token)
++      assert_response :success
++      body = response.parsed_body
++      seen.concat(body["tickets"].map { |t| t["id"] })
++      break unless body.dig("meta", "has_more")
++      url = body.dig("links", "next")
++    end
++
++    assert_equal Ticket.recently_active.pluck(:id), seen
++    assert_equal 4, seen.uniq.size
++  end
++
++  test "page[after] without a size falls back to the default page size" do
++    create_requests!(27)
++    get "/api/v1/tickets", params: { page: { size: 1 } }, headers: auth(@staff_token)
++    cursor = response.parsed_body.dig("meta", "after_cursor")
++
++    get "/api/v1/tickets", params: { page: { after: cursor } }, headers: auth(@staff_token)
++    assert_equal 25, response.parsed_body["tickets"].size
++    assert_equal true, response.parsed_body.dig("meta", "has_more")
++  end
++
++  test "cursors compose with search and other ticket filters" do
++    create_requests!(6)
++    Ticket.order(:id).where(id: Ticket.order(:id).limit(3)).each do |ticket|
++      ticket.update_columns(subject: "receipt problem")
++    end
++
++    seen = []
++    url = "/api/v1/tickets?page[size]=2&q=receipt"
++    loop do
++      get url, headers: auth(@staff_token)
++      assert_response :success
++      body = response.parsed_body
++      seen.concat(body["tickets"].map { |t| t["id"] })
++      break unless body.dig("meta", "has_more")
++      url = body.dig("links", "next")
++    end
++
++    assert_equal Ticket.matching("receipt").recently_active.pluck(:id), seen
++    assert_equal 3, seen.size
++  end
++
++  test "when both cursors are given, after wins" do
++    create_requests!(5)
++    ids = Ticket.recently_active.pluck(:id)
++    get "/api/v1/tickets", params: { page: { size: 2 } }, headers: auth(@staff_token)
++    after = response.parsed_body.dig("meta", "after_cursor")
++    before = response.parsed_body.dig("meta", "before_cursor")
++
++    get "/api/v1/tickets", params: { page: { size: 2, after: after, before: before } }, headers: auth(@staff_token)
++    assert_equal ids[2, 2], response.parsed_body["tickets"].map { |t| t["id"] }
++  end
++end

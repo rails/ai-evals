@@ -1,0 +1,443 @@
+diff --git a/docs/TEST_PERFORMANCE.md b/docs/TEST_PERFORMANCE.md
+new file mode 100644
+index 0000000..4cf8d7b
+--- /dev/null
++++ b/docs/TEST_PERFORMANCE.md
+@@ -0,0 +1,156 @@
++# Test suite performance
++
++Notes, metrics and plans for speeding up the RSpec suite. Update this file after
++every optimization phase so the next run can start from where we left off.
++
++Scope: plain `bundle exec rspec spec/<folder>` runs (no parallelization).
++System (`spec/system`, `:js`) and streaming (`:streaming`) specs are ignored
++(excluded by default anyway).
++
++## Phases
++
++| Phase | Target            | Status      |
++|-------|-------------------|-------------|
++| 1     | `spec/models`     | done        |
++| 2     | `spec/requests`   | todo        |
++| 3     | factories (`spec/fabricators`) | todo (do not touch before this phase) |
++
++Overall goal: `spec/models` + `spec/requests` together at least 2x faster than baseline.
++
++## Metrics
++
++Measured in the dev container (64 cores, local PostgreSQL + Redis), `Finished in` line of RSpec.
++
++### `spec/models` (152 files, 1795 examples)
++
++| State                                                                 | Time    |
++|-----------------------------------------------------------------------|---------|
++| Baseline                                                              | 164.7s  |
++| + Sidekiq `fake` mode by default                                      | 116.6s  |
++| + quiet logs, bcrypt digest memoization                               | 52.9s   |
++| + `let_it_be`/`before_all` in the 4 heaviest-setup files              | 46.5s   |
++
++Result: **~72% faster (3.5x)**. For reference, the final state with
++`TEST_LOG_LEVEL=debug` (that is, everything except the quiet logs) takes 91s,
++so debug logging alone costs roughly half of the remaining runtime.
++
++### `spec/requests`
++
++Baseline: not measured yet (do it first in phase 2).
++
++## How to profile
++
++[TestProf](https://test-prof.evilmartians.io) is in the Gemfile (`require: false`);
++`spec/support/test_prof.rb` loads the `before_all`/`let_it_be` recipes. Profilers
++are enabled with env vars plus `-r test_prof`:
++
++```sh
++# Slowest examples/groups
++bundle exec rspec spec/models --profile 30
++# Factory (Fabrication) usage: counts, time per factory, cascades
++FPROF=1 bundle exec rspec spec/models -r test_prof
++# Time spent in let/before per group: candidates for let_it_be/before_all
++RD_PROF=1 RD_PROF_TOP=20 bundle exec rspec spec/models -r test_prof
++# SQL / factory time per group
++EVENT_PROF=sql.active_record,factory.create bundle exec rspec spec/models -r test_prof
++# Wall-clock sampling (best for finding generic problems)
++TEST_STACK_PROF=1 bundle exec rspec spec/models/status_spec.rb -r test_prof
++bundle exec stackprof tmp/test_prof/stack-prof-report-wall-raw-total.dump --limit 40
++bundle exec stackprof tmp/test_prof/stack-prof-report-wall-raw-total.dump --sort-total --limit 300
++```
++
++NOTE: the `factory.create` EventProf event does not work with Fabrication (it reports 0);
++use `FPROF=1` instead.
++
++## Findings (shared problems) and fixes
++
++All per-type settings live in `spec/support/test_performance.rb` (`TestPerformance`).
++They are applied before each example (`rails_helper.rb`) and when entering a
++`before_all`/`let_it_be` block (TestProf `before(:begin)` hook in `spec/support/test_prof.rb`).
++Each setting has a list of spec types it is enabled for; **phase 2 should add
++`:request` to these lists** (and fix/tag whatever breaks).
++
++1. **Sidekiq inline mode for everything (≈30% of the runtime).** The global
++   `Sidekiq.testing!(:inline)` performed every job synchronously. The worst offender
++   is `TriggerWebhookWorker`: it is enqueued after commit for every created local
++   Account, Status, User (and Report), and serializes the record with
++   `REST::Admin::WebhookEventSerializer` even when no webhooks exist.
++   - Fix: `SIDEKIQ_FAKE_BY_DEFAULT_TYPES` (currently `%i(model)`). Jobs are only pushed to
++     `Sidekiq::Worker.jobs` (cleared before each example).
++   - Opt back in with `sidekiq: :inline` metadata (group or example), or opt in to
++     fake elsewhere with `sidekiq: :fake`. Calling `Sidekiq.testing!(:fake)` inside an
++     example still works as before.
++   - Tagged with `sidekiq: :inline` in models: examples using `capture_emails`
++     (`deliver_later` goes through Sidekiq/ActiveJob), see
++     `admin/account_action_spec.rb`, `email_subscription_spec.rb`,
++     `user_spec.rb` (`#mark_email_as_confirmed!`).
++   - **Gotcha**: negative assertions, for example `expect(emails).to be_empty` or
++     `not_change(...)`, can pass vacuously in fake mode. The failing specs are not the only
++     ones to look at. Audit which jobs get enqueued per file and check what the
++     examples assert. Helper used for the audit (run with `-r /tmp/jobaudit.rb`):
++
++     ```ruby
++     RSpec.configure do |c|
++       $jobs = Hash.new { |h, k| h[k] = Hash.new(0) }
++       c.after do |ex|
++         next unless TestPerformance.sidekiq_mode(ex.metadata) == :fake
++         Sidekiq::Worker.jobs.each { |j| $jobs[ex.metadata[:rerun_file_path]][j['wrapped'] || j['class']] += 1 }
++       end
++       c.after(:suite) { File.write('/tmp/jobs.txt', $jobs.map { |f, h| "#{f}: #{h}" }.sort.join("\n")) }
++     end
++     ```
++
++2. **Debug logging to `log/test.log`.** `ActiveRecord::LogSubscriber#sql` plus `IO#write`
++   took a large share of samples, and the log grows by hundreds of MB per run.
++   - Fix: `QUIET_LOGS_TYPES` sets `Rails.logger.level = :warn` (currently `%i(model)`).
++     Set `TEST_LOG_LEVEL=debug` to get full logs again when debugging.
++   - Specs that stub `Rails.logger` (e.g. `remotable_spec.rb`) are not affected.
++
++3. **bcrypt on every fabricated user (~5%).** Each local `account` builds a `user`
++   with the same password, and Devise hashes it on every build (cost 4 is the bcrypt minimum,
++   so `stretches = 1` does not help further).
++   - Fix: `MEMOIZE_PASSWORD_DIGEST_TYPES` memoizes `Devise::Encryptor.digest` per
++     `[class, pepper, stretches, password]`. Digests are still real bcrypt hashes
++     of the given password (only the salt is reused), so `valid_password?` and
++     "password changed" assertions keep working.
++
++4. **Repeated heavy setup in read-only groups.** RSpecDissect showed ~80% of time in
++   `let`/`before`. Converted to `let_it_be` / `before_all` (use `refind: true` when
++   examples mutate records):
++   - `account_statuses_cleanup_policy_spec.rb` (`#statuses_to_delete`)
++   - `tag_feed_spec.rb` (`#get`)
++   - `notification_spec.rb` (`.paginate_groups_by_*`)
++   - `concerns/status/threading_concern_spec.rb`
++   - **Gotchas**:
++     - Redis and `Rails.cache` are wiped after *every* example (`rails_helper.rb`),
++       so setups that store state in Redis (e.g. `Trends::Statuses` via
++       `subject.add`, home feeds) must NOT move into `before_all`.
++     - Setups using relative times like `1.second.ago` (e.g. `fetch_replies_concern_spec.rb`)
++       or overriding the shared records per context are also bad candidates.
++     - Per-example hooks (DNS stub, `Sidekiq::Worker.clear_all`) do not run before `before_all`.
++       `TestPerformance.apply` handles the settings that matter there.
++
++Checked and found negligible: per-example `redis.del(redis.keys)`, `Rails.cache.clear`,
++`reload_routes_unless_loaded`.
++
++## Remaining hotspots in `spec/models` (after phase 1)
++
++- Fabrication is still ~75% of runtime (FPROF: ~39s of ~51s). This is for phase 3:
++  - `status` fabricator `after_create` creates a `bookmark` (with its own
++    account+user) for **every** status: 650 bookmarks ≈ 7s of the 13s spent on statuses.
++  - `user` fabricator creates 2 `login_activity` records for every user.
++  - `account` builds a `user` for every local account (~10ms per account).
++- `media_attachment_spec.rb` (~6.5s): real ffmpeg/libvips processing, by design.
++- `Trends::Statuses` (~3.4s): Redis-backed, see gotcha above.
++- `PublicFeed`, `Status`, `Account::Interactions`: many small contexts
++  with 2–3 examples each. `let_it_be` would help a bit, but with a large diff.
++
++## Plan for phase 2 (`spec/requests`)
++
++1. Measure the baseline: `bundle exec rspec spec/requests --profile 30`, plus FPROF/RD_PROF.
++2. Add `:request` to `TestPerformance::QUIET_LOGS_TYPES` and
++   `MEMOIZE_PASSWORD_DIGEST_TYPES` (should be safe), then to `SIDEKIQ_FAKE_BY_DEFAULT_TYPES`.
++   Fix failures by tagging `sidekiq: :inline`, and audit vacuous negative assertions
++   with the job audit helper above.
++3. Look for request-specific shared costs (authentication setup, `sign_in`,
++   Doorkeeper token creation, JSON schema validation, ...) with TEST_STACK_PROF.
+diff --git a/spec/models/account_statuses_cleanup_policy_spec.rb b/spec/models/account_statuses_cleanup_policy_spec.rb
+index 548e110..1452372 100644
+--- a/spec/models/account_statuses_cleanup_policy_spec.rb
++++ b/spec/models/account_statuses_cleanup_policy_spec.rb
+@@ -263,23 +263,25 @@ RSpec.describe AccountStatusesCleanupPolicy do
+   describe '#statuses_to_delete' do
+     subject { account_statuses_cleanup_policy.statuses_to_delete }
+ 
+-    let!(:unrelated_status)  { Fabricate(:status, created_at: 3.years.ago) }
+-    let!(:very_old_status)   { Fabricate(:status, created_at: 3.years.ago, account: account) }
+-    let!(:pinned_status)     { Fabricate(:status, created_at: 1.year.ago, account: account) }
+-    let!(:direct_message)    { Fabricate(:status, created_at: 1.year.ago, account: account, visibility: :direct) }
+-    let!(:self_faved)        { Fabricate(:status, created_at: 1.year.ago, account: account) }
+-    let!(:self_bookmarked)   { Fabricate(:status, created_at: 1.year.ago, account: account) }
+-    let!(:status_with_poll)  { Fabricate(:status, created_at: 1.year.ago, account: account, poll_attributes: { account: account, voters_count: 0, options: %w(a b), expires_in: 2.days }) }
+-    let!(:status_with_media) { Fabricate(:status, created_at: 1.year.ago, account: account) }
+-    let!(:faved_primary) { Fabricate(:status, created_at: 1.year.ago, account: account) }
+-    let!(:faved_secondary) { Fabricate(:status, created_at: 1.year.ago, account: account) }
+-    let!(:reblogged_primary) { Fabricate(:status, created_at: 1.year.ago, account: account) }
+-    let!(:reblogged_secondary) { Fabricate(:status, created_at: 1.year.ago, account: account) }
+-    let!(:recent_status) { Fabricate(:status, created_at: 2.days.ago, account: account) }
++    # Shared read-only setup, created once for the whole group (see docs/TEST_PERFORMANCE.md)
++    let_it_be(:account) { Fabricate(:account, username: 'alice', domain: nil) }
++    let_it_be(:unrelated_status)  { Fabricate(:status, created_at: 3.years.ago) }
++    let_it_be(:very_old_status)   { Fabricate(:status, created_at: 3.years.ago, account: account) }
++    let_it_be(:pinned_status)     { Fabricate(:status, created_at: 1.year.ago, account: account) }
++    let_it_be(:direct_message)    { Fabricate(:status, created_at: 1.year.ago, account: account, visibility: :direct) }
++    let_it_be(:self_faved)        { Fabricate(:status, created_at: 1.year.ago, account: account) }
++    let_it_be(:self_bookmarked)   { Fabricate(:status, created_at: 1.year.ago, account: account) }
++    let_it_be(:status_with_poll)  { Fabricate(:status, created_at: 1.year.ago, account: account, poll_attributes: { account: account, voters_count: 0, options: %w(a b), expires_in: 2.days }) }
++    let_it_be(:status_with_media) { Fabricate(:status, created_at: 1.year.ago, account: account) }
++    let_it_be(:faved_primary) { Fabricate(:status, created_at: 1.year.ago, account: account) }
++    let_it_be(:faved_secondary) { Fabricate(:status, created_at: 1.year.ago, account: account) }
++    let_it_be(:reblogged_primary) { Fabricate(:status, created_at: 1.year.ago, account: account) }
++    let_it_be(:reblogged_secondary) { Fabricate(:status, created_at: 1.year.ago, account: account) }
++    let_it_be(:recent_status) { Fabricate(:status, created_at: 2.days.ago, account: account) }
+ 
+     let(:account_statuses_cleanup_policy) { Fabricate(:account_statuses_cleanup_policy, account: account) }
+ 
+-    before do
++    before_all do
+       Fabricate(:media_attachment, account: account, status: status_with_media)
+       Fabricate(:status_pin, account: account, status: pinned_status)
+       Fabricate(:favourite, account: account, status: self_faved)
+diff --git a/spec/models/admin/account_action_spec.rb b/spec/models/admin/account_action_spec.rb
+index 5339084..b199258 100644
+--- a/spec/models/admin/account_action_spec.rb
++++ b/spec/models/admin/account_action_spec.rb
+@@ -87,7 +87,7 @@ RSpec.describe Admin::AccountAction do
+       end
+     end
+ 
+-    it 'sends email to target account user' do
++    it 'sends email to target account user', sidekiq: :inline do
+       emails = capture_emails { subject }
+ 
+       expect(emails).to contain_exactly(
+diff --git a/spec/models/concerns/status/threading_concern_spec.rb b/spec/models/concerns/status/threading_concern_spec.rb
+index a13487c..c455a6d 100644
+--- a/spec/models/concerns/status/threading_concern_spec.rb
++++ b/spec/models/concerns/status/threading_concern_spec.rb
+@@ -4,14 +4,14 @@ require 'rails_helper'
+ 
+ RSpec.describe Status::ThreadingConcern do
+   describe '#ancestors' do
+-    let!(:alice)  { Fabricate(:account, username: 'alice') }
+-    let!(:bob)    { Fabricate(:account, username: 'bob', domain: 'example.com') }
+-    let!(:jeff)   { Fabricate(:account, username: 'jeff') }
+-    let!(:status) { Fabricate(:status, account: alice) }
+-    let!(:reply_to_status) { Fabricate(:status, thread: status, account: jeff) }
+-    let!(:reply_to_first_reply) { Fabricate(:status, thread: reply_to_status, account: bob) }
+-    let!(:reply_to_second_reply) { Fabricate(:status, thread: reply_to_first_reply, account: alice) }
+-    let!(:viewer) { Fabricate(:account, username: 'viewer') }
++    let_it_be(:alice, refind: true)  { Fabricate(:account, username: 'alice') }
++    let_it_be(:bob, refind: true)    { Fabricate(:account, username: 'bob', domain: 'example.com') }
++    let_it_be(:jeff, refind: true)   { Fabricate(:account, username: 'jeff') }
++    let_it_be(:status, refind: true) { Fabricate(:status, account: alice) }
++    let_it_be(:reply_to_status, refind: true) { Fabricate(:status, thread: status, account: jeff) }
++    let_it_be(:reply_to_first_reply, refind: true) { Fabricate(:status, thread: reply_to_status, account: bob) }
++    let_it_be(:reply_to_second_reply, refind: true) { Fabricate(:status, thread: reply_to_first_reply, account: alice) }
++    let_it_be(:viewer, refind: true) { Fabricate(:account, username: 'viewer') }
+ 
+     it 'returns conversation history' do
+       expect(reply_to_second_reply.ancestors(4)).to include(status, reply_to_status, reply_to_first_reply)
+@@ -79,14 +79,14 @@ RSpec.describe Status::ThreadingConcern do
+   end
+ 
+   describe '#descendants' do
+-    let!(:alice)  { Fabricate(:account, username: 'alice') }
+-    let!(:bob)    { Fabricate(:account, username: 'bob', domain: 'example.com') }
+-    let!(:jeff)   { Fabricate(:account, username: 'jeff') }
+-    let!(:status) { Fabricate(:status, account: alice) }
+-    let!(:reply_to_status_from_alice) { Fabricate(:status, thread: status, account: alice) }
+-    let!(:reply_to_status_from_bob) { Fabricate(:status, thread: status, account: bob) }
+-    let!(:reply_to_alice_reply_from_jeff) { Fabricate(:status, thread: reply_to_status_from_alice, account: jeff) }
+-    let!(:viewer) { Fabricate(:account, username: 'viewer') }
++    let_it_be(:alice, refind: true)  { Fabricate(:account, username: 'alice') }
++    let_it_be(:bob, refind: true)    { Fabricate(:account, username: 'bob', domain: 'example.com') }
++    let_it_be(:jeff, refind: true)   { Fabricate(:account, username: 'jeff') }
++    let_it_be(:status, refind: true) { Fabricate(:status, account: alice) }
++    let_it_be(:reply_to_status_from_alice, refind: true) { Fabricate(:status, thread: status, account: alice) }
++    let_it_be(:reply_to_status_from_bob, refind: true) { Fabricate(:status, thread: status, account: bob) }
++    let_it_be(:reply_to_alice_reply_from_jeff, refind: true) { Fabricate(:status, thread: reply_to_status_from_alice, account: jeff) }
++    let_it_be(:viewer, refind: true) { Fabricate(:account, username: 'viewer') }
+ 
+     it 'returns replies' do
+       expect(status.descendants(4)).to include(reply_to_status_from_alice, reply_to_status_from_bob, reply_to_alice_reply_from_jeff)
+diff --git a/spec/models/email_subscription_spec.rb b/spec/models/email_subscription_spec.rb
+index 3730b5c..81242c8 100644
+--- a/spec/models/email_subscription_spec.rb
++++ b/spec/models/email_subscription_spec.rb
+@@ -27,7 +27,7 @@ RSpec.describe EmailSubscription do
+   describe 'Callbacks' do
+     subject { Fabricate(:email_subscription) }
+ 
+-    it 'generates token and delivers confirmation email' do
++    it 'generates token and delivers confirmation email', sidekiq: :inline do
+       emails = capture_emails { subject }
+ 
+       expect(subject.confirmed_at).to be_nil
+diff --git a/spec/models/notification_spec.rb b/spec/models/notification_spec.rb
+index 08427a5..2711c14 100644
+--- a/spec/models/notification_spec.rb
++++ b/spec/models/notification_spec.rb
+@@ -163,9 +163,9 @@ RSpec.describe Notification do
+   end
+ 
+   describe '.paginate_groups_by_max_id' do
+-    let(:account) { Fabricate(:account) }
++    let_it_be(:account) { Fabricate(:account) }
+ 
+-    let!(:notifications) do
++    let_it_be(:notifications) do
+       ['group-1', 'group-1', nil, 'group-2', nil, 'group-1', 'group-2', 'group-1']
+         .map { |group_key| Fabricate(:notification, account: account, group_key: group_key) }
+     end
+@@ -193,9 +193,9 @@ RSpec.describe Notification do
+   end
+ 
+   describe '.paginate_groups_by_min_id' do
+-    let(:account) { Fabricate(:account) }
++    let_it_be(:account) { Fabricate(:account) }
+ 
+-    let!(:notifications) do
++    let_it_be(:notifications) do
+       ['group-1', 'group-1', nil, 'group-2', nil, 'group-1', 'group-2', 'group-1']
+         .map { |group_key| Fabricate(:notification, account: account, group_key: group_key) }
+     end
+diff --git a/spec/models/tag_feed_spec.rb b/spec/models/tag_feed_spec.rb
+index 8618b67..8431769 100644
+--- a/spec/models/tag_feed_spec.rb
++++ b/spec/models/tag_feed_spec.rb
+@@ -4,12 +4,12 @@ require 'rails_helper'
+ 
+ RSpec.describe TagFeed do
+   describe '#get' do
++    let_it_be(:tag_cats, refind: true) { Fabricate(:tag, name: 'cats') }
++    let_it_be(:tag_dogs, refind: true) { Fabricate(:tag, name: 'dogs') }
++    let_it_be(:status_tagged_with_cats, refind: true) { Fabricate(:status, tags: [tag_cats]) }
++    let_it_be(:status_tagged_with_dogs, refind: true) { Fabricate(:status, tags: [tag_dogs]) }
++    let_it_be(:both, refind: true) { Fabricate(:status, tags: [tag_cats, tag_dogs]) }
+     let(:account) { Fabricate(:account) }
+-    let(:tag_cats) { Fabricate(:tag, name: 'cats') }
+-    let(:tag_dogs) { Fabricate(:tag, name: 'dogs') }
+-    let!(:status_tagged_with_cats) { Fabricate(:status, tags: [tag_cats]) }
+-    let!(:status_tagged_with_dogs) { Fabricate(:status, tags: [tag_dogs]) }
+-    let!(:both) { Fabricate(:status, tags: [tag_cats, tag_dogs]) }
+ 
+     it 'can add tags in "any" mode' do
+       results = described_class.new(tag_cats, nil, any: [tag_dogs.name]).get(20)
+diff --git a/spec/models/user_spec.rb b/spec/models/user_spec.rb
+index 3a1964b..963056c 100644
+--- a/spec/models/user_spec.rb
++++ b/spec/models/user_spec.rb
+@@ -493,7 +493,7 @@ RSpec.describe User do
+     end
+   end
+ 
+-  describe '#mark_email_as_confirmed!' do
++  describe '#mark_email_as_confirmed!', sidekiq: :inline do
+     subject { user.mark_email_as_confirmed! }
+ 
+     let!(:user) { Fabricate(:user, confirmed_at: confirmed_at) }
+diff --git a/spec/rails_helper.rb b/spec/rails_helper.rb
+index a91461b..9d165d8 100644
+--- a/spec/rails_helper.rb
++++ b/spec/rails_helper.rb
+@@ -105,8 +105,10 @@ RSpec.configure do |config|
+     self.use_transactional_tests = true
+   end
+ 
+-  config.before do
+-    Sidekiq.testing!(:inline)
++  # Sidekiq testing mode, log level, etc. (see spec/support/test_performance.rb)
++  config.before do |example|
++    Sidekiq::Worker.clear_all
++    TestPerformance.apply(example.metadata)
+   end
+ 
+   config.before :each, type: :cli do
+diff --git a/spec/support/test_performance.rb b/spec/support/test_performance.rb
+new file mode 100644
+index 0000000..4e13f17
+--- /dev/null
++++ b/spec/support/test_performance.rb
+@@ -0,0 +1,54 @@
++# frozen_string_literal: true
++
++# Test-suite-wide performance settings. They are rolled out spec type by spec type
++# (see docs/TEST_PERFORMANCE.md for the rationale, metrics and the roadmap).
++#
++# Settings are applied before every example (see rails_helper.rb) and when entering
++# a `before_all` / `let_it_be` block (see spec/support/test_prof.rb), based on metadata.
++module TestPerformance
++  # Spec types where Sidekiq jobs are only pushed to `Sidekiq::Worker.jobs` (fake mode) instead
++  # of being performed inline. Performing every job inline (e.g. the TriggerWebhookWorker
++  # enqueued for each created Account/Status/User) is a major time sink.
++  # Use `sidekiq: :inline` metadata on groups/examples which rely on jobs being performed
++  # (e.g. `capture_emails` around `deliver_later`), or `sidekiq: :fake` to opt in elsewhere.
++  SIDEKIQ_FAKE_BY_DEFAULT_TYPES = %i(model).freeze
++
++  # Spec types where `Rails.logger` level is set to `warn`: writing debug logs (mostly SQL)
++  # to log/test.log is slow. Use TEST_LOG_LEVEL=debug to get full logs when debugging.
++  QUIET_LOGS_TYPES = %i(model).freeze
++
++  # Spec types where password digests (bcrypt) are memoized per password: every fabricated
++  # local account builds a user with the same password, and hashing it each time is slow.
++  # Digests stay valid bcrypt hashes of the given password, only the salt gets reused.
++  MEMOIZE_PASSWORD_DIGEST_TYPES = %i(model).freeze
++
++  DEFAULT_LOG_LEVEL = Rails.logger.level
++
++  module PasswordDigestMemoization
++    CACHE = {} # rubocop:disable Style/MutableConstant
++
++    class << self
++      attr_accessor :enabled
++    end
++
++    def digest(klass, password)
++      return super unless PasswordDigestMemoization.enabled
++
++      CACHE[[klass.name, klass.pepper, klass.stretches, password]] ||= super
++    end
++  end
++
++  Devise::Encryptor.singleton_class.prepend(PasswordDigestMemoization)
++
++  module_function
++
++  def sidekiq_mode(metadata)
++    metadata.fetch(:sidekiq) { SIDEKIQ_FAKE_BY_DEFAULT_TYPES.include?(metadata[:type]) ? :fake : :inline }
++  end
++
++  def apply(metadata)
++    Sidekiq.testing!(sidekiq_mode(metadata) == :fake ? :fake : :inline)
++    Rails.logger.level = ENV.fetch('TEST_LOG_LEVEL') { QUIET_LOGS_TYPES.include?(metadata[:type]) ? :warn : DEFAULT_LOG_LEVEL }
++    PasswordDigestMemoization.enabled = MEMOIZE_PASSWORD_DIGEST_TYPES.include?(metadata[:type])
++  end
++end
+diff --git a/spec/support/test_prof.rb b/spec/support/test_prof.rb
+new file mode 100644
+index 0000000..233b1e8
+--- /dev/null
++++ b/spec/support/test_prof.rb
+@@ -0,0 +1,15 @@
++# frozen_string_literal: true
++
++# TestProf (https://test-prof.evilmartians.io) profiling and optimization tooling.
++# Profilers are only activated via env vars (EVENT_PROF, RD_PROF, FPROF, TEST_STACK_PROF, ...)
++# and `-r test_prof`. See docs/TEST_PERFORMANCE.md for usage notes.
++require 'test_prof/recipes/rspec/before_all'
++require 'test_prof/recipes/rspec/let_it_be'
++
++TestProf::BeforeAll.configure do |config|
++  # `before_all`/`let_it_be` run in `before(:context)`, i.e. before per-example hooks
++  # from rails_helper.rb: apply the same environment settings (Sidekiq mode, ...) there.
++  config.before(:begin) do |context|
++    TestPerformance.apply(context.metadata)
++  end
++end

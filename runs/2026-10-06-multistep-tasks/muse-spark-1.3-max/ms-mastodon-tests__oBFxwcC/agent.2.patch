@@ -1,0 +1,337 @@
+diff --git a/docs/rspec-optimization.md b/docs/rspec-optimization.md
+index 92680ea..443a388 100644
+--- a/docs/rspec-optimization.md
++++ b/docs/rspec-optimization.md
+@@ -168,3 +168,228 @@ Spot-test with `allow(TriggerWebhookWorker).to receive(:perform_async)` for `typ
+ - `enable_logging: true` — opt out of AR log silencing if a future model spec needs to assert on SQL logs (none currently).
+ - Full `spec/models` is now ~58s (was 162s). Combined `models + requests` 2x speedup goal is well underway; requests phase should re-evaluate Sidekiq needs (requests likely need inline for more flows) and consider similar tagging rather than blanket fake.
+ 
++
++---
++
++## Requests phase (2026-10-06, before requests optimization)
++
++### Baseline for `spec/requests` (after models optimization, requests unaffected)
++
++- Total: `bundle exec rspec spec/requests --dry-run` → **1877 examples** (vs 1795 in models).
++- Models optimizations were scoped to `type: :model` only, so requests timing before requests work equals original baseline (before any optimization).
++- Full `spec/requests` not run (would timeout in this env, ~4-5 min estimated). Spot checks below are 2-run averages unless noted, same env as models baseline (Ruby 4.0.6, PG 17, Redis, `CI` unset locally so `eager_load false`).
++
++#### Per-file spot checks (baseline, no requests optimization)
++
++- `spec/requests/api/v1/accounts_spec.rb` (39 ex): **3.25s**
++- `spec/requests/api/v1/notifications_spec.rb` (22 ex): **7.90s** (heavy: `PostStatusService` + `FollowService` + `FavouriteService` in `before`, triggers Distribution/FanOut/Notify/Mailer inline)
++- `spec/requests/api/v1/statuses_spec.rb` (36 ex): **4.81s**
++- `spec/requests/api/v1/timelines/home_spec.rb` (6 ex): **1.96s**
++- `spec/requests/api/v1/favourites_spec.rb` (4 ex): **1.44s**
++- `spec/requests/api/v1/conversations_spec.rb` (4 ex): **2.11s**
++- `spec/requests/api/v1/blocks_spec.rb` (5 ex): **1.42s**
++- `spec/requests/admin/accounts_spec.rb` (15 ex): **1.57s**
++- `spec/requests/api/v1/media_spec.rb` (18 ex): **3.07s** (Paperclip/VIPS)
++- `spec/requests/api/v2/search_spec.rb` (15 ex): **1.97s**
++- `spec/requests/api/v1/timelines/list_spec.rb`: **1.35s**
++- `spec/requests/api/v1/follow_requests_spec.rb` (7 ex): **2.18s**
++
++12 files total baseline: **33.03s** (154 ex).
++
++#### Per-folder spot checks (baseline, single runs)
++
++- `spec/requests/api/v1/accounts` (53 ex): **5.60s**
++- `spec/requests/api/v1/timelines` (43 ex): **10.78s** (0.25s avg, heavy: follows + `PostStatusService` + reblogs)
++- `spec/requests/api/v1/statuses` (75 ex): **8.79s**
++- `spec/requests/admin` (91 ex): **5.96s**
++- `spec/requests/api/v2` (112 ex): **16.22s**
++- `spec/requests/activitypub` (108 ex): **28.00s** (0.26s avg, heavy: many Fabricates + signed requests)
++- `spec/requests/auth` (17 ex): **1.81s** (light)
++- `spec/requests/settings` (49 ex): **2.38s** (light, HTML)
++
++8 folders total baseline: **79.54s** (548 ex, 29% of requests). Weighted avg ~0.145s/ex. Extrapolated full requests baseline ~220-270s (4-4.5 min). Combined `models + requests` original baseline ~380-430s; after models opt (~58s) + before requests opt, combined ~280-330s.
++
++### Profiling method (requests)
++
++- Same `stackprof` wall mode as models, but with load-excluded helper to avoid Bootsnap/require noise:
++  ```ruby
++  require 'stackprof'
++  RSpec.configure do |c|
++    c.before(:suite) { StackProf.start(mode: :wall, interval: 1000) }
++    c.after(:suite) { StackProf.stop; File.open('/tmp/stackprof.dump','wb'){|f| f.write(Marshal.dump(StackProf.results)) } }
++  end
++  ```
++  Run via `bundle exec rspec <file> --require /tmp/stackprof_helper2.rb`, analyze with `StackProf::Report` sorted by `total_samples` and `samples` (self).
++- Important: `Chewy::Railtie::RequestStrategy#call`, `SignedRequestHelpers#post`, `OmniAuth::Builder#call` show high *total* (~18-37%) but negligible *self* — they are wrappers containing the request, not overhead. `Chewy::Strategy::Mastodon#leave` self is 1 sample (negligible) even though it does `RedisConnection.with + pipelined` per request; stash is empty when `Chewy.enabled? false`, but `leave` still runs — still negligible in profiles, not worth optimizing.
++- Targeted experiments via `--require` stubs to measure incremental gains (2-run averages):
++  - `allow(TriggerWebhookWorker).to receive(:perform_async)` for `type: :request`
++  - `ActiveRecord::Base.logger = nil` around `type: :request`
++  - `allow_any_instance_of(NotifyService).to receive(:send_email!)` then prepend module (lower overhead)
++  - Misc workers (`LinkCrawlWorker`, `PushUpdateWorker`, `DeliveryWorker`, `MergeWorker`, `FeedInsertWorker`) — negligible, not applied.
++  - AMS instrumentation disable, Devise mailer stub, Rails logger level — investigated, see below.
++
++### Key findings (requests, shared bottlenecks)
++
++#### 1. `TriggerWebhookWorker` inline execution (~8-12% wall, shared by all Fabricate-heavy specs)
++
++- Same mechanism as models: `Fabricate(:account)` → `Fabricate(:user)` → `User#trigger_webhooks` → `TriggerWebhookWorker.perform_async('account.created', ...)`; `Fabricate(:status)` → `'status.created'`. With `:inline`, each executes `WebhookService#call` → `serialize_event` → AMS + JSON.
++- StackProf (load-excluded):
++  - `accounts_spec`: `TriggerWebhookWorker#perform` 12.0% total, `WebhookService#call` 11.0%, AMS `instrument_rendering` 10.5%.
++  - `notifications_spec` (with load): webhook 11.0%, `WebhookService` 10.4%.
++  - `favourites_spec` (light): webhook 6.7%, AMS 6.4%.
++- Lower than models (23-33%) because requests also have Distribution/Notify/Mailer costs diluting the share, but still significant and shared (971 `Fabricate` calls in requests, 198 `account/user/status`).
++- Spot-test stub alone (2-run avg):
++  - accounts 3.25→2.75 (-11.8%), notifications 7.90→6.81 (-16.3% in early single-run; stable -15-16%), statuses 4.81→3.76? (combined, see below), home 1.96→1.68 (-12.9%).
++- Safety: No request spec asserts webhook delivery. `grep -rn TriggerWebhook|have_enqueued.*Webhook spec/requests` → only `admin/webhooks_spec.rb` (CRUD, not delivery). Specs asserting other workers (`BootstrapTimelineWorker`, `UpdateDistributionWorker`, `RemovalWorker`, `Fasp::*`, etc.) explicitly set `Sidekiq.testing!(:fake)` then `have_enqueued_sidekiq_job` — unaffected by webhook-only stub. `activitypub/inboxes_spec` stubs `FollowersSynchronizationWorker` locally with `allow(...).to receive` + `have_received` — compatible with global webhook stub (different worker).
++
++#### 2. `ActiveRecord` SQL logging (~7-9% wall, shared)
++
++- `ActiveRecord::LogSubscriber#sql` total 6.35% (load-excluded, accounts), `BroadcastLogger` total 19% (includes AR + Cache + ActionController + Chewy). `IO#write` self 1.79% (file writes to `log/test.log`).
++- Log size check for `accounts_spec` (39 ex): 1.6M, 7242 lines baseline (2491 SQL, 1065 Cache, 149 Started/Processing/Completed, 78 Chewy). With `AR.logger=nil`: 336K, 4228 lines, 33 SQL (load only), time 3.21→3.04 (-5% single run, -7-9% avg).
++- With `Rails.logger.level=FATAL` (silences all, same BroadcastLogger object): 8.9K, 42 lines, time 3.25→2.82 (-13% single run) vs AR-only 2.89 (-11%). Extra 2% from Cache/Chewy silencing is within variance and risks breaking future `Rails.logger` assertions. Models precedent leaves `Rails.logger` intact (for `remotable_spec`); requests has no `Rails.logger` assertions (`grep -rn Rails.logger spec/requests` → none), but keep same `AR.logger=nil` approach for consistency and safety.
++- Spot-test AR-nil alone:
++  - accounts 3.25→2.89 (-7.4%), notifications 7.90→7.44 (-8.6%), statuses 4.81→4.27 (-9.5%), home 1.96→1.76 (-8.8%).
++- Combined webhook+AR (2-run avg): accounts 2.74 (-15.7%), notifications 6.31 (-20.1%), statuses 3.76 (-21.8%), home 1.70 (-13.3%). Total 17.92→14.51s (-19%) for 4 files. Need ~10% more for 30%.
++
++#### 3. `NotifyService#send_email!` via `deliver_later` inline (~13-19% in notification-heavy specs, zero in others, but safe globally)
++
++- Chain: `PostStatusService`/`FollowService`/`ReblogService`/`FavouriteService` in `before` blocks → `DistributionWorker` inline → `FanOutOnWriteService` → `LocalNotificationWorker` inline → `NotifyService#call` → `send_email!` → `NotificationMailer.with(...).type.deliver_later(wait: 2.minutes)` → Sidekiq inline ignores `wait`/`at` (see `Sidekiq::TestingClient#atomic_push` → `process_job` without `at` check) → `MailDeliveryJob#perform` → `deliver_now` → Premailer + rendering + `mail.deliver`.
++- StackProf `notifications_spec`: `LocalNotificationWorker#perform` 22.4%, `NotifyService#call` 21.5%, `DistributionWorker#perform` 17.6%, `FanOutOnWriteService#call` 17.2%, `NotifyService#send_email!` 13.6%, `ActionMailer::MessageDelivery#deliver_later` 13.6%, `MailDeliveryJob#perform` 13.0%, `deliver_now` 13.0%.
++- Only 8 files use `PostStatusService`/`FollowService` directly (`notifications_spec` v1+v2, `conversations_spec`, `follow_requests_spec`, `timelines/home|list|tag_spec`, `statuses/favourites|reblogs_spec`), but those are among the heaviest (notifications 7.9s, timelines 10.78s for 43 ex, etc.). Stubbing email globally helps heavy files a lot without hurting light files (no-op when no notifications).
++- Spot-test `allow_any_instance_of(NotifyService).to receive(:send_email!)` alone:
++  - notifications 7.90→6.38 (-19.2%), accounts 3.25→3.11 (-4.3%), home 1.96→2.06 (+5% overhead, within variance, due to `allow_any_instance` cost when no emails).
++- Combined webhook+AR+email (prepend, no RSpec mock overhead): notifications 7.90→4.79 (-39.4%), accounts 3.25→2.60 (-20%), conversations 2.11→1.59 (-24.6%), follow_requests 2.18→1.42 (-34.9%), statuses 4.81→3.69 (-23.3%). 12 files total 33.03→24.16s (-26.9%).
++- Safety: No request spec asserts `NotificationMailer`. `grep -rn NotificationMailer spec/requests` → none. `capture_emails` in requests only for `AdminMailer` (account_actions, reports) and empty-check (admin confirmations) — different code paths (`Admin::AccountAction`, `ReportService`, not `NotifyService`). Service specs (`notify_service_spec`) test `NotifyService` directly with `capture_emails` — our stub checks `metadata[:type]==:request`, so service specs (type `:service`) still call `super` and pass (verified: 61 ex, 0 failures).
++- Implementation choice: prepend module with `RSpec.current_example` metadata check, not `allow_any_instance_of`, to avoid per-test mock overhead for files with no emails. Prepend once in `before(:suite)`; check is cheap (thread-local + hash lookup) vs mailer cost (rendering + Sidekiq + file I/O).
++
++#### 4. Minor / shared but small
++
++- `redis.del(redis.keys)` + `Rails.cache.clear` after each: <1ms per test as in models. `flushdb` equivalent on dedicated test DB (DB 1), faster/atomic. Extended to requests for consistency.
++- `Sidekiq::Worker.clear_all` after each request: prevents fake-queue pollution between tests that explicitly use `:fake` (e.g., `interaction_policies_spec` with `to_not have_enqueued`, `confirmations_spec` with `to_not`). Clearing after inline tests is no-op. Negligible cost, safety win.
++- `Faker` 4-7% total (e.g., `favourites_spec` 7.4%), `I18n` similar — factory behavior, deferred to factories phase per instructions.
++- `BCrypt` 1.95% self (accounts) — already minimal (`stretches 1` in test), not worth touching.
++- `PG exec` 12.4% self (accounts) — necessary DB work.
++- `GC marking` 11% self — reduced indirectly by webhook/email stubs (fewer AMS objects, fewer mail objects).
++
++### Investigated but NOT applied (low value / risky / out of scope)
++
++- `LinkCrawlWorker` + `PushUpdateWorker` + `ActivityPub::DeliveryWorker` stub: negligible (notifications 7.90→7.98, accounts 3.25→3.14, statuses 4.81→4.87). `LinkCrawlWorker#perform` 0.2% in notifications (no URLs in `Lorem ipsum` statuses). `ActivityPub::DistributionWorker` 2.5% (local-only, no remote followers). `PushUpdateWorker` (streaming, excluded) negligible. Skipped.
++- `MergeWorker` + `FeedInsertWorker` stub: no gain (notifications 7.86 vs 7.90). Timelines still pass with `FeedInsert` stubbed (fallback to DB? `HomeFeed`?), but no time saved (few followers → few inserts). Skipped to avoid risk for timelines that might need feeds.
++- `User#send_devise_notification` (Devise confirmation emails via `AppSignUpService`): 5.4% in `accounts_spec` (`Devise::Confirmable#send_confirmation_instructions` → `User#send_devise_notification` → `render_and_send_devise_message` → `deliver_later` inline). Spot-test with prepend + AMS disable gave accounts 3.25→2.37 (-27% vs -20% without), but average across 12 files worsened slightly (24.16→25.22s, +4% variance/overhead). Only `POST /api/v1/accounts` specs trigger it (few files). Skipped to minimize risk (admin confirmations resend uses same path; though current test only checks empty case, future success-case tests would need tag).
++- `ActiveModelSerializers` instrumentation disable (`notify_render` + `tag_logger` → `yield`): `AMS::Logging` already unsubscribed (`config/initializers/active_model_serializers.rb` unsubscribes `RENDER_EVENT`), but `instrument` + `tagged` wrappers still cost ~10% total (accounts) / 13.9% (notifications) for every serialization (webhook + API responses). Spot-test disable alone: accounts 3.25→3.11 (-4.3%), notifications 7.90→8.14 (+3% variance). Requires monkey-patching gem (`module_eval`), global effect, small average gain. Skipped; webhook stub already removes webhook serializations, API response serializations are necessary and their `instrument` overhead is smaller than file I/O.
++- `Rails.logger.level=FATAL` for all (vs `AR.logger=nil`): silences Cache (1553 lines for accounts) + Chewy + ActionController in addition to SQL, log 1.6M→8.9K (-99%), but time 2.89→2.82 (-2% extra, within variance). Cache log file writes are cheap vs SQL. Kept `AR.logger=nil` only for consistency with models and to leave `Rails.logger` intact for any future assertions.
++- `Chewy.request_strategy=:bypass` for tests: `Mastodon#leave` self 1 sample (negligible) even though it does Redis `pipelined` per request when disabled. `Chewy.strategy` 21-37% total is wrapper, not overhead. Skipped.
++- `Rack::Attack` disable: in test, cache is `:memory_store` (not Redis), `IpBlock.blocked?` uses `Rails.cache.fetch` (DB once, then memory). Per-request overhead small. Skipped.
++- `Paperclip` stub for requests: only 10 files use `media_attachment`; those that do need real processing (`media_spec` asserts `have_attached_file`, `statuses_spec` DELETE asserts `url: %r{/system/media_attachments/files/}`, `credentials_spec` asserts `avatar: exist`). Previous models finding (2%, no gain for non-media) applies. Skipped.
++- Global `Sidekiq.testing!(:fake)` for requests (like models): would save Distribution/FanOut (17% in notifications) but break setup that needs inline side effects (`notifications_spec` needs `LocalNotificationWorker` inline to create `Notification` rows for `GET` to return; `timelines/home_spec` needs `Distribution` inline for feeds). Would require tagging 8+ files with `sidekiq_inline` and careful per-example analysis. Instead, kept `:inline` for requests and stubbed only unneeded side effects (webhooks, Notify emails). More minimal and safe.
++- `Faker`, `Bookmark`/`login_activity` cascades, `keypairs`: factory behavior, explicitly out of scope (“do not touch factories yet”). Webhook stub already mitigates cascade’s webhook part. Revisit in factories phase.
++
++### Plan for requests phase (no factory edits, no app code, minimal per-example changes)
++
++1. Change `spec/rails_helper.rb` only (config-level, scoped to `type: :request`):
++   - Stub `TriggerWebhookWorker.perform_async` for requests unless `sidekiq_inline: true` (same pattern as models).
++   - Clear `Sidekiq::Worker` jobs after each request test.
++   - Silence `ActiveRecord::Base.logger` (nil during example, restore after) for requests unless `enable_logging: true`.
++   - Skip `NotifyService#send_email!` for requests via `prepend` module checking `RSpec.current_example.metadata` unless `need_notification_email: true`.
++   - Use `redis.flushdb` for requests (extend models optimization).
++2. No tags added to individual request specs (none needed: no webhook assertions, no Notify email assertions, no SQL log assertions). Tags available for future: `sidekiq_inline`, `enable_logging`, `need_notification_email`.
++3. Verify: run representative request files + folders (single-folder runs only, per instructions) + critical Sidekiq/email specs + models spot checks + service specs; ensure 0 failures and ≥30% speedup on requests sample.
++
++## Optimization applied (requests phase, 2026-10-06)
++
++### Changes (1 file, no factories, no app code, no other spec types)
++
++**`spec/rails_helper.rb`** only:
++
++1. `RequestNotifyEmailStub` module + `before(:suite)` prepend:
++   ```ruby
++   module RequestNotifyEmailStub
++     def send_email!
++       example = RSpec.current_example rescue nil
++       return true if example && example.metadata[:type] == :request && !example.metadata[:need_notification_email]
++       super
++     end
++   end
++   config.before(:suite) { NotifyService.prepend(RequestNotifyEmailStub) }
++   ```
++   Zero RSpec mock overhead, scoped via metadata, opt-out via `need_notification_email: true`.
++
++2. Webhook stub for requests (same as models):
++   ```ruby
++   config.before(:each, type: :request) do |example|
++     allow(TriggerWebhookWorker).to receive(:perform_async) unless example.metadata[:sidekiq_inline]
++   end
++   config.after(:each, type: :request) { Sidekiq::Worker.clear_all }
++   ```
++
++3. AR log silencing for requests (same as models):
++   ```ruby
++   config.around(:each, type: :request) do |example|
++     if example.metadata[:enable_logging]
++       example.run
++     else
++       orig = ActiveRecord::Base.logger; ActiveRecord::Base.logger = nil
++       begin; example.run; ensure; ActiveRecord::Base.logger = orig; end
++     end
++   end
++   ```
++
++4. `flushdb` extended to requests:
++   ```ruby
++   if [:model, :request].include?(example.metadata[:type])
++     redis.flushdb
++   else
++     redis.del(redis.keys)
++   end
++   ```
++
++### Why this is safe
++
++- Webhooks: no request spec asserts `TriggerWebhookWorker` via `have_enqueued` or `have_received` (only `admin/webhooks_spec` CRUD). Specs asserting other workers set `:fake` explicitly — unaffected. `inboxes_spec` local stub for `FollowersSynchronizationWorker` is different worker, compatible.
++- Notify emails: no request spec asserts `NotificationMailer` (`grep` none). `capture_emails` in requests only for `AdminMailer` (account_actions, reports) and empty-check (admin confirmations) — different paths, still pass (verified 0 failures). Service specs for `NotifyService` (type `:service`) still call `super` and pass (61 ex, 0 failures).
++- AR logging: no request spec asserts on SQL logs (`grep` none). `Rails.logger` left intact (same as models).
++- `flushdb` vs `del(keys)`: same effect on isolated test DB (DB 1, `redis.flushdb` in `after` + `Rails.cache.clear`). Other types (system, etc.) keep `del(keys)`.
++- `clear_all` after requests: no-op for inline tests, prevents fake-queue pollution for `:fake` tests (e.g., `to_not have_enqueued`).
++- Other spec types (`type != :request`, except models already optimized) keep exact previous behavior (`:inline`, `del(keys)`, logging, real Notify emails).
++
++### Results (after, with `rails_helper` changes, no `--require`)
++
++Per-file (2-run avg or single runs, all 0 failures):
++
++- `accounts_spec` (39 ex): 3.25→**2.45s** (-24.6%)
++- `notifications_spec` (22 ex): 7.90→**4.68s** (-40.7%)
++- `statuses_spec` (36 ex): 4.81→**3.47s** (-27.8%)
++- `home_spec` (6 ex): 1.96→**1.72s** (-12.2%)
++- `conversations_spec` (4 ex): 2.11→**1.33s** (-37%)
++- `follow_requests_spec` (7 ex): 2.18→**1.15s** (-47%)
++- `media_spec` (18 ex): 3.07→**2.67s** (-13%)
++- `admin/accounts_spec` (15 ex): 1.57→**1.16s** (-26%)
++- Email-critical: `admin/confirmations_spec` (3 ex) 0.98s, `reports_spec` (8 ex) 1.36s, `account_actions_spec` (24 ex) 2.46s — all 0 failures.
++- Sidekiq-critical: `credentials_spec` (7 ex) 1.32s, `profiles_spec` (8 ex) 2.63s, `interaction_policies_spec` (6 ex) 1.09s, `pins_spec` (11 ex) 1.31s, `search_spec` v2 (15 ex) 1.34s, `suggestions_spec` (2 ex) 0.90s, `auth/confirmations_spec` (6 ex) 1.37s, `inboxes_spec` (14 ex) 1.07s, `webhooks_spec` (1 ex) 0.76s — all 0 failures.
++- Models spot checks still fast: `account_spec` 2.91s, `status_spec` 4.70s, `user_spec` 2.32s, `notification_spec` 2.93s — all 0 failures (no regression).
++- Services still pass: `notify_service_spec` 6.73s (61 ex), `post_status_service_spec` 4.25s (33 ex) — 0 failures (Notify stub correctly scoped).
++
++Per-folder (single runs, all 0 failures):
++
++- `api/v1/accounts` (53 ex): 5.60→**4.41s** (-21.2%)
++- `api/v1/timelines` (43 ex): 10.78→**7.62s** (-29.3%)
++- `api/v1/statuses` (75 ex): 8.79→**5.56s** (-36.7%)
++- `admin` (91 ex): 5.96→**4.54s** (-23.8%)
++- `api/v2` (112 ex): 16.22→**10.56s** (-34.9%)
++- `activitypub` (108 ex): 28.00→**15.87s** (-43.3%)
++- `auth` (17 ex): 1.81→**1.57s** (-13.2%)
++- `settings` (49 ex): 2.38→**1.96s** (-17.6%)
++
++8 folders total (548 ex, 29% of requests): **79.54→52.09s (with rails_helper, -34.5% time, 1.53x speedup)**. Earlier `--require` sample gave 79.54→51.58s (-35.1%). Both exceed **>30% target** (target was -30-35% vs baseline before any optimization; requests baseline unchanged by models work, so current baseline equals original).
++
++12 single files total: 33.03→~23-24s (-27-30%, lighter files dilute average, but weighted by time heavy files dominate).
++
++Full `spec/requests` estimated: baseline ~220-270s → optimized ~140-180s (-35%). Combined `models + requests` estimated: original ~380-430s → after both phases ~200-240s (~1.8-1.9x). Factories phase (Bookmark/login_activity/Faker) should push combined over 2x.
++
++### Tags for future runs (requests + models)
++
++- `sidekiq_inline: true` — opt into real Sidekiq inline + real webhooks for models *and* requests. Currently used in 3 model email specs; no request spec needs it yet (all request webhook/email assertions use different paths). Use if a future request spec needs to assert webhook delivery or relies on webhook side effects.
++- `enable_logging: true` — opt out of AR log silencing for models *and* requests (none currently need it).
++- `need_notification_email: true` — (new, requests only) opt into real `NotifyService#send_email!` (NotificationMailer via `deliver_later` inline). No current request spec needs it (only AdminMailer asserted). Use if a future request spec captures NotificationMailer emails.
++- Full `spec/requests` sample is now ~35% faster (79.5→52s for 29% sample). Combined `models (58s) + requests (~150s est)` well underway to 2x; factories phase should address `status→bookmark`, `user→2x login_activity`, `Faker`, and re-evaluate `Paperclip` for media-heavy requests.
++
+diff --git a/spec/rails_helper.rb b/spec/rails_helper.rb
+index 4eaf1f1..63247d9 100644
+--- a/spec/rails_helper.rb
++++ b/spec/rails_helper.rb
+@@ -46,6 +46,29 @@ Devise::Test::ControllerHelpers.module_eval do
+   end
+ end
+ 
++# Optimization for `spec/requests`: skip NotificationMailer emails triggered via
++# `NotifyService#send_email!` (ActionMailer + Sidekiq inline + Premailer, ~13-19%
++# of wall time in notification-heavy request specs). No request spec asserts
++# NotificationMailer deliveries (only AdminMailer via `capture_emails` in 3 files,
++# which use different code paths), so this is safe. Opt out with
++# `need_notification_email: true` tag.
++module RequestNotifyEmailStub
++  def send_email!
++    example = nil
++    begin
++      example = RSpec.current_example
++    rescue StandardError
++      example = nil
++    end
++
++    if example && example.metadata[:type] == :request && !example.metadata[:need_notification_email]
++      return true
++    end
++
++    super
++  end
++end
++
+ RSpec.configure do |config|
+   # By default, skip specs that need full JS browser
+   config.filter_run_excluding :js
+@@ -56,6 +79,11 @@ RSpec.configure do |config|
+   # By default, skip specs that need the streaming server
+   config.filter_run_excluding :streaming
+ 
++  # Prepend NotifyService email stub once (scoped to type: :request via metadata check)
++  config.before(:suite) do
++    NotifyService.prepend(RequestNotifyEmailStub)
++  end
++
+   config.fixture_paths = [
+     Rails.root.join('spec', 'fixtures'),
+   ]
+@@ -131,6 +159,20 @@ RSpec.configure do |config|
+     Sidekiq::Worker.clear_all
+   end
+ 
++  # Optimization for `spec/requests`: stub webhook delivery (same rationale as
++  # models, ~8-12% of wall time in request specs via Fabricate cascades).
++  # No request spec asserts webhook delivery (`admin/webhooks_spec` only tests
++  # CRUD, not delivery). Opt into real delivery with `sidekiq_inline: true`.
++  config.before(:each, type: :request) do |example|
++    unless example.metadata[:sidekiq_inline]
++      allow(TriggerWebhookWorker).to receive(:perform_async)
++    end
++  end
++
++  config.after(:each, type: :request) do
++    Sidekiq::Worker.clear_all
++  end
++
+   # Silence ActiveRecord SQL logging for model specs (~7% wall time saved
+   # by avoiding `log/test.log` writes). Opt out with `enable_logging: true`.
+   # Only touches `ActiveRecord::Base.logger`, leaves `Rails.logger` intact
+@@ -149,6 +191,23 @@ RSpec.configure do |config|
+     end
+   end
+ 
++  # Silence ActiveRecord SQL logging for request specs (same rationale as
++  # models, ~7-9% wall time saved). No request spec asserts on SQL logs.
++  # Opt out with `enable_logging: true`.
++  config.around(:each, type: :request) do |example|
++    if example.metadata[:enable_logging]
++      example.run
++    else
++      original_ar_logger = ActiveRecord::Base.logger
++      ActiveRecord::Base.logger = nil
++      begin
++        example.run
++      ensure
++        ActiveRecord::Base.logger = original_ar_logger
++      end
++    end
++  end
++
+   config.before :each, type: :cli do
+     stub_reset_connection_pools
+   end
+@@ -170,9 +229,10 @@ RSpec.configure do |config|
+ 
+   config.after do |example|
+     Rails.cache.clear
+-    if example.metadata[:type] == :model
++    if [:model, :request].include?(example.metadata[:type])
+       # `flushdb` is equivalent to `del(keys)` on dedicated test DB but
+-      # faster and atomic. Scoped to models to avoid touching other types.
++      # faster and atomic. Scoped to models and requests to avoid touching
++      # other types (e.g., system specs).
+       redis.flushdb
+     else
+       redis.del(redis.keys)

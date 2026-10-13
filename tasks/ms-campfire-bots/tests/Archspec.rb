@@ -1,0 +1,1 @@
+architecture :vanilla_rails

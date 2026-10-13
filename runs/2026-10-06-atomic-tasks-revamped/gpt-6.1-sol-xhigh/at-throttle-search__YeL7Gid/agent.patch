@@ -1,0 +1,293 @@
+diff --git a/app/controllers/books/searches_controller.rb b/app/controllers/books/searches_controller.rb
+index 5268c55..344561f 100644
+--- a/app/controllers/books/searches_controller.rb
++++ b/app/controllers/books/searches_controller.rb
+@@ -1,9 +1,17 @@
+ class Books::SearchesController < ApplicationController
+   allow_unauthenticated_access
+ 
++  class_attribute :search_rate_limiter, default: BookSearchRateLimiter.new
++  before_action :limit_search_requests, only: :create
++
+   include BookScoped
+ 
+   def create
+     @leaves = @book.leaves.active.search(params[:search]).favoring_title.limit(50)
+   end
++
++  private
++    def limit_search_requests
++      head :too_many_requests unless search_rate_limiter.allow?(request.remote_ip)
++    end
+ end
+diff --git a/app/models/book_search_rate_limiter.rb b/app/models/book_search_rate_limiter.rb
+new file mode 100644
+index 0000000..3ea0e6b
+--- /dev/null
++++ b/app/models/book_search_rate_limiter.rb
+@@ -0,0 +1,63 @@
++# Limits admitted searches in a rolling minute, across all books for an address.
++class BookSearchRateLimiter
++  LIMIT = 30
++  WINDOW = 1.minute
++
++  # Pruning, checking and recording must be atomic across web workers. Only
++  # admitted requests are recorded, so retries cannot extend a refusal forever.
++  REDIS_SCRIPT = <<~LUA.freeze
++    local key = KEYS[1]
++    local now = tonumber(ARGV[1])
++    local window = tonumber(ARGV[2])
++    local limit = tonumber(ARGV[3])
++
++    redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)
++    if redis.call('ZCARD', key) >= limit then
++      return 0
++    end
++
++    redis.call('ZADD', key, now, ARGV[4])
++    redis.call('PEXPIRE', key, window * 1000)
++    return 1
++  LUA
++  private_constant :REDIS_SCRIPT
++
++  def initialize(store: Rails.cache)
++    @redis = store.redis if store.is_a?(ActiveSupport::Cache::RedisCacheStore)
++    # NullStore is used in development and tests, but must not disable the limit.
++    @memory_store = store.is_a?(ActiveSupport::Cache::MemoryStore) ? store : ActiveSupport::Cache::MemoryStore.new
++  end
++
++  def allow?(address)
++    key = "writebook:rate-limit:book-search:#{address}"
++    now = Time.current.to_f
++
++    if @redis
++      allow_with_redis?(key, now)
++    else
++      allow_with_memory?(key, now)
++    end
++  end
++
++  private
++    def allow_with_redis?(key, now)
++      @redis.then do |redis|
++        redis.eval(REDIS_SCRIPT, keys: [ key ], argv: [ now, WINDOW.to_i, LIMIT, SecureRandom.uuid ]) == 1
++      end
++    rescue Redis::BaseError, ConnectionPool::Error => error
++      Rails.error.report(error, handled: true, severity: :warning)
++      # Keep searches available, with a per-worker limit, during a Redis outage.
++      allow_with_memory?(key, now)
++    end
++
++    def allow_with_memory?(key, now)
++      @memory_store.synchronize do
++        requests = @memory_store.read(key) || []
++        requests.reject! { |timestamp| timestamp <= now - WINDOW }
++        return false if requests.size >= LIMIT
++
++        @memory_store.write(key, requests << now, expires_in: WINDOW)
++        true
++      end
++    end
++end
+diff --git a/test/controllers/books/search_rate_limit_test.rb b/test/controllers/books/search_rate_limit_test.rb
+new file mode 100644
+index 0000000..a5ecf49
+--- /dev/null
++++ b/test/controllers/books/search_rate_limit_test.rb
+@@ -0,0 +1,129 @@
++require "test_helper"
++require "active_record/testing/query_assertions"
++
++class Books::SearchRateLimitTest < ActionDispatch::IntegrationTest
++  include ActiveRecord::Assertions::QueryAssertions
++
++  setup do
++    @previous_limiter = Books::SearchesController.search_rate_limiter
++    Books::SearchesController.search_rate_limiter = BookSearchRateLimiter.new(store: ActiveSupport::Cache::MemoryStore.new)
++    books(:handbook).update!(published: true)
++    books(:manual).update!(published: true)
++    Leaf.reindex_all
++  end
++
++  teardown do
++    Books::SearchesController.search_rate_limiter = @previous_limiter
++  end
++
++  test "thirty anonymous searches succeed and further searches are refused without querying" do
++    freeze_time do
++      30.times do
++        search_from "192.0.2.10"
++        assert_response :success
++        assert_in_body "<mark>Thanks</mark> for reading!"
++      end
++
++      2.times do
++        assert_no_queries_match(/leaf_search_index/) do
++          search_from "192.0.2.10"
++        end
++        assert_response :too_many_requests
++        assert_empty response.body
++        assert_nil response.headers["Location"]
++      end
++    end
++  end
++
++  test "the address limit is shared across books and queries" do
++    freeze_time do
++      30.times do |index|
++        search_from "192.0.2.10", book: books(index.even? ? :handbook : :manual), query: "search #{index}"
++        assert_response :success
++      end
++
++      search_from "192.0.2.10", book: books(:manual), query: "different"
++      assert_response :too_many_requests
++      search_from "192.0.2.10"
++      assert_response :too_many_requests
++    end
++  end
++
++  test "a refused address does not affect another anonymous reader or page access" do
++    freeze_time do
++      31.times { search_from "192.0.2.10" }
++      assert_response :too_many_requests
++
++      search_from "192.0.2.11"
++      assert_response :success
++      assert_in_body "<mark>Thanks</mark> for reading!"
++
++      get book_slug_path(books(:handbook)), env: { "REMOTE_ADDR" => "192.0.2.10" }
++      assert_response :success
++      get leafable_slug_path(leaves(:welcome_page)), env: { "REMOTE_ADDR" => "192.0.2.10" }
++      assert_response :success
++
++      search_from "192.0.2.10"
++      assert_response :too_many_requests
++    end
++  end
++
++  test "the limit recovers by itself after a burst stops" do
++    freeze_time do
++      31.times { search_from "192.0.2.10" }
++      assert_response :too_many_requests
++
++      travel 59.seconds
++      search_from "192.0.2.10"
++      assert_response :too_many_requests
++
++      travel 1.second
++      search_from "192.0.2.10"
++      assert_response :success
++      assert_in_body "<mark>Thanks</mark> for reading!"
++    end
++  end
++
++  test "a rolling minute cannot be bypassed at the first request's expiry" do
++    freeze_time do
++      search_from "192.0.2.10"
++      assert_response :success
++
++      travel 59.seconds
++      29.times do
++        search_from "192.0.2.10"
++        assert_response :success
++      end
++      search_from "192.0.2.10"
++      assert_response :too_many_requests
++
++      travel 1.second
++      search_from "192.0.2.10"
++      assert_response :success
++      search_from "192.0.2.10"
++      assert_response :too_many_requests
++
++      travel 59.seconds
++      search_from "192.0.2.10"
++      assert_response :success
++    end
++  end
++
++  test "searches remain rate limited when the general cache is disabled" do
++    Books::SearchesController.search_rate_limiter = BookSearchRateLimiter.new(store: ActiveSupport::Cache::NullStore.new)
++
++    freeze_time do
++      30.times do
++        search_from "192.0.2.10"
++        assert_response :success
++      end
++      search_from "192.0.2.10"
++      assert_response :too_many_requests
++    end
++  end
++
++  private
++    def search_from(address, book: books(:handbook), query: "Thanks")
++      post book_search_path(book), params: { search: query }, env: { "REMOTE_ADDR" => address }
++    end
++end
+diff --git a/test/models/book_search_rate_limiter_test.rb b/test/models/book_search_rate_limiter_test.rb
+new file mode 100644
+index 0000000..a2907c8
+--- /dev/null
++++ b/test/models/book_search_rate_limiter_test.rb
+@@ -0,0 +1,61 @@
++require "test_helper"
++
++class BookSearchRateLimiterTest < ActiveSupport::TestCase
++  test "concurrent requests cannot exceed the allowance" do
++    limiter = BookSearchRateLimiter.new(store: ActiveSupport::Cache::MemoryStore.new)
++
++    freeze_time do
++      requests = 100.times.map { Thread.new { limiter.allow?("192.0.2.10") } }
++      assert_equal 30, requests.count(&:value)
++    end
++  end
++
++  test "idle address state expires without manual cleanup" do
++    store = ActiveSupport::Cache::MemoryStore.new
++    limiter = BookSearchRateLimiter.new(store: store)
++
++    freeze_time do
++      assert limiter.allow?("192.0.2.10")
++      assert_equal [ Time.current.to_f ], store.read("writebook:rate-limit:book-search:192.0.2.10")
++
++      travel 1.minute
++      assert_nil store.read("writebook:rate-limit:book-search:192.0.2.10")
++      assert limiter.allow?("192.0.2.10")
++    end
++  end
++
++  test "Redis decisions are honored through the cache connection pool" do
++    redis = Struct.new(:calls).new([])
++    def redis.eval(_script, keys:, argv:)
++      calls << [ keys, argv ]
++      calls.size == 1 ? 1 : 0
++    end
++    store = ActiveSupport::Cache::RedisCacheStore.new(redis: redis)
++    limiter = BookSearchRateLimiter.new(store: store)
++
++    freeze_time do
++      assert limiter.allow?("192.0.2.10")
++      assert_not limiter.allow?("192.0.2.10")
++      assert_equal [ "writebook:rate-limit:book-search:192.0.2.10" ], redis.calls.first.first
++      assert_equal [ Time.current.to_f, 60, 30 ], redis.calls.first.last.first(3)
++      assert_not_equal redis.calls.first.last.last, redis.calls.last.last.last
++    end
++  end
++
++  test "a Redis outage still refuses excess requests rather than raising errors" do
++    unavailable_redis = Object.new
++    def unavailable_redis.eval(*)
++      raise Redis::CannotConnectError, "unavailable"
++    end
++    store = ActiveSupport::Cache::RedisCacheStore.new(redis: unavailable_redis, pool: false)
++    limiter = BookSearchRateLimiter.new(store: store)
++
++    freeze_time do
++      30.times { assert limiter.allow?("192.0.2.10") }
++      assert_not limiter.allow?("192.0.2.10")
++      assert limiter.allow?("192.0.2.11")
++      travel 1.minute
++      assert limiter.allow?("192.0.2.10")
++    end
++  end
++end

@@ -1,0 +1,1301 @@
+diff --git a/.dockerignore b/.dockerignore
+index 0096a00..6e19dc1 100644
+--- a/.dockerignore
++++ b/.dockerignore
+@@ -27,6 +27,7 @@ coverage
+ 
+ # Ignore public uploads
+ /public/uploads/*
++/storage/*
+ /public/c/*
+ /public/i/*
+ /public/assets/*
+diff --git a/.gitignore b/.gitignore
+index 15d09eb..6470949 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -22,6 +22,10 @@ coverage
+ 
+ # Ignore public uploads
+ /public/uploads/*
++
++# Ignore Active Storage files (development / test)
++/storage/*
++/tmp/storage/*
+ /public/c/*
+ /public/i/*
+ /public/assets/*
+diff --git a/app/models/concerns/profile_image_attachable.rb b/app/models/concerns/profile_image_attachable.rb
+new file mode 100644
+index 0000000..c6cd89a
+--- /dev/null
++++ b/app/models/concerns/profile_image_attachable.rb
+@@ -0,0 +1,303 @@
++# Moves a model's profile image from CarrierWave to Active Storage, one deploy at a time.
++#
++# The model keeps its CarrierWave mount (`mount_uploader :profile_image, ProfileImageUploader`), and
++# this concern layers an Active Storage attachment (+avatar+) on top of it:
++#
++# - Writing: every *new* image (a file given to +profile_image=+, or a URL given to
++#   +remote_profile_image_url=+) is validated and processed by the very same ProfileImageUploader
++#   (extension allowlist, size range, image bomb and frame count checks, EXIF stripping), and the
++#   result is stored with Active Storage instead of CarrierWave. Validation errors are reported
++#   exactly as before (they are CarrierWave integrity/processing/download errors).
++#
++# - Reading: +profile_image+, +profile_image_url+ and +profile_image?+ return the Active Storage
++#   image when there is one, and fall back to the CarrierWave image otherwise. Existing CarrierWave
++#   images are not moved, copied or deleted.
++#
++# Rolling deploys / rollbacks: storing a new image never touches the CarrierWave column nor the
++# CarrierWave file. Servers still running the previous release (or a rolled back release) keep
++# rendering the previous CarrierWave image, and every URL handed out so far (cached HTML, articles'
++# cached user/organization, search indexes, emails, ...) keeps working.
++#
++# Anything that isn't a file (nil, blank, strings) is still handed to CarrierWave, as before. When
++# CarrierWave ends up without an image (that's how it treats e.g. `profile_image = nil`), the Active
++# Storage image is removed as well, so both behave the same.
++module ProfileImageAttachable
++  extend ActiveSupport::Concern
++
++  ATTACHMENT_NAME = :avatar
++
++  # Stands in for the CarrierWave uploader returned by +profile_image+ when the image is stored with
++  # Active Storage, so that callers such as `profile_image.url`, `"#{profile_image}"`,
++  # `profile_image.present?` and JSON serialization keep working the same way.
++  class StoredImage
++    attr_reader :blob
++
++    # @param blob [ActiveStorage::Blob]
++    # @param pending_url [String, nil] URL of the processed file while the blob isn't saved yet
++    def initialize(blob, pending_url: nil)
++      @blob = blob
++      @pending_url = pending_url
++    end
++
++    def url(*)
++      return @pending_url unless blob.persisted?
++
++      @url ||= ProfileImageAttachable.url_for(blob)
++    end
++
++    def to_s
++      url || ""
++    end
++
++    # There is an image as soon as a file has been attached, even if it isn't saved yet
++    # (this is what presence validations look at, like with CarrierWave's cached files).
++    delegate :blank?, :present?, :content_type, to: :blob
++
++    # Local path of the file, when it is stored on disk (like CarrierWave's file storage)
++    def path
++      return unless blob.persisted? && blob.service.is_a?(ActiveStorage::Service::DiskService)
++
++      blob.service.path_for(blob.key)
++    end
++
++    def file
++      (local_path = path) ? CarrierWave::SanitizedFile.new(local_path) : blob
++    end
++
++    def read
++      blob.download
++    end
++
++    def size
++      blob.byte_size
++    end
++
++    def identifier
++      blob.filename.to_s
++    end
++    alias filename identifier
++
++    def serializable_hash(_options = nil)
++      { "url" => url }
++    end
++
++    def as_json(options = nil)
++      serializable_hash(options)
++    end
++
++    def to_json(*args)
++      as_json.to_json(*args)
++    end
++  end
++
++  # The URL of a profile image stored with Active Storage. It never expires: it gets cached in
++  # articles, edge caches, search indexes, emails, etc.
++  def self.url_for(blob)
++    return if blob.blank? || !blob.persisted?
++
++    if (permanent_url = blob.service.try(:permanent_url, blob.key))
++      # Same treatment as CarrierWave's fog URLs (see config/initializers/carrierwave_monkeypatch.rb)
++      app_domain = ApplicationConfig["APP_DOMAIN"]
++      return app_domain.present? ? permanent_url.gsub(app_domain, Settings::General.app_domain) : permanent_url
++    end
++
++    # Served (and cached forever) by the app; the signed id doesn't expire.
++    path = Rails.application.routes.url_helpers.rails_service_blob_proxy_path(blob.signed_id, blob.filename)
++    # Like CarrierWave's local storage: absolute in production, relative elsewhere.
++    Rails.env.production? ? URL.url(path) : path
++  end
++
++  # Things that can be stored as a new profile image; anything else (strings, nil, ...) is
++  # handled by CarrierWave as it always was.
++  def self.uploadable?(value)
++    return false if value.blank? || value.is_a?(String)
++
++    value.respond_to?(:read) || value.respond_to?(:tempfile) || value.respond_to?(:path)
++  end
++
++  included do
++    has_one_attached ATTACHMENT_NAME
++
++    # Prepended: it must run before any other after_save callback looking at saved changes.
++    after_save :track_saved_profile_image_attachment, prepend: true
++    after_commit :discard_pending_profile_image_upload
++    after_rollback :discard_pending_profile_image_upload
++
++    # Prepended so these win over the methods CarrierWave's mount_uploader defines, whatever the
++    # order of `include` and `mount_uploader` in the model.
++    prepend Overrides
++  end
++
++  module Overrides
++    def profile_image
++      stored_profile_image || super
++    end
++
++    def profile_image_url(*args)
++      stored_profile_image&.url || super
++    end
++
++    def profile_image?
++      stored_profile_image.present? || super
++    end
++
++    # New files go to Active Storage. Everything else keeps CarrierWave's behavior.
++    def profile_image=(new_file)
++      if ProfileImageAttachable.uploadable?(new_file)
++        store_profile_image_with_active_storage { |uploader| uploader.cache!(new_file) }
++      else
++        super
++        remove_stored_profile_image_on_save if _mounter(:profile_image).blank?
++      end
++    end
++
++    def remote_profile_image_url=(url)
++      if url.blank?
++        super
++      else
++        @remote_profile_image_url = url
++        store_profile_image_with_active_storage { |uploader| uploader.download!(url) }
++      end
++    end
++
++    def remote_profile_image_url
++      @remote_profile_image_url || super
++    end
++
++    def profile_image_integrity_errors
++      super + profile_image_attachment_errors[:integrity]
++    end
++
++    def profile_image_processing_errors
++      super + profile_image_attachment_errors[:processing]
++    end
++
++    def profile_image_download_errors
++      super + profile_image_attachment_errors[:download]
++    end
++
++    # A new Active Storage image counts as a change to +profile_image+, so everything that reacts to
++    # a new profile image (cache busting, articles' cached user/organization, social images, search
++    # indexing, ...) keeps doing so.
++    def will_save_change_to_attribute?(attr_name, **options)
++      return true if attr_name.to_s == "profile_image" && options.empty? && @profile_image_attachment_changed
++
++      super
++    end
++
++    def saved_change_to_attribute?(attr_name, **options)
++      return true if attr_name.to_s == "profile_image" && options.empty? && @saved_profile_image_attachment_change
++
++      super
++    end
++
++    def reload(*)
++      @stored_profile_image = nil
++      super
++    end
++  end
++
++  # The profile image stored with Active Storage, if any (possibly not saved yet).
++  def stored_profile_image
++    attachment = public_send(ATTACHMENT_NAME)
++    return unless attachment.attached?
++
++    blob = attachment.blob
++    return if blob.blank?
++
++    @stored_profile_image = nil if @stored_profile_image && !@stored_profile_image.blob.equal?(blob)
++    @stored_profile_image ||= StoredImage.new(blob, pending_url: @pending_profile_image_upload&.url)
++  end
++
++  def profile_image_stored_with_active_storage?
++    public_send(ATTACHMENT_NAME).attached?
++  end
++
++  # Removes the Active Storage profile image right away (e.g. when a moderator resets the profile
++  # image of a spammer).
++  def remove_stored_profile_image!
++    attachment = public_send(ATTACHMENT_NAME)
++    @stored_profile_image = nil
++    return unless attachment.attached?
++
++    attachment.purge
++  end
++
++  private
++
++  def profile_image_attachment_errors
++    @profile_image_attachment_errors ||= { integrity: [], processing: [], download: [] }
++  end
++
++  # Runs the file through ProfileImageUploader's caching step (validations + processing), then
++  # hands the result to Active Storage. The CarrierWave column and files are left untouched.
++  def store_profile_image_with_active_storage
++    @profile_image_attachment_errors = nil
++    uploader = ProfileImageUploader.new(self, :profile_image)
++
++    begin
++      yield uploader
++    rescue CarrierWave::DownloadError => e
++      profile_image_attachment_errors[:download] << e
++    rescue CarrierWave::ProcessingError => e
++      profile_image_attachment_errors[:processing] << e
++    rescue CarrierWave::IntegrityError => e
++      profile_image_attachment_errors[:integrity] << e
++    end
++
++    unless uploader.cached? && uploader.file.present?
++      discard_cached_profile_image(uploader)
++      return
++    end
++
++    cached_file = uploader.file
++    extension = cached_file.extension.to_s.downcase
++    attachable = {
++      io: StringIO.new(cached_file.read),
++      # Like ProfileImageUploader#filename: don't leak the original filename in public URLs
++      filename: [SecureRandom.uuid, extension.presence].compact.join("."),
++      content_type: cached_file.content_type,
++      # The file has already been validated and processed by ProfileImageUploader and we don't use
++      # Active Storage's image metadata, so skip its (background) analysis.
++      metadata: { analyzed: true }
++    }
++    public_send(:"#{ATTACHMENT_NAME}=", attachable)
++
++    # CarrierWave's cached copy is kept until the record is saved, to preview the image meanwhile
++    # (as CarrierWave does).
++    discard_pending_profile_image_upload
++    @pending_profile_image_upload = uploader
++    @stored_profile_image = nil
++    @profile_image_attachment_changed = true
++  end
++
++  def remove_stored_profile_image_on_save
++    return unless profile_image_stored_with_active_storage?
++
++    public_send(:"#{ATTACHMENT_NAME}=", nil)
++    discard_pending_profile_image_upload
++    @stored_profile_image = nil
++    @profile_image_attachment_changed = true
++  end
++
++  def discard_pending_profile_image_upload
++    discard_cached_profile_image(@pending_profile_image_upload)
++    @pending_profile_image_upload = nil
++  end
++
++  def discard_cached_profile_image(uploader)
++    return unless uploader&.cached?
++
++    path = uploader.file&.path
++    uploader.file&.delete
++    dir = path && File.dirname(path)
++    Dir.rmdir(dir) if dir && File.directory?(dir) && Dir.empty?(dir)
++  rescue StandardError => e
++    Rails.logger.warn("Could not remove cached profile image: #{e.message}")
++  end
++
++  def track_saved_profile_image_attachment
++    @saved_profile_image_attachment_change = @profile_image_attachment_changed.present?
++    @profile_image_attachment_changed = false
++  end
++end
+diff --git a/app/models/organization.rb b/app/models/organization.rb
+index 9697e5b..0a83b68 100644
+--- a/app/models/organization.rb
++++ b/app/models/organization.rb
+@@ -99,6 +99,8 @@ class Organization < ApplicationRecord
+   unique_across_models :slug, length: { in: 2..30 }
+ 
+   mount_uploader :profile_image, ProfileImageUploader
++  # New profile images are stored with Active Storage, existing ones stay on CarrierWave.
++  include ProfileImageAttachable
+   mount_uploader :cover_image, CoverImageUploader
+ 
+   alias_attribute :username, :slug
+diff --git a/app/models/user.rb b/app/models/user.rb
+index 3722018..9fae274 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -169,6 +169,8 @@ def cached_recent_user_ids
+   end
+ 
+   mount_uploader :profile_image, ProfileImageUploader
++  # New profile images are stored with Active Storage, existing ones stay on CarrierWave.
++  include ProfileImageAttachable
+ 
+   devise :invitable, :omniauthable, :registerable, :database_authenticatable, :confirmable, :rememberable,
+          :recoverable, :lockable, :trackable
+diff --git a/app/services/moderator/banish_user.rb b/app/services/moderator/banish_user.rb
+index e53aaf8..d713860 100644
+--- a/app/services/moderator/banish_user.rb
++++ b/app/services/moderator/banish_user.rb
+@@ -54,6 +54,8 @@ def reassign_and_bust_username
+     def remove_profile_info
+       user.profile.clear!
+       user.update_columns(profile_image: DEFAULT_PROFILE_IMAGE)
++      # A profile image stored with Active Storage would take precedence over the column
++      user.remove_stored_profile_image!
+     end
+ 
+     def delete_vomit_reactions
+diff --git a/config/application.rb b/config/application.rb
+index 3618d3e..2e8d4c7 100644
+--- a/config/application.rb
++++ b/config/application.rb
+@@ -5,7 +5,7 @@
+ require "active_model/railtie"
+ # require "active_job/railtie"
+ require "active_record/railtie"
+-# require "active_storage/engine"
++require "active_storage/engine"
+ require "action_controller/railtie"
+ require "action_mailer/railtie"
+ # require "action_mailbox/engine"
+diff --git a/config/initializers/active_storage.rb b/config/initializers/active_storage.rb
+new file mode 100644
+index 0000000..7b0bff0
+--- /dev/null
++++ b/config/initializers/active_storage.rb
+@@ -0,0 +1,36 @@
++# Active Storage currently only stores user and organization profile images (everything else is
++# still on CarrierWave, see config/initializers/carrierwave.rb and ProfileImageAttachable).
++#
++# The service is chosen with exactly the same rules CarrierWave uses, so that a Forem stores its new
++# profile images in the same place (bucket or persistent volume) as its existing ones.
++
++# Our Fog-backed service lives in lib/ and is loaded by Active Storage with a plain `require`.
++lib_path = Rails.root.join("lib").to_s
++$LOAD_PATH.unshift(lib_path) unless $LOAD_PATH.include?(lib_path)
++
++module ActiveStorageInitializer
++  def self.service_name
++    return :test if Rails.env.test?
++    return :local unless Rails.env.production?
++    return :public_uploads if ENV["FILE_STORAGE_LOCATION"] == "file"
++    return :forem_cloud if ENV["FOREM_CONTEXT"] == "forem_cloud"
++    return :amazon if ApplicationConfig["AWS_ID"].present?
++
++    :public_uploads
++  end
++end
++
++Rails.application.configure do
++  config.active_storage.service = ActiveStorageInitializer.service_name
++
++  # Images are processed with MiniMagick (as CarrierWave does); libvips is not a dependency.
++  config.active_storage.variant_processor = :mini_magick
++
++  # Only the routes we use are drawn, in config/routes.rb (before the catch-all routes). This
++  # also keeps Active Storage's public direct upload endpoint closed.
++  config.active_storage.draw_routes = false
++end
++
++# Routes are first drawn (by config/application.rb's after_initialize) before Active Storage copies
++# its configuration over, so this has to be set right away too.
++ActiveStorage.draw_routes = false
+diff --git a/config/initializers/zeitwerk.rb b/config/initializers/zeitwerk.rb
+index 4da82d4..3442074 100644
+--- a/config/initializers/zeitwerk.rb
++++ b/config/initializers/zeitwerk.rb
+@@ -16,3 +16,5 @@
+ Rails.autoloaders.main.ignore(Rails.root.join("lib/generators/service"))
+ Rails.autoloaders.main.ignore(Rails.root.join("lib/generators/settings_model"))
+ Rails.autoloaders.main.ignore(Rails.root.join("lib/cypress-rails"))
++# Loaded by Active Storage through `require` (see config/initializers/active_storage.rb)
++Rails.autoloaders.main.ignore(Rails.root.join("lib/active_storage"))
+diff --git a/config/routes.rb b/config/routes.rb
+index b78e0e6..5cc5d74 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -1,6 +1,14 @@
+ # rubocop:disable Metrics/BlockLength
+ 
+ Rails.application.routes.draw do
++  # Active Storage (profile images of users and organizations, see ProfileImageAttachable).
++  # Only the read-only proxy route is exposed (no direct uploads), and it is drawn first so that it
++  # isn't swallowed by the catch-all page / username routes below. The default Active Storage
++  # routes are disabled in config/initializers/active_storage.rb.
++  scope ActiveStorage.routes_prefix do
++    get "/blobs/proxy/:signed_id/*filename", to: "active_storage/blobs/proxy#show", as: :rails_service_blob_proxy
++  end
++
+   # Devise does not support scoping omniauth callbacks under a dynamic segment
+   # so this lives outside our i18n scope.
+   devise_for :users, controllers: {
+diff --git a/config/storage.yml b/config/storage.yml
+index d32f76e..3b32585 100644
+--- a/config/storage.yml
++++ b/config/storage.yml
+@@ -1,3 +1,10 @@
++# Active Storage services.
++#
++# Only user and organization profile images use Active Storage so far; every other upload is still
++# handled by CarrierWave. The service in use is picked by config/initializers/active_storage.rb with
++# the same rules CarrierWaveInitializer uses, so new blobs land in the same bucket / volume as the
++# CarrierWave files they are replacing.
++
+ test:
+   service: Disk
+   root: <%= Rails.root.join("tmp/storage") %>
+@@ -6,29 +13,36 @@ local:
+   service: Disk
+   root: <%= Rails.root.join("storage") %>
+ 
+-# Use rails credentials:edit to set the AWS secrets (as aws:access_key_id|secret_access_key)
+-# amazon:
+-#   service: S3
+-#   access_key_id: <%= Rails.application.credentials.dig(:aws, :access_key_id) %>
+-#   secret_access_key: <%= Rails.application.credentials.dig(:aws, :secret_access_key) %>
+-#   region: us-east-1
+-#   bucket: your_own_bucket
+-
+-# Remember not to checkin your GCS keyfile to a repository
+-# google:
+-#   service: GCS
+-#   project: your_project
+-#   credentials: <%= Rails.root.join("path/to/gcs.keyfile") %>
+-#   bucket: your_own_bucket
++# Production without AWS: CarrierWave writes to public/uploads, which is the directory self-hosted
++# Forems persist across deploys. Keep Active Storage files on that same volume.
++public_uploads:
++  service: Disk
++  root: <%= Rails.root.join("public/uploads/active_storage") %>
+ 
+-# Use rails credentials:edit to set the Azure Storage secret (as azure_storage:storage_access_key)
+-# microsoft:
+-#   service: AzureStorage
+-#   storage_account_name: your_account_name
+-#   storage_access_key: <%= Rails.application.credentials.dig(:azure_storage, :storage_access_key) %>
+-#   container: your_container_name
++# Production with AWS keys (same bucket and credentials as CarrierWave's standard_production_config).
++# Objects are public-read and served from permanent, unsigned URLs, like CarrierWave's.
++amazon:
++  service: Fog
++  directory: <%= ApplicationConfig["AWS_BUCKET_NAME"] %>
++  prefix: uploads/active_storage
++  public: true
++  cache_control: <%= "public, max-age=#{365 * 24 * 60 * 60}" %>
++  credentials:
++    provider: AWS
++    aws_access_key_id: <%= ApplicationConfig["AWS_ID"] %>
++    aws_secret_access_key: <%= ApplicationConfig["AWS_SECRET"] %>
++    region: <%= ApplicationConfig["AWS_UPLOAD_REGION"].presence || ApplicationConfig["AWS_DEFAULT_REGION"] %>
+ 
+-# mirror:
+-#   service: Mirror
+-#   primary: local
+-#   mirrors: [ amazon, google, microsoft ]
++# Forem Cloud (same as CarrierWave's forem_cloud_config): the bucket is private and served through
++# the /remoteimages proxy on the app domain.
++forem_cloud:
++  service: Fog
++  directory: <%= ApplicationConfig["AWS_BUCKET_NAME"] %>
++  prefix: uploads/active_storage
++  public: true
++  acl_public: false
++  public_host: <%= "https://#{ApplicationConfig["APP_DOMAIN"]}/remoteimages" %>
++  credentials:
++    provider: AWS
++    use_iam_profile: true
++    region: us-east-2
+diff --git a/db/migrate/20261009100000_create_active_storage_tables.rb b/db/migrate/20261009100000_create_active_storage_tables.rb
+new file mode 100644
+index 0000000..7b9a3c9
+--- /dev/null
++++ b/db/migrate/20261009100000_create_active_storage_tables.rb
+@@ -0,0 +1,41 @@
++# Active Storage tables, needed to move user and organization profile images off CarrierWave.
++#
++# These are brand new, empty tables: creating them (and their indexes / foreign keys) does not
++# lock or rewrite any existing table, so it is safe to run before the code that uses them is live.
++# rubocop:disable Rails/CreateTableWithTimestamps
++# (the standard Active Storage tables only have a created_at)
++class CreateActiveStorageTables < ActiveRecord::Migration[8.0]
++  def change
++    create_table :active_storage_blobs do |t|
++      t.string :key, null: false
++      t.string :filename, null: false
++      t.string :content_type
++      t.text :metadata
++      t.string :service_name, null: false
++      t.bigint :byte_size, null: false
++      t.string :checksum
++      t.datetime :created_at, null: false
++
++      t.index [:key], unique: true
++    end
++
++    create_table :active_storage_attachments do |t|
++      t.string :name, null: false
++      t.references :record, null: false, polymorphic: true, index: false
++      t.references :blob, null: false
++      t.datetime :created_at, null: false
++
++      t.index %i[record_type record_id name blob_id], name: :index_active_storage_attachments_uniqueness, unique: true
++      t.foreign_key :active_storage_blobs, column: :blob_id
++    end
++
++    create_table :active_storage_variant_records do |t|
++      t.belongs_to :blob, null: false, index: false
++      t.string :variation_digest, null: false
++
++      t.index %i[blob_id variation_digest], name: :index_active_storage_variant_records_uniqueness, unique: true
++      t.foreign_key :active_storage_blobs, column: :blob_id
++    end
++  end
++end
++# rubocop:enable Rails/CreateTableWithTimestamps
+diff --git a/db/schema.rb b/db/schema.rb
+index 4894dbd..c0ac16c 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.0].define(version: 2026_09_15_160000) do
++ActiveRecord::Schema[8.0].define(version: 2026_10_09_100000) do
+   # These are extensions that must be enabled in order to support this database
+   enable_extension "citext"
+   enable_extension "ltree"
+@@ -20,6 +20,34 @@
+   enable_extension "unaccent"
+   enable_extension "vector"
+ 
++  create_table "active_storage_attachments", force: :cascade do |t|
++    t.bigint "blob_id", null: false
++    t.datetime "created_at", null: false
++    t.string "name", null: false
++    t.bigint "record_id", null: false
++    t.string "record_type", null: false
++    t.index ["blob_id"], name: "index_active_storage_attachments_on_blob_id"
++    t.index ["record_type", "record_id", "name", "blob_id"], name: "index_active_storage_attachments_uniqueness", unique: true
++  end
++
++  create_table "active_storage_blobs", force: :cascade do |t|
++    t.bigint "byte_size", null: false
++    t.string "checksum"
++    t.string "content_type"
++    t.datetime "created_at", null: false
++    t.string "filename", null: false
++    t.string "key", null: false
++    t.text "metadata"
++    t.string "service_name", null: false
++    t.index ["key"], name: "index_active_storage_blobs_on_key", unique: true
++  end
++
++  create_table "active_storage_variant_records", force: :cascade do |t|
++    t.bigint "blob_id", null: false
++    t.string "variation_digest", null: false
++    t.index ["blob_id", "variation_digest"], name: "index_active_storage_variant_records_uniqueness", unique: true
++  end
++
+   create_table "agent_sessions", force: :cascade do |t|
+     t.datetime "created_at", null: false
+     t.jsonb "curated_data", default: {}, null: false
+@@ -2199,6 +2227,8 @@
+     t.datetime "updated_at", null: false
+   end
+ 
++  add_foreign_key "active_storage_attachments", "active_storage_blobs", column: "blob_id"
++  add_foreign_key "active_storage_variant_records", "active_storage_blobs", column: "blob_id"
+   add_foreign_key "agent_sessions", "users", on_delete: :cascade
+   add_foreign_key "ahoy_events", "ahoy_visits", column: "visit_id", on_delete: :cascade
+   add_foreign_key "ahoy_events", "users", on_delete: :cascade
+diff --git a/lib/active_storage/service/fog_service.rb b/lib/active_storage/service/fog_service.rb
+new file mode 100644
+index 0000000..1a6b980
+--- /dev/null
++++ b/lib/active_storage/service/fog_service.rb
+@@ -0,0 +1,157 @@
++require "fog/aws"
++
++module ActiveStorage
++  # An Active Storage service backed by Fog (AWS), i.e. the same storage library (and bucket)
++  # CarrierWave already uses in production. This lets us move uploads to Active Storage without
++  # pulling in a second AWS SDK.
++  #
++  # Options (see config/storage.yml):
++  #
++  # - +directory+:     the bucket name.
++  # - +credentials+:   passed to +Fog::Storage.new+ (provider, keys or use_iam_profile, region, ...).
++  # - +prefix+:        optional key prefix, so blobs live next to the CarrierWave "uploads/" tree.
++  # - +public+:        when true, URLs are permanent, unsigned public URLs (like CarrierWave's).
++  # - +public_host+:   optional host (and path) that serves the bucket, e.g. a proxy in front of a
++  #                    private bucket. Defaults to the bucket's own public URL.
++  # - +acl_public+:    whether uploaded objects get a public-read ACL (defaults to +public+).
++  # - +cache_control+: Cache-Control header stored with every object.
++  class Service
++    class FogService < Service
++      attr_reader :directory_name, :prefix, :public_host, :cache_control
++
++      def initialize(directory:, credentials:, public: false, prefix: nil, public_host: nil, acl_public: nil,
++                     cache_control: nil, **)
++        super()
++        @directory_name = directory
++        @credentials = credentials.to_h.symbolize_keys
++        @public = public
++        @prefix = prefix.presence&.delete_suffix("/")
++        @public_host = public_host.presence&.delete_suffix("/")
++        @acl_public = acl_public.nil? ? public : acl_public
++        @cache_control = cache_control
++      end
++
++      def upload(key, io, checksum: nil, content_type: nil, disposition: nil, filename: nil, custom_metadata: {}, **)
++        instrument :upload, key: key, checksum: checksum do
++          attributes = {
++            key: path_for(key),
++            body: io,
++            content_type: content_type,
++            public: @acl_public,
++            metadata: custom_metadata.presence
++          }
++          attributes[:content_md5] = checksum if checksum
++          attributes[:cache_control] = cache_control if cache_control
++          if disposition && filename
++            attributes[:content_disposition] = content_disposition_with(type: disposition, filename: filename)
++          end
++
++          directory.files.create(**attributes.compact)
++        rescue Excon::Error::BadRequest => e
++          raise ActiveStorage::IntegrityError if e.message.include?("BadDigest") || e.message.include?("InvalidDigest")
++
++          raise
++        end
++      end
++
++      def download(key, &block)
++        if block
++          instrument :streaming_download, key: key do
++            with_not_found_handling do
++              connection.get_object(directory_name, path_for(key)) { |chunk, _remaining, _total| yield chunk }
++            end
++          end
++        else
++          instrument :download, key: key do
++            with_not_found_handling { connection.get_object(directory_name, path_for(key)).body }
++          end
++        end
++      end
++
++      def download_chunk(key, range)
++        instrument :download_chunk, key: key, range: range do
++          last = range.exclude_end? ? range.end - 1 : range.end
++          with_not_found_handling do
++            connection.get_object(directory_name, path_for(key), "Range" => "bytes=#{range.begin}-#{last}").body
++          end
++        end
++      end
++
++      def delete(key)
++        instrument :delete, key: key do
++          connection.delete_object(directory_name, path_for(key))
++        rescue Excon::Error::NotFound, Fog::AWS::Storage::NotFound
++          # Already gone
++        end
++      end
++
++      def delete_prefixed(prefix)
++        instrument :delete_prefixed, prefix: prefix do
++          # A Fog collection (paginated by Fog), not an Active Record relation
++          directory.files.all(prefix: path_for(prefix)).each(&:destroy) # rubocop:disable Rails/FindEach
++        end
++      end
++
++      def exist?(key)
++        instrument :exist, key: key do |payload|
++          answer = begin
++            connection.head_object(directory_name, path_for(key))
++            true
++          rescue Excon::Error::NotFound, Fog::AWS::Storage::NotFound
++            false
++          end
++          payload[:exist] = answer
++          answer
++        end
++      end
++
++      # A URL that never expires, or nil if this service doesn't serve its files publicly.
++      def permanent_url(key)
++        return unless public?
++
++        if public_host
++          "#{public_host}/#{path_for(key)}"
++        else
++          # Built locally: Fog::AWS::Storage::File#public_url would query the object ACL first
++          connection.request_url(bucket_name: directory_name, object_name: path_for(key))
++        end
++      end
++
++      def path_for(key)
++        [prefix, key].compact.join("/")
++      end
++
++      private
++
++      def public_url(key, **)
++        permanent_url(key)
++      end
++
++      def private_url(key, expires_in:, filename:, content_type:, disposition:, **)
++        connection.get_object_https_url(
++          directory_name,
++          path_for(key),
++          Time.current + expires_in,
++          query: {
++            "response-content-disposition" => content_disposition_with(type: disposition, filename: filename),
++            "response-content-type" => content_type
++          }.compact,
++        )
++      end
++
++      def with_not_found_handling
++        yield
++      rescue Excon::Error::NotFound, Fog::AWS::Storage::NotFound
++        raise ActiveStorage::FileNotFoundError
++      end
++
++      def connection
++        @connection ||= Fog::Storage.new(@credentials)
++      end
++
++      def directory
++        @directory ||= connection.directories.new(key: directory_name)
++      end
++    end
++  end
++end
+diff --git a/spec/lib/active_storage/service/fog_service_spec.rb b/spec/lib/active_storage/service/fog_service_spec.rb
+new file mode 100644
+index 0000000..1b4cc8c
+--- /dev/null
++++ b/spec/lib/active_storage/service/fog_service_spec.rb
+@@ -0,0 +1,111 @@
++require "rails_helper"
++require "active_storage/service/fog_service"
++
++RSpec.describe ActiveStorage::Service::FogService do
++  let(:credentials) do
++    { provider: "AWS", aws_access_key_id: "id", aws_secret_access_key: "secret", region: "us-east-1" }
++  end
++  let(:options) { {} }
++  let(:service) do
++    described_class.new(directory: "forem-bucket", credentials: credentials, prefix: "uploads/active_storage",
++                        public: true, **options)
++  end
++  let(:data) { Rails.root.join("spec/fixtures/files/800x600.png").binread }
++  let(:checksum) { OpenSSL::Digest::MD5.base64digest(data) }
++  let(:key) { SecureRandom.base58(24) }
++  let(:storage) { Fog::Storage.new(credentials) }
++
++  before do
++    Fog.mock!
++    storage.directories.create(key: "forem-bucket")
++  end
++
++  after do
++    Fog::Mock.reset
++    Fog.unmock!
++  end
++
++  it "uploads, downloads, checks and deletes files under its prefix" do
++    service.upload(key, StringIO.new(data), checksum: checksum, content_type: "image/png")
++
++    stored = storage.directories.get("forem-bucket").files.get("uploads/active_storage/#{key}")
++    expect(stored.body).to eq(data)
++    expect(stored.content_type).to eq("image/png")
++    expect(service.exist?(key)).to be(true)
++    expect(service.download(key)).to eq(data)
++    expect(service.download_chunk(key, 0..9)).to eq(data[0..9])
++
++    streamed = +""
++    service.download(key) { |chunk| streamed << chunk }
++    expect(streamed.b).to eq(data)
++
++    service.delete(key)
++    expect(service.exist?(key)).to be(false)
++  end
++
++  it "deletes files by prefix" do
++    service.upload("variants/a", StringIO.new("a"))
++    service.upload("variants/b", StringIO.new("b"))
++    service.upload("other", StringIO.new("c"))
++
++    service.delete_prefixed("variants/")
++
++    expect(service.exist?("variants/a")).to be(false)
++    expect(service.exist?("variants/b")).to be(false)
++    expect(service.exist?("other")).to be(true)
++  end
++
++  it "raises FileNotFoundError for missing files" do
++    expect { service.download("missing") }.to raise_error(ActiveStorage::FileNotFoundError)
++  end
++
++  it "uploads public-read objects with a long cache control when configured to" do
++    options[:cache_control] = "public, max-age=31536000"
++    service.upload(key, StringIO.new(data))
++
++    stored = storage.directories.get("forem-bucket").files.get("uploads/active_storage/#{key}")
++    expect(stored.cache_control).to eq("public, max-age=31536000")
++    expect(storage.get_object_acl("forem-bucket", "uploads/active_storage/#{key}").body["AccessControlList"])
++      .to include(hash_including("Grantee" => hash_including("URI" => "http://acs.amazonaws.com/groups/global/AllUsers")))
++  end
++
++  describe "#permanent_url" do
++    it "is the bucket's public URL, without querying S3" do
++      # "abc" doesn't exist: Fog::AWS::Storage::File#public_url (ACL lookup) would raise here
++      expect(service.permanent_url("abc")).to eq("https://forem-bucket.s3.amazonaws.com/uploads/active_storage/abc")
++    end
++
++    context "with a public host (private bucket behind a proxy)" do
++      let(:options) { { public_host: "https://forem.example.com/remoteimages", acl_public: false } }
++
++      it "points to the proxy" do
++        expect(service.permanent_url("abc")).to eq("https://forem.example.com/remoteimages/uploads/active_storage/abc")
++      end
++    end
++
++    context "when the service isn't public" do
++      let(:service) { described_class.new(directory: "forem-bucket", credentials: credentials) }
++
++      it "is nil" do
++        expect(service.permanent_url("abc")).to be_nil
++      end
++    end
++  end
++
++  it "is used for profile image URLs" do
++    service.upload(key, StringIO.new(data))
++    blob = ActiveStorage::Blob.new(key: key, filename: "a.png", byte_size: data.bytesize, checksum: checksum,
++                                   service_name: "test")
++    allow(blob).to receive_messages(persisted?: true, service: service)
++
++    expect(ProfileImageAttachable.url_for(blob))
++      .to eq("https://forem-bucket.s3.amazonaws.com/uploads/active_storage/#{key}")
++  end
++
++  it "is configured from config/storage.yml" do
++    configs = ActiveSupport::ConfigurationFile.parse(Rails.root.join("config/storage.yml"))
++
++    expect(ActiveStorage::Service::Configurator.build(:amazon, configs)).to be_a(described_class)
++    expect(ActiveStorage::Service::Configurator.build(:forem_cloud, configs)).to be_a(described_class)
++  end
++end
+diff --git a/spec/models/concerns/profile_image_attachable_spec.rb b/spec/models/concerns/profile_image_attachable_spec.rb
+new file mode 100644
+index 0000000..47a9f03
+--- /dev/null
++++ b/spec/models/concerns/profile_image_attachable_spec.rb
+@@ -0,0 +1,275 @@
++require "rails_helper"
++require "exifr/jpeg"
++
++RSpec.describe ProfileImageAttachable do
++  let(:png_path) { Rails.root.join("spec/fixtures/files/800x600.png") }
++  let(:jpg_path) { Rails.root.join("spec/fixtures/files/800x600.jpg") }
++  let(:png) { Rack::Test::UploadedFile.new(png_path, "image/png") }
++  let(:jpg) { Rack::Test::UploadedFile.new(jpg_path, "image/jpeg") }
++
++  # A profile image uploaded before this deploy: stored by CarrierWave, referenced by the column.
++  def store_legacy_profile_image(record, path = png_path)
++    uploader = ProfileImageUploader.new(record, :profile_image)
++    uploader.store!(Rack::Test::UploadedFile.new(path, "image/png"))
++    record.update_column(:profile_image, uploader.identifier)
++    record.class.find(record.id)
++  end
++
++  shared_examples "a model storing its profile image with Active Storage" do
++    context "with a profile image uploaded before Active Storage (CarrierWave)" do
++      let!(:legacy_record) { store_legacy_profile_image(record_without_image) }
++      let!(:legacy_url) { legacy_record.profile_image.url }
++      let(:legacy_path) { Rails.public_path.join(legacy_url.delete_prefix("/")) }
++
++      it "keeps serving it from CarrierWave" do
++        expect(legacy_record.avatar).not_to be_attached
++        expect(legacy_url).to start_with("/uploads/#{record_without_image.class.name.underscore}/profile_image/")
++        expect(legacy_record.profile_image_url).to eq(legacy_url)
++        expect(legacy_record.profile_image_90).to eq(Images::Profile.call(legacy_url, length: 90))
++        expect(legacy_record.profile_image).to be_present
++        expect(File).to exist(legacy_path)
++      end
++
++      it "stores a new image with Active Storage, without touching the CarrierWave one" do
++        legacy_column = legacy_record.read_attribute(:profile_image)
++
++        legacy_record.update!(profile_image: jpg)
++        reloaded = legacy_record.class.find(legacy_record.id)
++
++        expect(reloaded.avatar).to be_attached
++        expect(reloaded.profile_image_url).to start_with("/rails/active_storage/blobs/proxy/")
++        expect(reloaded.profile_image_url).to end_with(".jpg")
++        # The previous release (and everything that cached the old URL) still finds the old image
++        expect(reloaded.read_attribute(:profile_image)).to eq(legacy_column)
++        expect(File).to exist(legacy_path)
++      end
++
++      it "keeps the CarrierWave image when the new file is invalid" do
++        legacy_record.profile_image = Rack::Test::UploadedFile.new(
++          Rails.root.join("spec/fixtures/files/800x600.pdf"), "application/pdf"
++        )
++
++        expect(legacy_record).not_to be_valid
++        expect(legacy_record.errors[:profile_image]).to be_present
++        expect(legacy_record.avatar).not_to be_attached
++        expect(legacy_record.profile_image_url).to eq(legacy_url)
++      end
++    end
++
++    context "with a new profile image" do
++      let(:record) do
++        record_without_image.update!(profile_image: png)
++        record_without_image.class.find(record_without_image.id)
++      end
++
++      it "stores it with Active Storage" do
++        expect(record.avatar).to be_attached
++        expect(record.read_attribute(:profile_image)).to be_nil
++        expect(record.avatar.blob.content_type).to eq("image/png")
++        expect(record.avatar.download).to eq(File.binread(png_path))
++      end
++
++      it "returns a permanent URL for it" do
++        url = record.profile_image_url
++        signed_id = url.split("/")[-2]
++
++        expect(url).to start_with("/rails/active_storage/blobs/proxy/")
++        expect(ActiveStorage::Blob.find_signed!(signed_id)).to eq(record.avatar.blob)
++        expect(record.profile_image.url).to eq(url)
++        expect(record.profile_image.to_s).to eq(url)
++        expect(record.profile_image_90).to eq(Images::Profile.call(url, length: 90))
++        expect(record.profile_image_url_for(length: 640)).to eq(Images::Profile.call(url, length: 640))
++      end
++
++      it "does not leak the original filename" do
++        expect(record.avatar.filename.to_s).to match(/\A\h{8}-\h{4}-\h{4}-\h{4}-\h{12}\.png\z/)
++      end
++
++      it "serializes like CarrierWave did" do
++        expect(record.as_json(only: [:profile_image])).to eq("profile_image" => { "url" => record.profile_image_url })
++      end
++
++      it "doesn't store anything with CarrierWave" do
++        expect(Dir[Rails.public_path.join("uploads/#{record.class.name.underscore}/profile_image/#{record.id}/*")])
++          .to be_empty
++      end
++
++      it "counts as a change of the profile image" do
++        record_without_image.profile_image = jpg
++        expect(record_without_image.will_save_change_to_profile_image?).to be(true)
++
++        record_without_image.save!
++        expect(record_without_image.saved_change_to_profile_image?).to be(true)
++        expect(record_without_image.saved_change_to_attribute?(:profile_image)).to be(true)
++
++        record_without_image.update!(name: "Another name")
++        expect(record_without_image.saved_change_to_profile_image?).to be(false)
++      end
++
++      it "replaces the previous Active Storage image" do
++        old_blob = record.avatar.blob
++        record.update!(profile_image: jpg)
++
++        expect(record.reload.avatar.blob).not_to eq(old_blob)
++        expect(record.profile_image_url).to end_with(".jpg")
++      end
++
++      it "is removed when the profile image is cleared, as CarrierWave does" do
++        record.profile_image = nil
++        record.save(validate: false)
++
++        expect(record.reload.avatar).not_to be_attached
++      end
++
++      it "ignores strings, as CarrierWave does" do
++        new_record = record_without_image.class.new
++        new_record.profile_image = "https://example.com/image.png"
++
++        expect(new_record.avatar).not_to be_attached
++        expect(new_record.profile_image_url).to be_nil
++      end
++    end
++
++    it "previews a new image before the record is saved, as CarrierWave does" do
++      record_without_image.profile_image = png
++
++      expect(record_without_image.profile_image).to be_present
++      expect(record_without_image.profile_image_url).to start_with("/uploads/tmp/")
++    end
++
++    it "doesn't enqueue Active Storage analysis jobs" do
++      expect { record_without_image.update!(profile_image: png) }
++        .not_to have_enqueued_job(ActiveStorage::AnalyzeJob)
++    end
++
++    it "validates new images with the ProfileImageUploader rules" do
++      record_without_image.profile_image = Rack::Test::UploadedFile.new(
++        Rails.root.join("spec/fixtures/files/800x600.pdf"), "application/pdf"
++      )
++
++      expect(record_without_image).not_to be_valid
++      expect(record_without_image.errors[:profile_image]).to include(/unsupported type/i)
++      expect(record_without_image.avatar).not_to be_attached
++    end
++
++    it "rejects too large images" do
++      record_without_image # created before the limit changes
++      stub_const("ProfileImageUploader::MAX_FILE_SIZE", 1.kilobyte)
++      record_without_image.profile_image = jpg
++
++      expect(record_without_image).not_to be_valid
++      expect(record_without_image.errors[:profile_image]).to be_present
++      expect(record_without_image.avatar).not_to be_attached
++    end
++
++    it "stores remote images with Active Storage" do
++      stub_request(:get, "https://images.example.com/avatar.png")
++        .to_return(status: 200, body: File.binread(png_path), headers: { "Content-Type" => "image/png" })
++
++      record_without_image.remote_profile_image_url = "https://images.example.com/avatar.png"
++      record_without_image.save!
++
++      expect(record_without_image.reload.avatar).to be_attached
++      expect(record_without_image.avatar.download).to eq(File.binread(png_path))
++      expect(record_without_image.read_attribute(:profile_image)).to be_nil
++    end
++
++    it "reports remote images that can't be downloaded" do
++      stub_request(:get, "https://images.example.com/missing.png").to_return(status: 404)
++
++      record_without_image.remote_profile_image_url = "https://images.example.com/missing.png"
++
++      expect(record_without_image).not_to be_valid
++      expect(record_without_image.errors[:profile_image]).to be_present
++      expect(record_without_image.avatar).not_to be_attached
++    end
++
++    it "processes images as CarrierWave does (EXIF data is removed)" do
++      ProfileImageUploader.enable_processing = true
++      record_without_image.update!(
++        profile_image: Rack::Test::UploadedFile.new(Rails.root.join("spec/fixtures/files/image_gps_data.jpg"),
++                                                    "image/jpeg"),
++      )
++
++      expect(EXIFR::JPEG.new(StringIO.new(record_without_image.avatar.download)).exif?).to be(false)
++    ensure
++      ProfileImageUploader.enable_processing = false
++    end
++  end
++
++  describe User do
++    let(:record_without_image) { create(:user, profile_image: nil) }
++
++    it_behaves_like "a model storing its profile image with Active Storage"
++
++    it "stores profile images of new users with Active Storage" do
++      user = create(:user)
++
++      expect(user.avatar).to be_attached
++      expect(user.profile_image_url).to start_with("/rails/active_storage/blobs/proxy/")
++    end
++
++    it "busts the profile image cache when a new image is stored" do
++      sidekiq_assert_enqueued_with(job: Users::BustProfileImageCacheWorker, args: [record_without_image.id]) do
++        record_without_image.update!(profile_image: png)
++      end
++    end
++
++    it "regenerates social images when a new image is stored" do
++      create(:article, user: record_without_image)
++      allow(Images::SocialImageWorker).to receive(:perform_async)
++
++      record_without_image.update!(profile_image: png)
++
++      expect(Images::SocialImageWorker).to have_received(:perform_async).with(record_without_image.id, "User")
++    end
++
++    it "is updated through Users::Update" do
++      Users::Update.call(record_without_image, user: { profile_image: png })
++
++      expect(record_without_image.reload.avatar).to be_attached
++    end
++  end
++
++  describe Organization do
++    let(:record_without_image) do
++      organization = create(:organization)
++      organization.avatar.purge
++      organization.class.find(organization.id)
++    end
++
++    it_behaves_like "a model storing its profile image with Active Storage"
++
++    it "accepts an Active Storage image for its profile image presence validation" do
++      organization = build(:organization, profile_image: png)
++
++      expect(organization).to be_valid
++      expect(organization.read_attribute(:profile_image)).to be_nil
++    end
++
++    it "still requires a profile image" do
++      organization = build(:organization, profile_image: nil)
++
++      expect(organization).not_to be_valid
++      expect(organization.errors[:profile_image]).to be_present
++    end
++
++    it "updates its articles' cached organization when a new image is stored" do
++      article = create(:article, organization: record_without_image)
++      sidekiq_assert_enqueued_with(job: Organizations::SaveArticleWorker, args: [article.id]) do
++        record_without_image.update!(profile_image: png)
++      end
++    end
++  end
++
++  describe "other uploads" do
++    it "are still stored with CarrierWave" do
++      tag = create(:tag, profile_image: png)
++
++      expect(tag).not_to respond_to(:avatar)
++      expect(tag.profile_image).to be_a(ProfileImageUploader)
++      expect(tag.read_attribute(:profile_image)).to be_present
++      expect(tag.profile_image_url).to start_with("/uploads/tag/profile_image/#{tag.id}/")
++    end
++  end
++end
+diff --git a/spec/requests/profile_image_storage_spec.rb b/spec/requests/profile_image_storage_spec.rb
+new file mode 100644
+index 0000000..32e13e5
+--- /dev/null
++++ b/spec/requests/profile_image_storage_spec.rb
+@@ -0,0 +1,95 @@
++require "rails_helper"
++
++# Profile images of users and organizations are moving from CarrierWave to Active Storage: new
++# images are stored with Active Storage, existing ones stay on CarrierWave.
++RSpec.describe "Profile image storage" do
++  let(:png_path) { Rails.root.join("spec/fixtures/files/800x600.png") }
++  let(:api_headers) { { "content-type" => "application/json", "Accept" => "application/vnd.forem.api-v1+json" } }
++
++  def store_legacy_profile_image(record)
++    uploader = ProfileImageUploader.new(record, :profile_image)
++    uploader.store!(Rack::Test::UploadedFile.new(png_path, "image/png"))
++    record.update_column(:profile_image, uploader.identifier)
++    record.class.find(record.id)
++  end
++
++  describe "GET an Active Storage profile image URL" do
++    let(:user) { create(:user, profile_image: Rack::Test::UploadedFile.new(png_path, "image/png")) }
++
++    it "serves the image, cacheable forever" do
++      get user.profile_image_url
++
++      expect(response).to have_http_status(:ok)
++      expect(response.media_type).to eq("image/png")
++      expect(response.body.b).to eq(File.binread(png_path))
++      expect(response.headers["Cache-Control"]).to include("public")
++      expect(response.headers["Cache-Control"]).to include("max-age=#{1.year.to_i}").or include("immutable")
++    end
++
++    it "keeps serving it later on (the URL doesn't expire)" do
++      url = user.profile_image_url
++
++      Timecop.travel(2.years.from_now) do
++        get url
++        expect(response).to have_http_status(:ok)
++      end
++    end
++
++    it "is not swallowed by the catch-all routes" do
++      expect(Rails.application.routes.recognize_path(user.profile_image_url))
++        .to include(controller: "active_storage/blobs/proxy", action: "show")
++    end
++
++    it "does not expose Active Storage direct uploads" do
++      expect(Rails.application.routes.url_helpers).not_to respond_to(:rails_direct_uploads_path)
++    end
++  end
++
++  describe "GET /api/profile_images/:username" do
++    it "returns the Active Storage image of a user with a new image" do
++      user = create(:user)
++
++      get api_profile_image_path(user.username), headers: api_headers
++
++      expect(response.parsed_body["profile_image"]).to include("/rails/active_storage/blobs/proxy/")
++    end
++
++    it "returns the CarrierWave image of a user with an existing image" do
++      user = store_legacy_profile_image(create(:user, profile_image: nil))
++
++      get api_profile_image_path(user.username), headers: api_headers
++
++      expect(response.parsed_body["profile_image"]).to include("/uploads/user/profile_image/#{user.id}/")
++    end
++  end
++
++  describe "updating the profile image from the settings" do
++    let(:user) { store_legacy_profile_image(create(:user, profile_image: nil)) }
++    let!(:legacy_url) { user.profile_image_url }
++
++    before { sign_in user }
++
++    it "stores the new image with Active Storage and keeps the existing CarrierWave file" do
++      patch "/profiles/#{user.id}", params: {
++        user: { profile_image: fixture_file_upload("800x600.jpg", "image/jpeg") }
++      }
++
++      user.reload
++      expect(user.avatar).to be_attached
++      expect(user.profile_image_url).to include("/rails/active_storage/blobs/proxy/")
++      expect(File).to exist(Rails.public_path.join(legacy_url.delete_prefix("/")))
++    end
++  end
++
++  describe "banishing a user" do
++    it "removes the Active Storage profile image" do
++      admin = create(:user, :super_admin)
++      user = create(:user)
++
++      Moderator::BanishUser.call(admin: admin, user: user)
++
++      expect(user.reload.avatar).not_to be_attached
++      expect(user.profile_image_url).not_to include("active_storage")
++    end
++  end
++end

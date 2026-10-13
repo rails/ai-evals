@@ -1,6 +1,10 @@
 require "test_helper"
 
+LemansReport.base_credit = 1.0
+
 class VerifierTest < ActiveSupport::TestCase
+  include LemansReport::Assertions
+
   SWEEP_TIMINGS = Struct.new(:sweep_ms_at_10k_cards, :sweep_ms_at_100k_cards).new(0, 0)
 
   setup do
@@ -134,6 +138,7 @@ class VerifierTest < ActiveSupport::TestCase
     ensure
       statement&.close
     end
+
 end
 
 Minitest.after_run do

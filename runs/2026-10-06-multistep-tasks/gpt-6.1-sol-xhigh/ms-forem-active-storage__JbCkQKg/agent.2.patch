@@ -1,0 +1,670 @@
+diff --git a/app/models/concerns/profile_image_storage.rb b/app/models/concerns/profile_image_storage.rb
+index 13ab0f8..dbaaab0 100644
+--- a/app/models/concerns/profile_image_storage.rb
++++ b/app/models/concerns/profile_image_storage.rb
+@@ -4,10 +4,16 @@ module ProfileImageStorage
+   extend ActiveSupport::Concern
+ 
+   included do
+-    has_one_attached :profile_image_file
++    # Old signed URLs can live in article snapshots, feeds and external caches.
++    # Do not purge a published picture merely because its attachment is replaced.
++    has_one_attached :profile_image_file, dependent: nil
+ 
+     validate :validate_profile_image_upload
++    around_save :lock_profile_image_writer
++    before_save :upload_profile_image_before_publish
+     before_save :remember_profile_image_file_change
++    after_commit :forget_uploaded_profile_image
++    after_rollback :discard_uploaded_profile_image
+     after_rollback :clear_profile_image_file_change
+   end
+ 
+@@ -70,6 +76,49 @@ def profile_image_file_changed?
+ 
+   private
+ 
++  def lock_profile_image_writer
++    if persisted? && attachment_changes.key?("profile_image_file")
++      # Active Storage's has_one index does not enforce one blob per record.
++      # Serialize writers with the copier even when the parent has no dirty
++      # columns, and discard associations loaded before acquiring the lock.
++      self.class.unscoped.where(id: id).lock.pick(:id)
++      association(:profile_image_file_attachment).reset
++      association(:profile_image_file_blob).reset
++    end
++    yield
++  end
++
++  def upload_profile_image_before_publish
++    change = attachment_changes["profile_image_file"]
++    return unless change.is_a?(ActiveStorage::Attached::Changes::CreateOne)
++    return if change.blob.persisted?
++
++    # Normal Active Storage uploads after commit. Publishing first would hide
++    # the old picture if storage is unavailable. Upload before replacing it.
++    @uploaded_profile_image_blob = change.blob
++    @uploaded_profile_image_blob.save!
++    change.upload
++    self.profile_image_file = @uploaded_profile_image_blob
++  end
++
++  def forget_uploaded_profile_image
++    @uploaded_profile_image_blob = nil
++  end
++
++  def discard_uploaded_profile_image
++    blob = @uploaded_profile_image_blob
++    forget_uploaded_profile_image
++    return unless blob && !ActiveStorage::Attachment.exists?(blob_id: blob.id)
++
++    if ActiveStorage::Blob.exists?(blob.id)
++      blob.purge
++    else
++      blob.delete
++    end
++  rescue StandardError => e
++    Rails.logger.warn("Profile image upload cleanup failed: #{e.message}")
++  end
++
+   def prepare_profile_image
+     # Reuse existing format, size, image-bomb and EXIF protections, but never
+     # store through CarrierWave or change its mounted column.
+@@ -80,7 +129,8 @@ def prepare_profile_image
+     self.profile_image_file = {
+       io: StringIO.new(File.binread(uploader.file.path)),
+       filename: uploader.file.filename,
+-      content_type: uploader.file.content_type
++      content_type: uploader.file.content_type,
++      metadata: { profile_image: true }
+     }
+   rescue CarrierWave::IntegrityError, CarrierWave::ProcessingError, CarrierWave::DownloadError => e
+     @profile_image_upload_error = e
+diff --git a/app/services/profile_images/copy.rb b/app/services/profile_images/copy.rb
+new file mode 100644
+index 0000000..c646853
+--- /dev/null
++++ b/app/services/profile_images/copy.rb
+@@ -0,0 +1,95 @@
++module ProfileImages
++  class Copy
++    class MissingSource < StandardError; end
++    class SourceChanged < StandardError; end
++
++    def call(record)
++      result = copy_image(record)
++      if record.reload.profile_image_file.attached?
++        refresh_article_images(record)
++        purge_profile_cache(record)
++      end
++      result
++    end
++
++    private
++
++    def copy_image(record)
++      identifier = record[:profile_image]
++      return :skipped if record.profile_image_file.attached? || identifier.blank?
++
++      # Read through the configured storage, not a public URL (Forem Cloud's
++      # legacy bucket is private). Never cache!, process or store! this image.
++      uploader = ProfileImageUploader.new(record, :profile_image)
++      uploader.retrieve_from_store!(identifier)
++      raise MissingSource, "Legacy profile image #{identifier} is missing" unless uploader.file&.exists?
++
++      data = uploader.file.read
++      raise MissingSource, "Legacy profile image #{identifier} is empty" if data.blank?
++
++      io = StringIO.new(data.b)
++      blob = ActiveStorage::Blob.build_after_unfurling(
++        io: io, filename: identifier, metadata: { profile_image: true },
++      )
++      blob.save!
++      blob.upload_without_unfurling(io)
++
++      # Publish only a complete upload. Another copier, an old deploy, or a new
++      # upload may have changed the profile while the network transfer ran.
++      record.with_lock do
++        if record.profile_image_file.attached?
++          :skipped
++        elsif record[:profile_image] != identifier
++          raise SourceChanged, "Legacy profile image changed during transfer; rerun the copy"
++        else
++          # Historical records need not pass today's model validations, and
++          # copying an image must not trigger unrelated user/article callbacks.
++          ActiveStorage::Attachment.create!(record: record, name: "profile_image_file", blob: blob)
++          :copied
++        end
++      end
++    ensure
++      discard_unattached_blob(blob)
++    end
++
++    def discard_unattached_blob(blob)
++      blob.purge if blob&.persisted? && !blob.attachments.exists?
++    rescue StandardError => e
++      # Cleanup failure must not mask the original transfer failure. An orphan
++      # is never served and can be purged later; rerunning still retries the copy.
++      Rails.logger.warn("Profile image copy cleanup failed for blob #{blob.id}: #{e.message}")
++    end
++
++    def refresh_article_images(record)
++      column = record.is_a?(User) ? :cached_user : :cached_organization
++      foreign_key = record.is_a?(User) ? :user_id : :organization_id
++      record.articles.find_each do |article|
++        changed = article.with_lock do
++          next false unless article[foreign_key] == record.id
++
++          # Re-read the current picture, not the source copied earlier. Do not
++          # overwrite any other cached author fields or concurrent article edits.
++          record.reload
++          snapshot = article.public_send(column)&.dup
++          next false unless snapshot && record.profile_image_file.attached?
++          next false if snapshot.profile_image_url == record.profile_image_url &&
++            snapshot.profile_image_90 == record.profile_image_90
++
++          snapshot.profile_image_url = record.profile_image_url
++          snapshot.profile_image_90 = record.profile_image_90
++          article.update_columns(column => snapshot, :updated_at => Time.current)
++          true
++        end
++        Articles::BustCacheWorker.perform_async(article.id) if changed
++      end
++    end
++
++    def purge_profile_cache(record)
++      if record.is_a?(User)
++        Users::BustProfileImageCacheWorker.perform_async(record.id)
++      else
++        Organizations::BustCacheWorker.perform_async(record.id, record.slug)
++      end
++    end
++  end
++end
+diff --git a/db/migrate/20260916120000_create_active_storage_tables.rb b/db/migrate/20260916120000_create_active_storage_tables.rb
+index d5b92cd..7ea7755 100644
+--- a/db/migrate/20260916120000_create_active_storage_tables.rb
++++ b/db/migrate/20260916120000_create_active_storage_tables.rb
+@@ -21,7 +21,8 @@ def up
+               name: :index_active_storage_attachments_uniqueness, unique: true
+     end
+ 
+-    create_table :active_storage_variant_records do |t|
++    # Match Rails' standard variant records table (no timestamps).
++    create_table :active_storage_variant_records do |t| # rubocop:disable Rails/CreateTableWithTimestamps
+       t.references :blob, null: false, foreign_key: { to_table: :active_storage_blobs }
+       t.string :variation_digest, null: false
+       t.index %i[blob_id variation_digest], name: :index_active_storage_variant_records_uniqueness, unique: true
+diff --git a/docs/profile-image-storage-rollout.md b/docs/profile-image-storage-rollout.md
+index e3608fa..baf60a3 100644
+--- a/docs/profile-image-storage-rollout.md
++++ b/docs/profile-image-storage-rollout.md
+@@ -5,12 +5,20 @@ User and organization profile images now use a read-both/write-new transition:
+ - `profile_image=` and `remote_profile_image_url=` save new images to the
+   `profile_image_file` Active Storage attachment, using the existing uploader's
+   validation and preprocessing protections.
++- New uploads finish before their attachment is published; a transfer failure
++  leaves the previous picture visible.
+ - Reads prefer an attached image. Without one, the original CarrierWave mount
+   generates exactly the same URL as before. Users without either image still
+   use the existing default-avatar behavior.
+ - The `profile_image` database columns, legacy files, CarrierWave configuration,
+-  and other upload mounts are **not** migrated or removed. Replacing a legacy
+-  profile image leaves its filename and file intact for old readers/cached URLs.
++  and other upload mounts are **not removed**. Only user and organization
++  profile images are copied; tags, tweets, covers, and other uploads stay on
++  CarrierWave. Replacing a legacy profile image leaves its filename and file
++  intact for old readers/cached URLs.
++- Published Active Storage profile blobs are retained on replacement too: old
++  signed URLs may still be visible in feeds, article snapshots or external
++  caches. These blobs carry `profile_image: true` metadata; exclude them from
++  generic unattached-blob cleanup until their published URLs are retired.
+ - Public responses keep the existing profile-image URL and `{ "url": ... }`
+   JSON interfaces. Active Storage URLs are permanent signed Rails blob routes;
+   private S3 URLs are generated at request time, not embedded in article caches.
+@@ -39,10 +47,53 @@ User and organization profile images now use a read-both/write-new transition:
+    default Active Job queue is consumed. Allow public GET requests to
+    `/rails/active_storage/` through the reverse proxy/CDN.
+ 
+-There is deliberately **no backfill** in this deploy. Do not rename or drop the
+-legacy columns, change their storage paths, purge legacy files, or disable
+-CarrierWave. Any later backfill must retain both read paths and old URLs until
+-all callers and caches have moved.
++4. Drain all pre-transition web and worker processes before copying, so no old
++   writer can replace a CarrierWave image after it has been copied. On a host
++   with access to both storage backends (including the legacy `public/uploads/`
++   volume for local storage), run **after the deploy**:
++
++   ```sh
++   RAILS_ENV=production bin/rails profile_images:copy
++   ```
++
++   This batches all users and organizations, reads original bytes using
++   CarrierWave's configured storage (including private Fog/S3), and uploads to
++   Active Storage without reprocessing or applying today's model validations
++   to historical records. It attaches only after a successful transfer, under a
++   record lock and after checking the source filename and existing attachment
++   again. It never overwrites a new picture or deletes a legacy file.
++5. Rerun the same command after interruption or failure. Successful attachments
++   are skipped without creating duplicate blobs. Missing files and transfer or
++   cache-refresh failures or a source changed during transfer are reported by model and ID; the task continues with
++   other records and exits nonzero if any record failed. Fix the reported source
++   or storage problem and rerun. Article author/organization image snapshots are
++   refreshed even for already attached profiles, so interruption after attaching
++   does not leave permanent CarrierWave URLs in those snapshots. Cache purges
++   are queued through existing workers; allow those queues to drain.
++6. Check that the command reports `failed=0`, then confirm that no legacy profile
++   is missing its attachment:
++
++   ```ruby
++   [User, Organization].each do |model|
++     puts "#{model}: #{model.unscoped.where.not(profile_image: [nil, ''])
++       .where.missing(:profile_image_file_attachment).count} remaining"
++   end
++   ```
++
++   All successfully copied and newly uploaded profile pictures are now served
++   by Active Storage through the existing profile-image interfaces. Profiles
++   without a picture keep the existing default-avatar behavior.
++
++Do not rename or drop the legacy columns, change their storage paths, purge
++legacy files, or disable CarrierWave in this rollout. Before or during copying,
++legacy reads must still work. Old pages, feeds, emails and external caches may
++retain CarrierWave URLs even after copying; keep those files and endpoints
++available in subsequent deploys too. Other uploaders still require CarrierWave.
++A hard kill between blob upload and attachment publication can leave an
++unattached blob, but never a broken public attachment. It does not prevent
++rerunning. Only known unpublished/failed uploads are safe to clean up while
++old profile-image URLs may still be visible; being unattached alone is not
++sufficient evidence that a profile blob is unused.
+ 
+ The migration is irreversible to prevent a schema rollback from deleting new
+ attachments. A code rollback must leave the tables and stored blobs in place.
+diff --git a/lib/tasks/profile_images.rake b/lib/tasks/profile_images.rake
+new file mode 100644
+index 0000000..267b8d0
+--- /dev/null
++++ b/lib/tasks/profile_images.rake
+@@ -0,0 +1,19 @@
++namespace :profile_images do
++  desc "Copy user and organization profile images to Active Storage (safe to rerun)"
++  task copy: :environment do
++    counts = Hash.new(0)
++    copier = ProfileImages::Copy.new
++    [User, Organization].each do |model|
++      model.unscoped.with_attached_profile_image_file.find_each do |record|
++        counts[copier.call(record)] += 1
++      rescue StandardError => e
++        counts[:failed] += 1
++        warn "#{model.name}##{record.id}: #{e.class}: #{e.message}"
++      end
++    end
++    puts "Profile images: copied=#{counts[:copied]} skipped=#{counts[:skipped]} failed=#{counts[:failed]}"
++    if counts[:failed].positive?
++      abort "Profile image copy incomplete. Fix the reported failures and rerun bin/rails profile_images:copy."
++    end
++  end
++end
+diff --git a/spec/models/concerns/profile_image_storage_spec.rb b/spec/models/concerns/profile_image_storage_spec.rb
+index 68f1bac..c592368 100644
+--- a/spec/models/concerns/profile_image_storage_spec.rb
++++ b/spec/models/concerns/profile_image_storage_spec.rb
+@@ -47,6 +47,32 @@ def legacy_record(factory, image_path)
+     expect(record.profile_image_url).to include("/rails/active_storage/blobs/redirect/")
+   end
+ 
++  it "keeps the current picture when the storage upload fails" do
++    record = create(factory)
++    previous_blob = record.profile_image_file.blob
++    url = record.profile_image_url
++    allow(ActiveStorage::Blob.service).to receive(:upload).and_raise(IOError, "storage unavailable")
++    image_path.open do |file|
++      expect { record.update!(profile_image: file) }.to raise_error(IOError)
++    end
++    expect(record.reload.profile_image_url).to eq(url)
++    expect(record.profile_image_file.blob).to eq(previous_blob)
++    expect(record.profile_image_file.download).not_to be_empty
++  end
++
++  it "replaces the copy even when the writer loaded the old association before copying" do
++    record = legacy_record(factory, image_path)
++    writer = record.class.find(record.id)
++    expect(writer.profile_image_file).not_to be_attached
++    image_path.open { |file| writer.profile_image = file }
++    ProfileImages::Copy.new.call(record)
++    copied_blob = record.reload.profile_image_file.blob
++    writer.save!
++    expect(record.reload.profile_image_file.blob).not_to eq(copied_blob)
++    expect(record.profile_image_file.download).to eq(File.binread(image_path))
++    expect(ActiveStorage::Attachment.where(record: record, name: "profile_image_file").count).to eq(1)
++  end
++
+   it "keeps the current image when a new upload is invalid" do
+     record = legacy_record(factory, image_path)
+     url = record.profile_image_url
+diff --git a/spec/models/organization_spec.rb b/spec/models/organization_spec.rb
+index 26bf4b8..e37f51e 100644
+--- a/spec/models/organization_spec.rb
++++ b/spec/models/organization_spec.rb
+@@ -38,11 +38,13 @@
+       it { is_expected.to validate_presence_of(:articles_count) }
+       it { is_expected.to validate_presence_of(:credits_count) }
+       it { is_expected.to validate_presence_of(:name) }
++
+       it "requires a profile image on a new organization" do
+         organization = build(:organization, profile_image: nil)
+         expect(organization).not_to be_valid
+         expect(organization.errors[:profile_image]).to include("can't be blank")
+       end
++
+       it { is_expected.to validate_presence_of(:slug) }
+       it { is_expected.to validate_presence_of(:spent_credits_count) }
+       it { is_expected.to validate_presence_of(:unspent_credits_count) }
+diff --git a/spec/requests/images/profile_storage_spec.rb b/spec/requests/images/profile_storage_spec.rb
+index 9323ba9..a00ccb9 100644
+--- a/spec/requests/images/profile_storage_spec.rb
++++ b/spec/requests/images/profile_storage_spec.rb
+@@ -12,6 +12,25 @@
+     expect(response.body.b).to eq(user.profile_image_file.download)
+   end
+ 
++  %i[user organization].each do |factory|
++    it "serves a copied #{factory} picture publicly and retains its original file" do
++      record = build(factory, profile_image: nil)
++      writer = ProfileImageStorage.instance_method(:profile_image=).bind(record).super_method
++      path = Rails.root.join("spec/support/fixtures/images/image1.jpeg")
++      path.open { |file| writer.call(file) }
++      record.save!
++      record.reload
++      legacy_path = record.profile_image.path
++      ProfileImages::Copy.new.call(record)
++      get URI.parse(record.reload.profile_image_url).request_uri
++      expect(response).to have_http_status(:redirect)
++      follow_redirect!
++      expect(response).to have_http_status(:ok)
++      expect(response.body.b).to eq(File.binread(path))
++      expect(File.binread(legacy_path)).to eq(File.binread(path))
++    end
++  end
++
+   it "analyzes uploaded images with the installed MiniMagick processor" do
+     user = create(:user)
+     ActiveStorage::AnalyzeJob.perform_now(user.profile_image_file.blob)
+@@ -21,6 +40,25 @@
+     expect(metadata["height"]).to be_positive
+   end
+ 
++  %i[user organization].each do |factory|
++    it "keeps published #{factory} image URLs readable after replacing their attachment" do
++      record = create(factory)
++      old_url = record.profile_image_url
++      old_bytes = record.profile_image_file.download
++      expect(record.profile_image_file.blob.metadata["profile_image"]).to be(true)
++      expect do
++        Rails.root.join("spec/support/fixtures/images/image1.jpeg").open do |image|
++          record.update!(profile_image: image)
++        end
++      end.not_to have_enqueued_job(ActiveStorage::PurgeJob)
++      expect(record.reload.profile_image_url).not_to eq(old_url)
++      get URI.parse(old_url).request_uri
++      follow_redirect!
++      expect(response).to have_http_status(:ok)
++      expect(response.body.b).to eq(old_bytes)
++    end
++  end
++
+   it "uses the attachment for resized images and article cache snapshots" do
+     user = create(:user)
+     expect(user.profile_image_90).to eq(Images::Profile.call(user.profile_image_url, length: 90))
+diff --git a/spec/services/profile_images/copy_spec.rb b/spec/services/profile_images/copy_spec.rb
+new file mode 100644
+index 0000000..6399e66
+--- /dev/null
++++ b/spec/services/profile_images/copy_spec.rb
+@@ -0,0 +1,194 @@
++require "rails_helper"
++
++RSpec.describe ProfileImages::Copy do
++  let(:image_path) { Rails.root.join("spec/support/fixtures/images/image1.jpeg") }
++
++  def legacy_record(factory)
++    record = build(factory, profile_image: nil)
++    writer = ProfileImageStorage.instance_method(:profile_image=).bind(record).super_method
++    image_path.open { |file| writer.call(file) }
++    record.save!
++    record.reload
++  end
++
++  %i[user organization].each do |factory|
++    context "with a legacy #{factory} image" do
++      it "copies the original bytes and preserves the old filename, file and URL" do
++        record = legacy_record(factory)
++        path = record.profile_image.path
++        filename = record[:profile_image]
++        old_url = record.profile_image_url
++
++        expect(described_class.new.call(record)).to eq(:copied)
++        expect(record.reload.profile_image_file.download).to eq(File.binread(image_path))
++        expect(record[:profile_image]).to eq(filename)
++        expect(File.binread(path)).to eq(File.binread(image_path))
++        expect(record.profile_image_url).not_to eq(old_url)
++        expect(record.profile_image_url).to include("/rails/active_storage/blobs/redirect/")
++        expect(record.profile_image.as_json).to eq("url" => record.profile_image_url)
++      end
++
++      it "is idempotent and does not replace an already attached image" do
++        record = legacy_record(factory)
++        copier = described_class.new
++        copier.call(record)
++        blob = record.reload.profile_image_file.blob
++        expect { copier.call(record.reload) }.not_to change(ActiveStorage::Blob, :count)
++        expect(record.reload.profile_image_file.blob).to eq(blob)
++      end
++
++      it "resumes if interrupted after publishing the attachment but before refreshing snapshots" do
++        record = legacy_record(factory)
++        article = factory == :user ? create(:article, user: record) : create(:article, organization: record)
++        column = factory == :user ? :cached_user : :cached_organization
++        copier = described_class.new
++        allow(copier).to receive(:refresh_article_images).and_raise(Interrupt)
++        expect { copier.call(record) }.to raise_error(Interrupt)
++        blob = record.reload.profile_image_file.blob
++        expect(blob.download).to eq(File.binread(image_path))
++        expect { described_class.new.call(record) }.not_to change(ActiveStorage::Blob, :count)
++        expect(record.reload.profile_image_file.blob).to eq(blob)
++        expect(article.reload.public_send(column).profile_image_url).to eq(record.profile_image_url)
++      end
++
++      it "does not validate or reprocess historical images" do
++        record = legacy_record(factory)
++        record.update_column(:name, nil)
++        expect { described_class.new.call(record.reload) }.not_to raise_error
++        expect(record.reload.profile_image_file.download).to eq(File.binread(image_path))
++        expect(record.name).to be_nil
++      end
++
++      it "keeps serving the original picture when upload fails, and retries successfully" do
++        record = legacy_record(factory)
++        url = record.profile_image_url
++        service = ActiveStorage::Blob.service
++        allow(service).to receive(:upload).and_raise(IOError, "storage unavailable")
++
++        expect { described_class.new.call(record) }.to raise_error(IOError)
++        expect(record.reload.profile_image_url).to eq(url)
++        expect(record.profile_image_file).not_to be_attached
++        allow(service).to receive(:upload).and_call_original
++        expect(described_class.new.call(record)).to eq(:copied)
++        expect(record.reload.profile_image_file.download).to eq(File.binread(image_path))
++      end
++
++      it "does not overwrite a profile picture uploaded during the copy" do
++        record = legacy_record(factory)
++        service = ActiveStorage::Blob.service
++        replacement = nil
++        allow(service).to receive(:upload).and_wrap_original do |upload, *args, **kwargs|
++          allow(service).to receive(:upload).and_call_original
++          image_path.open { |file| record.class.find(record.id).update!(profile_image: file) }
++          replacement = record.class.find(record.id).profile_image_file.blob
++          upload.call(*args, **kwargs)
++        end
++        expect(described_class.new.call(record)).to eq(:skipped)
++        expect(record.reload.profile_image_file.blob).to eq(replacement)
++        expect(ActiveStorage::Blob.where(id: replacement.id).count).to eq(1)
++      end
++
++      it "does not attach a stale source if an old application changed the filename during copying" do
++        record = legacy_record(factory)
++        service = ActiveStorage::Blob.service
++        allow(service).to receive(:upload).and_wrap_original do |upload, *args, **kwargs|
++          record.class.where(id: record.id).update_all(profile_image: "new-legacy-image.jpg")
++          upload.call(*args, **kwargs)
++        end
++        expect { described_class.new.call(record) }.to raise_error(described_class::SourceChanged)
++        expect(record.reload.profile_image_file).not_to be_attached
++      end
++
++      it "reports a missing source instead of attaching an empty file" do
++        record = legacy_record(factory)
++        File.delete(record.profile_image.path)
++        expect { described_class.new.call(record) }.to raise_error(ProfileImages::Copy::MissingSource)
++        expect(record.reload.profile_image_file).not_to be_attached
++      end
++    end
++  end
++
++  it "does not duplicate attachments when another copier publishes during the upload" do
++    record = legacy_record(:user)
++    service = ActiveStorage::Blob.service
++    allow(service).to receive(:upload).and_wrap_original do |upload, *args, **kwargs|
++      allow(service).to receive(:upload).and_call_original
++      described_class.new.call(User.find(record.id))
++      upload.call(*args, **kwargs)
++    end
++    expect { described_class.new.call(record) }.to change(ActiveStorage::Blob, :count).by(1)
++    expect(ActiveStorage::Attachment.where(record: record, name: "profile_image_file").count).to eq(1)
++  end
++
++  context "with private CarrierWave Fog storage" do
++    let(:credentials) do
++      { provider: "AWS", aws_access_key_id: "test", aws_secret_access_key: "test", region: "us-east-2" }
++    end
++    let(:connection) { Fog::Storage.new(**credentials) }
++
++    before do
++      Fog.mock!
++      connection.put_bucket("legacy-profile-images")
++      allow(ProfileImageUploader).to receive_messages(
++        storage: CarrierWave::Storage::Fog,
++        fog_credentials: credentials,
++        fog_directory: "legacy-profile-images",
++        fog_public: false,
++        asset_host: "https://example.com/remoteimages",
++      )
++    end
++
++    after { Fog.unmock! }
++
++    it "copies private objects through storage without fetching their public URLs" do
++      user = create(:user, profile_image: nil)
++      filename = "legacy-avatar.jpeg"
++      key = "uploads/user/profile_image/#{user.id}/#{filename}"
++      data = File.binread(image_path)
++      connection.put_object("legacy-profile-images", key, data, "Content-Type" => "image/jpeg")
++      user.update_column(:profile_image, filename)
++      user.reload
++      old_url = user.profile_image_url
++      expect(old_url).to include("/remoteimages/")
++      expect(described_class.new.call(user)).to eq(:copied)
++      expect(user.reload.profile_image_file.download).to eq(data)
++      expect(connection.get_object("legacy-profile-images", key).body).to eq(data)
++      expect(WebMock).not_to have_requested(:get, old_url)
++    end
++  end
++
++  it "skips profiles with neither a legacy picture nor an attachment" do
++    user = create(:user, profile_image: nil)
++    expect { described_class.new.call(user) }.not_to change(ActiveStorage::Blob, :count)
++    expect(user.reload.profile_image_file).not_to be_attached
++  end
++
++  it "does not modify an article that changed authors before its snapshot was locked" do
++    user = legacy_record(:user)
++    new_author = create(:user)
++    article = create(:article, user: user)
++    allow(user.articles).to receive(:find_each).and_yield(article)
++    article.update!(user: new_author)
++    described_class.new.call(user)
++    expect(article.reload.cached_user.profile_image_url).to eq(new_author.profile_image_url)
++  end
++
++  it "refreshes both article snapshots, including when a previous copy was interrupted after attaching" do
++    user = legacy_record(:user)
++    organization = legacy_record(:organization)
++    article = create(:article, user: user, organization: organization)
++    old_user_snapshot = article.cached_user.dup
++    copier = described_class.new
++    copier.call(user)
++    copier.call(organization)
++    article.reload
++    expect(article.cached_user.profile_image_url).to eq(user.reload.profile_image_url)
++    expect(article.cached_user.profile_image_90).to eq(user.profile_image_90)
++    expect(article.cached_organization.profile_image_url).to eq(organization.reload.profile_image_url)
++    expect(article.cached_organization.profile_image_90).to eq(organization.profile_image_90)
++
++    article.update_columns(cached_user: old_user_snapshot)
++    expect { copier.call(user.reload) }.not_to change(ActiveStorage::Blob, :count)
++    expect(article.reload.cached_user.profile_image_url).to eq(user.profile_image_url)
++  end
++end
+diff --git a/spec/tasks/profile_images_spec.rb b/spec/tasks/profile_images_spec.rb
+new file mode 100644
+index 0000000..9342e3c
+--- /dev/null
++++ b/spec/tasks/profile_images_spec.rb
+@@ -0,0 +1,46 @@
++require "rails_helper"
++
++RSpec.describe "profile_images:copy", type: :task do
++  before { Rake::Task["profile_images:copy"].reenable }
++
++  def legacy_record(factory)
++    record = build(factory, profile_image: nil)
++    writer = ProfileImageStorage.instance_method(:profile_image=).bind(record).super_method
++    Rails.root.join("spec/support/fixtures/images/image1.jpeg").open { |file| writer.call(file) }
++    record.save!
++    record.reload
++  end
++
++  it "copies users and organizations and can run again without duplicating blobs" do
++    user = legacy_record(:user)
++    organization = legacy_record(:organization)
++    tag = Rails.root.join("spec/support/fixtures/images/image1.jpeg").open do |image|
++      create(:tag, profile_image: image)
++    end
++    tag_url = tag.profile_image_url
++
++    Rake::Task["profile_images:copy"].invoke
++    expect(user.reload.profile_image_file).to be_attached
++    expect(organization.reload.profile_image_file).to be_attached
++    expect(tag.reload.profile_image_url).to eq(tag_url)
++    expect(tag.profile_image).to be_a(ProfileImageUploader)
++    Rake::Task["profile_images:copy"].reenable
++    expect { Rake::Task["profile_images:copy"].invoke }.not_to change(ActiveStorage::Blob, :count)
++  end
++
++  it "reports failures, continues copying other profiles, and retries failed profiles on rerun" do
++    missing = legacy_record(:user)
++    path = missing.profile_image.path
++    data = File.binread(path)
++    File.delete(path)
++    organization = legacy_record(:organization)
++
++    expect { Rake::Task["profile_images:copy"].invoke }.to raise_error(SystemExit)
++    expect(missing.reload.profile_image_file).not_to be_attached
++    expect(organization.reload.profile_image_file).to be_attached
++    File.binwrite(path, data)
++    Rake::Task["profile_images:copy"].reenable
++    Rake::Task["profile_images:copy"].invoke
++    expect(missing.reload.profile_image_file.download).to eq(data)
++  end
++end

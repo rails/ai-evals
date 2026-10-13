@@ -1,0 +1,445 @@
+diff --git a/docs/TEST_SUITE_PERFORMANCE.md b/docs/TEST_SUITE_PERFORMANCE.md
+new file mode 100644
+index 0000000..729b338
+--- /dev/null
++++ b/docs/TEST_SUITE_PERFORMANCE.md
+@@ -0,0 +1,149 @@
++# Test suite performance notes
++
++Living document with profiling results, decisions and plans for speeding up
++the RSpec suite. Update it after every optimization phase.
++
++Scope: system specs (`spec/system`) and streaming specs (`:streaming`) are
++excluded from all measurements (they are not run by default).
++
++Phases:
++
++1. `spec/models` — **done** (this document, phase 1)
++2. `spec/requests` — next
++3. factories (`spec/fabricators`) — later (not touched yet on purpose)
++
++## How to profile
++
++`test-prof`, `stackprof` and `ruby-prof` are in the Gemfile (`require: false`).
++
++```sh
++# Wall-clock time per example / group
++bundle exec rspec spec/models --profile 30
++
++# Sampling profiler for the whole run (open with `bundle exec stackprof <dump> --limit 40`)
++TEST_STACK_PROF=1 TEST_STACK_PROF_MODE=wall bundle exec rspec spec/models -r test-prof
++bundle exec stackprof tmp/test_prof/stack-prof-report-wall-raw-total.dump --method 'Some#method'
++
++# Time spent in inline Sidekiq jobs
++EVENT_PROF="sidekiq.inline" bundle exec rspec spec/models -r test-prof
++```
++
++NOTE: `EVENT_PROF=factory.create` reports nothing when `test-prof` is
++required via `-r` (fabrication is not loaded yet at that time); use a custom
++`ActiveSupport::Notifications`/middleware script or require test-prof from
++`rails_helper` if factory stats are needed.
++
++Small ad-hoc instrumentation scripts that were useful (load them with
++`-r ./config/environment -r /path/to/script.rb`):
++
++- SQL time aggregated by statement (`ActiveSupport::Notifications.monotonic_subscribe('sql.active_record')`)
++  → SQL itself is only ~12s of the models run, the DB is not the bottleneck.
++- Sidekiq server middleware (`Sidekiq::Testing.server_middleware`) recording
++  job class + duration, and the current example location → finds which jobs
++  run inline and which examples depend on them.
++- An `after` hook dumping `Sidekiq::Worker.jobs` while in fake mode → verifies
++  no example silently stopped running a job it depends on.
++
++## Baseline (before any changes)
++
++Environment: local container, 1 process (no parallelization), Ruby 4.0, Rails 8.1.
++
++| Group         | Examples | Time      |
++|---------------|----------|-----------|
++| `spec/models` | 1795     | **~156s** (2m36s, `Finished in`) |
++
++Top costs in the `spec/models` StackProf (wall) profile:
++
++- ~40% `ActiveRecord::LogSubscriber#sql` — SQL debug logging, mostly
++  `ActiveSupport::BacktraceCleaner` resolving the query call site, because
++  **`ActiveRecord.verbose_query_logs = true`** was set at load time by
++  `spec/models/concerns/status/fetch_replies_concern_spec.rb` (debug leftover
++  that leaked into the whole process, i.e. every spec loaded together with
++  it). The test log grew by >130MB per models run.
++- ~30% inline Sidekiq jobs (`Sidekiq.testing!(:inline)` before every example).
++  19s of 24.6s were `TriggerWebhookWorker` (3.8k jobs): every local
++  account/status/report created by a fabricator triggers the webhook worker,
++  which serializes the event with `REST::Admin::WebhookEventSerializer`, even
++  though no `Webhook` records exist in almost any spec.
++- ~7% ffmpeg/imagemagick subprocesses (media attachment specs; legitimate).
++- ~5% bcrypt (password hashing in the `:user` fabricator; Devise stretches
++  are already 1 in test → bcrypt minimum cost).
++
++## Phase 1: `spec/models` changes
++
++1. **Removed the leaking `ActiveRecord.verbose_query_logs = true`** from
++   `fetch_replies_concern_spec.rb`.
++2. **`spec/support/logging.rb`**: the test logger level defaults to `:warn`
++   (no per-query SQL formatting/writing at all — the AR log subscriber checks
++   `logger.debug?` per event). The level is changed instead of replacing the
++   logger, so specs stubbing `Rails.logger` keep working.
++   - `LOG=1` / `LOG=debug` restores debug logging to `log/test.log`
++   - `VERBOSE_QUERY_LOGS=1` additionally enables query call-site annotations
++   This is process-wide, so it also speeds up all other spec types (no
++   behaviour change for them).
++3. **Sidekiq testing mode via metadata** (`spec/rails_helper.rb`):
++   - `sidekiq: :inline` / `sidekiq: :fake` metadata selects the mode;
++   - without metadata, spec types in `SIDEKIQ_FAKE_BY_DEFAULT_TYPES`
++     (currently `%i(model)`) default to `:fake`, every other type still
++     defaults to `:inline` (unchanged behaviour);
++   - explicit `Sidekiq.testing!(:fake)` calls inside specs still work (they
++     run after the global hook);
++   - rspec-sidekiq clears `Sidekiq::Worker.jobs` before each example.
++   Groups/examples whose assertions depend on job side effects were tagged
++   `sidekiq: :inline`. They were found by recording, under the old inline
++   mode, every example that ran any job other than `TriggerWebhookWorker`
++   (or `TriggerWebhookWorker` while `Webhook` records existed — never
++   happened). That list was used instead of "whatever fails in fake mode",
++   because negative assertions (e.g. "does not deliver welcome email")
++   would silently pass in fake mode. Tagged:
++   - whole files: `account_suggestions/fasp_source`, `admin/account_action`,
++     `admin/moderation_action`, `announcement_reaction`, `announcement`,
++     `email_subscription`, `fasp/backfill_request`, `follow_request`,
++     `form/account_batch`, `terms_of_service`, `user/confirmation`
++   - `user_spec`: `#approve!`, `#reset_password!`, `#mark_email_as_confirmed!`,
++     `#active_for_authentication?`
++   - `account_spec`: `searchable`; `tag_feed_spec`: "can restrict to an account"
++   **When adding model specs relying on side effects of jobs (mails via
++   `deliver_later`, notifications, workers called from callbacks), tag them
++   with `sidekiq: :inline`.**
++
++### Result
++
++| Group         | Before | After      | Improvement |
++|---------------|--------|------------|-------------|
++| `spec/models` | ~156s  | **~55s** (54–57s over several seeds) | ~65% faster (2.8x) |
++
++Intermediate: logging fix alone → ~80–94s; + Sidekiq fake mode → ~55s.
++
++## Remaining hot spots in `spec/models` (ideas for later)
++
++- `media_attachment_spec.rb` (~6s): real ffmpeg/imagemagick processing — legit,
++  could share processed attachments with `before_all` if needed.
++- `account_statuses_cleanup_policy_spec.rb` (~4.4s / 36 ex) and
++  `tag_feed_spec.rb` (~3.8s), `trends/statuses_spec.rb` (~3.3s),
++  `public_feed_spec.rb`: big `let!` setups recreated for each example —
++  candidates for `let_it_be`/`before_all` (test-prof), but needs care with
++  time-relative data (`1.year.ago`) and examples mutating records.
++- Factories (phase 3): `Fabricate(:user)` creates an account + keypair (static test RSA keys, no generation) + 2 `login_activity` records + bcrypt
++  hashing; `:account`/`:status` cascades. Look at `FactoryProf`-like stats
++  (`EVENT_PROF=factory.create` with test-prof loaded from rails_helper).
++- GC ~7% of samples.
++
++## Notes for `spec/requests` (phase 2)
++
++- `spec/requests` baseline measured right after phase 1 (see table below);
++  `LOG=debug` approximates the original logging behaviour (the
++  verbose-query-logs leak only applied when the models spec file was loaded).
++- Start with the same recipe: StackProf + inline job breakdown. Request specs
++  still use inline Sidekiq by default; consider adding `:request` to
++  `SIDEKIQ_FAKE_BY_DEFAULT_TYPES` after finding which examples depend on jobs
++  (use the job-dependency recording approach described above).
++
++| Group           | Examples | Original behaviour (`LOG=debug`) | After phase 1 (log level `:warn`) |
++|-----------------|----------|----------------------------------|-----------------------------------|
++| `spec/requests` | 1877     | ~176s                            | ~160s                             |
++
++Overall goal: `spec/models` + `spec/requests` at least 2x faster than the
++original baseline: (156s + 176s) = ~332s → **≤ ~166s**. After phase 1 the sum
++is ~55s + ~160s = ~215s, so phase 2 needs to bring `spec/requests` to
++≤ ~110s (≈30%+ improvement on top of the logging fix).
+diff --git a/spec/models/account_spec.rb b/spec/models/account_spec.rb
+index 70d349d..cdbebfb 100644
+--- a/spec/models/account_spec.rb
++++ b/spec/models/account_spec.rb
+@@ -701,7 +701,7 @@ RSpec.describe Account do
+       end
+     end
+ 
+-    describe 'searchable' do
++    describe 'searchable', sidekiq: :inline do
+       let!(:suspended_local)        { Fabricate(:account, suspended: true, username: 'suspended_local') }
+       let!(:suspended_remote)       { Fabricate(:account, suspended: true, domain: 'example.org', username: 'suspended_remote') }
+       let!(:silenced_local)         { Fabricate(:account, silenced: true, username: 'silenced_local') }
+diff --git a/spec/models/account_suggestions/fasp_source_spec.rb b/spec/models/account_suggestions/fasp_source_spec.rb
+index 9d46b76..5a2eed6 100644
+--- a/spec/models/account_suggestions/fasp_source_spec.rb
++++ b/spec/models/account_suggestions/fasp_source_spec.rb
+@@ -2,7 +2,7 @@
+ 
+ require 'rails_helper'
+ 
+-RSpec.describe AccountSuggestions::FaspSource do
++RSpec.describe AccountSuggestions::FaspSource, sidekiq: :inline do
+   describe '#get', feature: :fasp do
+     subject { described_class.new }
+ 
+diff --git a/spec/models/admin/account_action_spec.rb b/spec/models/admin/account_action_spec.rb
+index 5339084..065a42b 100644
+--- a/spec/models/admin/account_action_spec.rb
++++ b/spec/models/admin/account_action_spec.rb
+@@ -2,7 +2,7 @@
+ 
+ require 'rails_helper'
+ 
+-RSpec.describe Admin::AccountAction do
++RSpec.describe Admin::AccountAction, sidekiq: :inline do
+   let(:account_action) { described_class.new }
+ 
+   describe '#save!' do
+diff --git a/spec/models/admin/moderation_action_spec.rb b/spec/models/admin/moderation_action_spec.rb
+index c49e7c9..57ee031 100644
+--- a/spec/models/admin/moderation_action_spec.rb
++++ b/spec/models/admin/moderation_action_spec.rb
+@@ -2,7 +2,7 @@
+ 
+ require 'rails_helper'
+ 
+-RSpec.describe Admin::ModerationAction do
++RSpec.describe Admin::ModerationAction, sidekiq: :inline do
+   subject do
+     described_class.new(
+       current_account:,
+diff --git a/spec/models/announcement_reaction_spec.rb b/spec/models/announcement_reaction_spec.rb
+index e02a8dc..0b37841 100644
+--- a/spec/models/announcement_reaction_spec.rb
++++ b/spec/models/announcement_reaction_spec.rb
+@@ -2,7 +2,7 @@
+ 
+ require 'rails_helper'
+ 
+-RSpec.describe AnnouncementReaction do
++RSpec.describe AnnouncementReaction, sidekiq: :inline do
+   describe 'Associations' do
+     it { is_expected.to belong_to(:account) }
+     it { is_expected.to belong_to(:announcement).inverse_of(:announcement_reactions) }
+diff --git a/spec/models/announcement_spec.rb b/spec/models/announcement_spec.rb
+index 884b352..c5f5db0 100644
+--- a/spec/models/announcement_spec.rb
++++ b/spec/models/announcement_spec.rb
+@@ -2,7 +2,7 @@
+ 
+ require 'rails_helper'
+ 
+-RSpec.describe Announcement do
++RSpec.describe Announcement, sidekiq: :inline do
+   describe 'Scopes' do
+     context 'with published and unpublished records' do
+       let!(:published) { Fabricate(:announcement, published: true) }
+diff --git a/spec/models/concerns/status/fetch_replies_concern_spec.rb b/spec/models/concerns/status/fetch_replies_concern_spec.rb
+index e9c81d4..b42a6dc 100644
+--- a/spec/models/concerns/status/fetch_replies_concern_spec.rb
++++ b/spec/models/concerns/status/fetch_replies_concern_spec.rb
+@@ -3,8 +3,6 @@
+ require 'rails_helper'
+ 
+ RSpec.describe Status::FetchRepliesConcern do
+-  ActiveRecord.verbose_query_logs = true
+-
+   let!(:alice)  { Fabricate(:account, username: 'alice') }
+   let!(:bob)    { Fabricate(:account, username: 'bob', domain: 'other.com') }
+ 
+diff --git a/spec/models/email_subscription_spec.rb b/spec/models/email_subscription_spec.rb
+index 3730b5c..d280d19 100644
+--- a/spec/models/email_subscription_spec.rb
++++ b/spec/models/email_subscription_spec.rb
+@@ -2,7 +2,7 @@
+ 
+ require 'rails_helper'
+ 
+-RSpec.describe EmailSubscription do
++RSpec.describe EmailSubscription, sidekiq: :inline do
+   describe '#confirmed?' do
+     it 'returns true when confirmed' do
+       subject.confirmed_at = Time.now.utc
+diff --git a/spec/models/fasp/backfill_request_spec.rb b/spec/models/fasp/backfill_request_spec.rb
+index 5ea820d..fa54b7e 100644
+--- a/spec/models/fasp/backfill_request_spec.rb
++++ b/spec/models/fasp/backfill_request_spec.rb
+@@ -2,7 +2,7 @@
+ 
+ require 'rails_helper'
+ 
+-RSpec.describe Fasp::BackfillRequest do
++RSpec.describe Fasp::BackfillRequest, sidekiq: :inline do
+   describe '#next_objects' do
+     let(:account) { Fabricate(:account) }
+     let!(:statuses) { Fabricate.times(3, :status, account:).sort_by(&:id) }
+diff --git a/spec/models/follow_request_spec.rb b/spec/models/follow_request_spec.rb
+index 237875d..cd88db5 100644
+--- a/spec/models/follow_request_spec.rb
++++ b/spec/models/follow_request_spec.rb
+@@ -2,7 +2,7 @@
+ 
+ require 'rails_helper'
+ 
+-RSpec.describe FollowRequest do
++RSpec.describe FollowRequest, sidekiq: :inline do
+   describe '#authorize!' do
+     let!(:follow_request) { Fabricate(:follow_request, account: account, target_account: target_account) }
+     let(:account)         { Fabricate(:account) }
+diff --git a/spec/models/form/account_batch_spec.rb b/spec/models/form/account_batch_spec.rb
+index 8db9a2a..c76c846 100644
+--- a/spec/models/form/account_batch_spec.rb
++++ b/spec/models/form/account_batch_spec.rb
+@@ -2,7 +2,7 @@
+ 
+ require 'rails_helper'
+ 
+-RSpec.describe Form::AccountBatch do
++RSpec.describe Form::AccountBatch, sidekiq: :inline do
+   let(:account_batch) { described_class.new }
+ 
+   describe '#save' do
+diff --git a/spec/models/tag_feed_spec.rb b/spec/models/tag_feed_spec.rb
+index 8618b67..0b7e23d 100644
+--- a/spec/models/tag_feed_spec.rb
++++ b/spec/models/tag_feed_spec.rb
+@@ -46,7 +46,7 @@ RSpec.describe TagFeed do
+       expect(results).to     include both
+     end
+ 
+-    it 'can restrict to an account' do
++    it 'can restrict to an account', sidekiq: :inline do
+       BlockService.new.call(account, status_tagged_with_cats.account)
+       results = described_class.new(tag_cats, account, none: [tag_dogs.name]).get(20)
+       expect(results).to_not include status_tagged_with_cats
+diff --git a/spec/models/terms_of_service_spec.rb b/spec/models/terms_of_service_spec.rb
+index e86b1de..57f6355 100644
+--- a/spec/models/terms_of_service_spec.rb
++++ b/spec/models/terms_of_service_spec.rb
+@@ -2,7 +2,7 @@
+ 
+ require 'rails_helper'
+ 
+-RSpec.describe TermsOfService do
++RSpec.describe TermsOfService, sidekiq: :inline do
+   describe 'Validations' do
+     subject { Fabricate.build :terms_of_service }
+ 
+diff --git a/spec/models/user/confirmation_spec.rb b/spec/models/user/confirmation_spec.rb
+index eda12e2..8e28eb0 100644
+--- a/spec/models/user/confirmation_spec.rb
++++ b/spec/models/user/confirmation_spec.rb
+@@ -2,7 +2,7 @@
+ 
+ require 'rails_helper'
+ 
+-RSpec.describe User::Confirmation do
++RSpec.describe User::Confirmation, sidekiq: :inline do
+   describe 'Scopes' do
+     let!(:unconfirmed_user) { Fabricate :user, confirmed_at: nil }
+     let!(:confirmed_user) { Fabricate :user, confirmed_at: Time.now.utc }
+diff --git a/spec/models/user_spec.rb b/spec/models/user_spec.rb
+index 3a1964b..f38e105 100644
+--- a/spec/models/user_spec.rb
++++ b/spec/models/user_spec.rb
+@@ -220,7 +220,7 @@ RSpec.describe User do
+     end
+   end
+ 
+-  describe '#approve!' do
++  describe '#approve!', sidekiq: :inline do
+     subject { user.approve! }
+ 
+     before do
+@@ -445,7 +445,7 @@ RSpec.describe User do
+     end
+   end
+ 
+-  describe '#reset_password!' do
++  describe '#reset_password!', sidekiq: :inline do
+     subject(:user) { Fabricate(:user, password: original_password) }
+ 
+     let(:original_password) { 'foobar12345' }
+@@ -493,7 +493,7 @@ RSpec.describe User do
+     end
+   end
+ 
+-  describe '#mark_email_as_confirmed!' do
++  describe '#mark_email_as_confirmed!', sidekiq: :inline do
+     subject { user.mark_email_as_confirmed! }
+ 
+     let!(:user) { Fabricate(:user, confirmed_at: confirmed_at) }
+@@ -527,7 +527,7 @@ RSpec.describe User do
+     end
+   end
+ 
+-  describe '#active_for_authentication?' do
++  describe '#active_for_authentication?', sidekiq: :inline do
+     subject { user.active_for_authentication? }
+ 
+     let(:user) { Fabricate(:user, disabled: disabled, confirmed_at: confirmed_at) }
+diff --git a/spec/rails_helper.rb b/spec/rails_helper.rb
+index a91461b..2ddf5b5 100644
+--- a/spec/rails_helper.rb
++++ b/spec/rails_helper.rb
+@@ -28,6 +28,10 @@ WebMock.disable_net_connect!(
+ )
+ Sidekiq.default_configuration.logger = nil
+ 
++# Spec types in which Sidekiq jobs are NOT executed inline by default
++# (use `sidekiq: :inline` metadata to opt-in where job side effects matter)
++SIDEKIQ_FAKE_BY_DEFAULT_TYPES = %i(model).freeze
++
+ DatabaseCleaner.strategy = [:deletion]
+ 
+ Devise::Test::ControllerHelpers.module_eval do
+@@ -105,8 +109,20 @@ RSpec.configure do |config|
+     self.use_transactional_tests = true
+   end
+ 
+-  config.before do
+-    Sidekiq.testing!(:inline)
++  # Sidekiq testing mode can be set per example group via metadata:
++  #   `sidekiq: :inline` - jobs are executed immediately (synchronously)
++  #   `sidekiq: :fake`   - jobs are only pushed to `Sidekiq::Worker.jobs`
++  #
++  # Spec types listed in SIDEKIQ_FAKE_BY_DEFAULT_TYPES default to `:fake`
++  # (running every enqueued job inline, e.g. TriggerWebhookWorker for every
++  # created account/status, was ~30% of the model specs run time); all others
++  # still default to `:inline`. See docs/TEST_SUITE_PERFORMANCE.md.
++  config.before do |example|
++    Sidekiq.testing!(
++      example.metadata.fetch(:sidekiq) do
++        SIDEKIQ_FAKE_BY_DEFAULT_TYPES.include?(example.metadata[:type]) ? :fake : :inline
++      end
++    )
+   end
+ 
+   config.before :each, type: :cli do
+diff --git a/spec/support/logging.rb b/spec/support/logging.rb
+new file mode 100644
+index 0000000..2f02d54
+--- /dev/null
++++ b/spec/support/logging.rb
+@@ -0,0 +1,24 @@
++# frozen_string_literal: true
++
++# Logging is one of the most expensive "hidden" costs of the test suite:
++# with the default `:debug` level every SQL query is formatted (and, with
++# `verbose_query_logs`, its caller location is resolved through the backtrace
++# cleaner) and written to `log/test.log`. That used to take ~40% of the total
++# `spec/models` run time.
++#
++# By default we only log warnings and errors. Set `LOG=1` (or `LOG=debug`) to
++# get full debug logs back (e.g. when investigating a failing spec), and
++# `VERBOSE_QUERY_LOGS=1` to also annotate queries with their call sites.
++#
++# NOTE: we change the level instead of replacing the logger with a null one,
++# so specs stubbing/inspecting `Rails.logger` keep working.
++log_level = ENV.fetch('LOG', nil)
++
++if log_level.blank? || log_level == '0'
++  Rails.logger.level = :warn
++  ActiveRecord::Base.logger&.level = :warn
++else
++  Rails.logger.level = log_level == '1' ? :debug : log_level.to_sym
++end
++
++ActiveRecord.verbose_query_logs = ENV['VERBOSE_QUERY_LOGS'].present?

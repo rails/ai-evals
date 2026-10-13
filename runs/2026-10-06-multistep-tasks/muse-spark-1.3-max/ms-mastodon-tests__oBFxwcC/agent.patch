@@ -1,0 +1,1017 @@
+diff --git a/docs/rspec-optimization.md b/docs/rspec-optimization.md
+new file mode 100644
+index 0000000..f38730a
+--- /dev/null
++++ b/docs/rspec-optimization.md
+@@ -0,0 +1,546 @@
++# RSpec Suite Optimization Notes
++
++## Baseline (2026-10-06, before models optimization)
++
++- Command: `bundle exec rspec spec/models --profile 20`
++- Result: **1795 examples, 0 failures, Finished in 2 minutes 42.5 seconds** (files took 2.62s to load)
++- Seed: 31864
++- Environment: Ruby 4.0.6, Rails test env, PostgreSQL 17, Redis 6379, no parallelization, CI=eager_load false locally.
++
++### Top 20 slowest examples (27.98s, 17.2% of total)
++- Trends::Statuses#refresh decays scores — 3.4s
++- Trends::Statuses#refresh returns correct statuses — 3.24s
++- MediaAttachment mp3 with large cover art — 2.63s
++- Trends::Statuses Query #filtered_for x4 — 1.28-1.63s each
++- AccountStatusesCleanupPolicy#statuses_to_delete x10 — ~0.9-1.18s each
++- Notification paginate/preload — ~1.0-1.08s each
++
++### Top slowest groups (avg per example)
++- Trends::Statuses: 1.12s avg (13.42s / 12 ex)
++- AccountSuggestions::FriendsOfFriendsSource: 0.49s avg
++- Status::ThreadingConcern: 0.44s avg (7.07s / 16 ex)
++- AccountStatusesCleanupPolicy: 0.43s avg (15.5s / 36 ex)
++- TagFeed: 0.388s avg (12.82s / 33 ex)
++- MediaAttachment: 0.266s avg (7.18s / 27 ex)
++- Notification: 0.31s avg (7.76s / 25 ex)
++
++### Per-file spot checks (without optimization)
++- spec/models/account_spec.rb (122 ex): ~3.98-4.32s
++- spec/models/status_spec.rb (62 ex): ~7.27-7.63s
++- spec/models/media_attachment_spec.rb (27 ex): ~6.95s
++- spec/models/user_spec.rb (72 ex): ~3.26s
++- spec/models/account_statuses_cleanup_policy_spec.rb (36 ex): ~8.6s
++- spec/models/tag_feed_spec.rb (33 ex): ~7.83s
++- spec/models/trends/statuses_spec.rb (12 ex): ~8.22s
++
++## Profiling method
++- Used `stackprof` gem (wall mode, interval 1000) via `--require /tmp/stackprof_helper.rb` on individual model files.
++- Example helper:
++  ```ruby
++  require 'stackprof'
++  StackProf.start(mode: :wall, out: '/tmp/stackprof.dump', interval: 1000)
++  RSpec.configure { |c| c.after(:suite) { StackProf.stop; StackProf.results('/tmp/stackprof.dump') } }
++  ```
++- Analyzed with `StackProf::Report`.
++
++## Key findings (shared bottlenecks)
++
++### 1. TriggerWebhookWorker inline execution dominates (~23-33% of wall time)
++- `rails_helper.rb` sets `Sidekiq.testing!(:inline)` globally before each test.
++- Every `Fabricate(:account)` → `Fabricate(:user)` triggers `User#trigger_webhooks` → `TriggerWebhookWorker.perform_async('account.created', ...)`.
++- Every `Fabricate(:status)` triggers `Status#trigger_create_webhooks` → `TriggerWebhookWorker.perform_async('status.created', ...)`.
++- With `:inline`, each `perform_async` immediately executes `TriggerWebhookWorker#perform` → `WebhookService#call` → `WebhookService#serialize_event` → ActiveModelSerializers + JSON.
++- StackProf for `tag_feed_spec.rb`: 23.2% in `Sidekiq::TestingClient#atomic_push` → `TriggerWebhookWorker#perform` (19.6% in AMS serialization).
++- For `account_statuses_cleanup_policy_spec.rb`: 27.7% in webhook path, 25.3% in `WebhookService#call`.
++- For `trends/statuses_spec.rb`: 33.7% in webhook path.
++- Note: `Status` fabricator also creates a `Bookmark` per status (after_create), whose own `account`+`user` cascade triggers additional `account.created` webhooks — amplifying the cost. Factories are out of scope for this phase, but stubbing webhooks mitigates the cascade cost.
++- Model specs that assert webhooks already stub `TriggerWebhookWorker.perform_async` with `allow(...).to receive` (e.g., `user_spec.rb`, `user/confirmation_spec.rb`, `follow_request_spec.rb`, `relay_spec.rb`), so global stub is safe. Specs asserting enqueues (`FASP`, `CacheBuster`, `Admin::AccountAction`) explicitly set `Sidekiq.testing!(:fake)`, also safe.
++- No model spec was found to rely on inline webhook side effects (no `Webhook` records created in model specs that would need delivery; `webhook_spec.rb` only tests model validations/callbacks, not delivery).
++
++**Fix direction**: Default `type: :model` specs to `Sidekiq.testing!(:fake)` (or stub `TriggerWebhookWorker.perform_async`) with opt-in tag `sidekiq_inline: true` for specs needing inline. Clear `Sidekiq::Worker` jobs after each model test when using fake to avoid pollution.
++
++Spot-test with `allow(TriggerWebhookWorker).to receive(:perform_async)` for `type: :model`:
++- tag_feed: 7.83s → 5.27s (-32.6%)
++- cleanup_policy: 8.6s → 5.81s (-32%)
++- trends/statuses: 8.22s → 4.65s (-43%)
++- account: 4.32s → 3.39s (-21%)
++- status: 7.27s → 5.09s (-30%)
++- user: 3.26s → 2.81s (-14%)
++- media_attachment: 6.95s → 7.17s (no change, as expected — no webhooks)
++- rule: no change (light file)
++
++### 2. ActiveRecord logging overhead (~6-8%)
++- `ActiveRecord::LogSubscriber#sql` + `ActiveSupport::LogSubscriber#call` + `BroadcastLogger` visible in profiles (6-7% for AR SQL logging alone, plus AMS logging which disappears with webhook fix).
++- Test env uses default debug logging to `log/test.log`; every SQL + AMS render logs.
++- Potential: silence AR logger or raise log level for `type: :model` (verify no spec asserts on logs).
++
++### 3. Paperclip / media processing for non-media specs (~2% + FS I/O)
++- `Paperclip::Attachment#assign` + `post_process` ~2% in cleanup_policy (1 media per test). Heavier in `status_spec.rb` ordered_attachments (4 medias) and `avatar`/`header` specs.
++- `media_attachment_spec.rb` needs real processing (tests metadata, transcoding, blurhash, ffmpeg). Other model specs use media attachments only as associated records (e.g., `status_with_media` in cleanup policy) and do not assert on processed file metadata.
++- Potential: stub Paperclip processing globally for models except tagged specs (e.g., `:attachment_processing`).
++
++### 4. Minor / investigated but low value
++- `redis.del(redis.keys)` + `Rails.cache.clear` after each test: benchmarked <1ms per test (<2s total for 1795 tests). `flushdb` vs `del(keys)` similar for small key counts; not a major win. Still worth using `flushdb` for correctness/speed.
++- `Rails.application.reload_routes_unless_loaded` per test: cheap (`execute_unless_loaded`).
++- `allow(Resolv::DNS).to receive(:open)` per test: cheap.
++- `Faker` (~2-3%): `Faker::Base.translate` etc. in account/user/tag fabricators. Small; optimizing would touch factory behavior — deferred to factories phase.
++- `Chewy.strategy(:bypass)` already set; Chewy overhead ~1%.
++- `Mastodon::Snowflake` ~1%.
++- `Fabricate(:status)` → `Fabricate(:bookmark)` cascade + `Fabricate(:user)` → 2x `login_activity` cascade: major DB cost (74% in `Fabricate.create`), but explicitly out of scope for models phase (“do not touch factories yet”). Deferred to factories phase. Webhook stub already mitigates part of cascade cost.
++- `Bootsnap` 6% is load-time only.
++
++## Plan for models phase (no factory edits, no other spec types)
++1. Change `spec/rails_helper.rb`:
++   - Default `Sidekiq.testing!` to `:fake` for `type: :model` unless `sidekiq_inline: true` tag; keep `:inline` for other types.
++   - Stub `TriggerWebhookWorker.perform_async` for models (belt-and-braces, avoids even fake enqueue cost; still allows `have_received` assertions where specs already stub).
++   - Clear Sidekiq jobs after each model test.
++   - Optionally silence AR logging for models and stub Paperclip for non-media models with opt-in tag.
++2. Verify: run representative model files + full `spec/models` once; ensure 0 failures and ≥30-35% speedup.
++3. Keep changes minimal per-example: only add tags where needed for inline/paperclip.
++
++## Future (requests phase + factories phase)
++- Factories: remove `status → bookmark` after_create, reduce `user → 2x login_activity`, consider `build` vs `create` where associations not needed, optimize `Faker` usage.
++- Requests: re-evaluate Sidekiq inline needs (requests likely need inline for some flows); consider similar tagging.
++- Media: evaluate `Paperclip` stub strategy for requests as well.
++
++## Optimization applied (models phase, 2026-10-06)
++
++### Changes (4 files, no factories, no app code, no other spec types)
++
++1. **`spec/rails_helper.rb`** (config-level, scoped to `type: :model`):
++   - `Sidekiq.testing!`: `:fake` for models by default, `:inline` otherwise. Opt-in inline via `sidekiq_inline: true` tag.
++     ```ruby
++     config.before do |example|
++       if example.metadata[:type] == :model && !example.metadata[:sidekiq_inline]
++         Sidekiq.testing!(:fake)
++       else
++         Sidekiq.testing!(:inline)
++       end
++     end
++     ```
++   - Stub `TriggerWebhookWorker.perform_async` for models (avoids even fake-enqueue JSON + Queues overhead; still allows `have_received` in specs that explicitly stub):
++     ```ruby
++     config.before(:each, type: :model) do |example|
++       allow(TriggerWebhookWorker).to receive(:perform_async) unless example.metadata[:sidekiq_inline]
++     end
++     config.after(:each, type: :model) { Sidekiq::Worker.clear_all }
++     ```
++   - Silence `ActiveRecord::Base.logger` (set to `nil` during example, restore after) for models. Leaves `Rails.logger` intact. Opt-out via `enable_logging: true`.
++   - `redis.flushdb` instead of `redis.del(redis.keys)` for models (equivalent on dedicated test DB, faster/atomic).
++
++2. **Tags added** (only to preserve correctness for email specs that rely on Sidekiq inline via ActiveJob `:sidekiq` adapter + `capture_emails`):
++   - `spec/models/user_spec.rb`: `describe '#mark_email_as_confirmed!', sidekiq_inline: true`
++   - `spec/models/email_subscription_spec.rb`: `it 'generates token...', sidekiq_inline: true`
++   - `spec/models/admin/account_action_spec.rb`: `it 'sends email...', sidekiq_inline: true`
++   - No assertions changed. These 3 specs use `deliver_later` (Sidekiq) + `capture_emails` which requires inline (since `perform_enqueued_jobs` is no-op with `:sidekiq` adapter).
++
++### Why this is safe
++- Model specs asserting webhooks already stub `TriggerWebhookWorker` (`user_spec#approve!`, `user/confirmation_spec`, `follow_request`, `relay`); global stub is compatible (double `allow` before example, `have_received(...).with(...)` still checks matching args).
++- No model spec asserts `enqueue_sidekiq_job(TriggerWebhookWorker)`; FASP/CacheBuster/Suspension specs explicitly use `:fake` and assert other workers — still pass with global fake.
++- `ActiveRecord::Base.logger = nil` does not affect `Rails.logger` (separate reference after assignment); only `remotable_spec` asserts on `Rails.logger.debug` and still passes.
++- `flushdb` vs `del(keys)`: same effect on isolated test DB (DB 1).
++- Other spec types (`type != :model`) keep exact previous behavior (`:inline`, `del(keys)`, logging).
++
++### Results (after)
++- Command: `bundle exec rspec spec/models` (same env)
++- Run 1: **1795 examples, 0 failures, Finished in 58.9s** (seed 60129)
++- Run 2: **1795 examples, 0 failures, Finished in 57.97s** (seed 24293)
++- Baseline: 162.5s → **~58s, -64% time, 2.8x speedup** (target was -30-35%).
++- Per-group improvements (from `--profile 20`):
++  - Trends::Statuses: 13.42s → 3.49s (-74%, 1.12s → 0.29s avg)
++  - AccountStatusesCleanupPolicy: 15.5s → 4.53s (-71%)
++  - TagFeed: 12.82s → 4.38s (-66%)
++  - Status::ThreadingConcern: 7.07s → 2.18s (-69%)
++  - Notification: 7.76s → 1.97s (-75%)
++  - Status: ~7.6s → 4.23s (-44%)
++  - Account: ~4.3s → 2.9s (-32%)
++  - MediaAttachment: 7.18s → 6.75s (-6%, as expected — no webhooks; now the dominant group, needs real Paperclip/ffmpeg)
++- Spot checks all 0 failures, including FASP, follow_request, relay, confirmation, remotable, webhook, user, email_subscription, account_action.
++
++### Investigated but NOT applied (low value / out of scope)
++- Paperclip `post_process` stub for non-media models: ~2% in profiles, spot-test showed no measurable gain (VIPS in-process is fast for `attachment.jpg`; only media specs need real processing). Skipped to minimize risk.
++- `Faker` optimization: 2-3% but touches factory behavior — deferred to factories phase.
++- `Fabricate(:status)` → `bookmark` + `Fabricate(:user)` → 2x `login_activity` cascades: major DB cost (74% in `Fabricate.create`) but explicitly out of scope (“do not touch factories yet”). Webhook stub already mitigates cascade’s webhook part. Revisit in factories phase.
++- Global `ActiveJob` adapter switch to `:test` for models: would fix email specs without tags, but broader behavior change; tagging 3 specs is more minimal and preserves Sidekiq semantics.
++
++### Tags for future runs
++- `sidekiq_inline: true` — use for any model spec that needs real Sidekiq inline (e.g., `capture_emails` with `deliver_later` via `:sidekiq` adapter, or assertions on worker side effects like Redis merges). Currently used in 3 email specs.
++- `enable_logging: true` — opt out of AR log silencing if a future model spec needs to assert on SQL logs (none currently).
++- Full `spec/models` is now ~58s (was 162s). Combined `models + requests` 2x speedup goal is well underway; requests phase should re-evaluate Sidekiq needs (requests likely need inline for more flows) and consider similar tagging rather than blanket fake.
++
++
++---
++
++## Requests phase (2026-10-06, before requests optimization)
++
++### Baseline for `spec/requests` (after models optimization, requests unaffected)
++
++- Total: `bundle exec rspec spec/requests --dry-run` → **1877 examples** (vs 1795 in models).
++- Models optimizations were scoped to `type: :model` only, so requests timing before requests work equals original baseline (before any optimization).
++- Full `spec/requests` not run (would timeout in this env, ~4-5 min estimated). Spot checks below are 2-run averages unless noted, same env as models baseline (Ruby 4.0.6, PG 17, Redis, `CI` unset locally so `eager_load false`).
++
++#### Per-file spot checks (baseline, no requests optimization)
++
++- `spec/requests/api/v1/accounts_spec.rb` (39 ex): **3.25s**
++- `spec/requests/api/v1/notifications_spec.rb` (22 ex): **7.90s** (heavy: `PostStatusService` + `FollowService` + `FavouriteService` in `before`, triggers Distribution/FanOut/Notify/Mailer inline)
++- `spec/requests/api/v1/statuses_spec.rb` (36 ex): **4.81s**
++- `spec/requests/api/v1/timelines/home_spec.rb` (6 ex): **1.96s**
++- `spec/requests/api/v1/favourites_spec.rb` (4 ex): **1.44s**
++- `spec/requests/api/v1/conversations_spec.rb` (4 ex): **2.11s**
++- `spec/requests/api/v1/blocks_spec.rb` (5 ex): **1.42s**
++- `spec/requests/admin/accounts_spec.rb` (15 ex): **1.57s**
++- `spec/requests/api/v1/media_spec.rb` (18 ex): **3.07s** (Paperclip/VIPS)
++- `spec/requests/api/v2/search_spec.rb` (15 ex): **1.97s**
++- `spec/requests/api/v1/timelines/list_spec.rb`: **1.35s**
++- `spec/requests/api/v1/follow_requests_spec.rb` (7 ex): **2.18s**
++
++12 files total baseline: **33.03s** (154 ex).
++
++#### Per-folder spot checks (baseline, single runs)
++
++- `spec/requests/api/v1/accounts` (53 ex): **5.60s**
++- `spec/requests/api/v1/timelines` (43 ex): **10.78s** (0.25s avg, heavy: follows + `PostStatusService` + reblogs)
++- `spec/requests/api/v1/statuses` (75 ex): **8.79s**
++- `spec/requests/admin` (91 ex): **5.96s**
++- `spec/requests/api/v2` (112 ex): **16.22s**
++- `spec/requests/activitypub` (108 ex): **28.00s** (0.26s avg, heavy: many Fabricates + signed requests)
++- `spec/requests/auth` (17 ex): **1.81s** (light)
++- `spec/requests/settings` (49 ex): **2.38s** (light, HTML)
++
++8 folders total baseline: **79.54s** (548 ex, 29% of requests). Weighted avg ~0.145s/ex. Extrapolated full requests baseline ~220-270s (4-4.5 min). Combined `models + requests` original baseline ~380-430s; after models opt (~58s) + before requests opt, combined ~280-330s.
++
++### Profiling method (requests)
++
++- Same `stackprof` wall mode as models, but with load-excluded helper to avoid Bootsnap/require noise:
++  ```ruby
++  require 'stackprof'
++  RSpec.configure do |c|
++    c.before(:suite) { StackProf.start(mode: :wall, interval: 1000) }
++    c.after(:suite) { StackProf.stop; File.open('/tmp/stackprof.dump','wb'){|f| f.write(Marshal.dump(StackProf.results)) } }
++  end
++  ```
++  Run via `bundle exec rspec <file> --require /tmp/stackprof_helper2.rb`, analyze with `StackProf::Report` sorted by `total_samples` and `samples` (self).
++- Important: `Chewy::Railtie::RequestStrategy#call`, `SignedRequestHelpers#post`, `OmniAuth::Builder#call` show high *total* (~18-37%) but negligible *self* — they are wrappers containing the request, not overhead. `Chewy::Strategy::Mastodon#leave` self is 1 sample (negligible) even though it does `RedisConnection.with + pipelined` per request; stash is empty when `Chewy.enabled? false`, but `leave` still runs — still negligible in profiles, not worth optimizing.
++- Targeted experiments via `--require` stubs to measure incremental gains (2-run averages):
++  - `allow(TriggerWebhookWorker).to receive(:perform_async)` for `type: :request`
++  - `ActiveRecord::Base.logger = nil` around `type: :request`
++  - `allow_any_instance_of(NotifyService).to receive(:send_email!)` then prepend module (lower overhead)
++  - Misc workers (`LinkCrawlWorker`, `PushUpdateWorker`, `DeliveryWorker`, `MergeWorker`, `FeedInsertWorker`) — negligible, not applied.
++  - AMS instrumentation disable, Devise mailer stub, Rails logger level — investigated, see below.
++
++### Key findings (requests, shared bottlenecks)
++
++#### 1. `TriggerWebhookWorker` inline execution (~8-12% wall, shared by all Fabricate-heavy specs)
++
++- Same mechanism as models: `Fabricate(:account)` → `Fabricate(:user)` → `User#trigger_webhooks` → `TriggerWebhookWorker.perform_async('account.created', ...)`; `Fabricate(:status)` → `'status.created'`. With `:inline`, each executes `WebhookService#call` → `serialize_event` → AMS + JSON.
++- StackProf (load-excluded):
++  - `accounts_spec`: `TriggerWebhookWorker#perform` 12.0% total, `WebhookService#call` 11.0%, AMS `instrument_rendering` 10.5%.
++  - `notifications_spec` (with load): webhook 11.0%, `WebhookService` 10.4%.
++  - `favourites_spec` (light): webhook 6.7%, AMS 6.4%.
++- Lower than models (23-33%) because requests also have Distribution/Notify/Mailer costs diluting the share, but still significant and shared (971 `Fabricate` calls in requests, 198 `account/user/status`).
++- Spot-test stub alone (2-run avg):
++  - accounts 3.25→2.75 (-11.8%), notifications 7.90→6.81 (-16.3% in early single-run; stable -15-16%), statuses 4.81→3.76? (combined, see below), home 1.96→1.68 (-12.9%).
++- Safety: No request spec asserts webhook delivery. `grep -rn TriggerWebhook|have_enqueued.*Webhook spec/requests` → only `admin/webhooks_spec.rb` (CRUD, not delivery). Specs asserting other workers (`BootstrapTimelineWorker`, `UpdateDistributionWorker`, `RemovalWorker`, `Fasp::*`, etc.) explicitly set `Sidekiq.testing!(:fake)` then `have_enqueued_sidekiq_job` — unaffected by webhook-only stub. `activitypub/inboxes_spec` stubs `FollowersSynchronizationWorker` locally with `allow(...).to receive` + `have_received` — compatible with global webhook stub (different worker).
++
++#### 2. `ActiveRecord` SQL logging (~7-9% wall, shared)
++
++- `ActiveRecord::LogSubscriber#sql` total 6.35% (load-excluded, accounts), `BroadcastLogger` total 19% (includes AR + Cache + ActionController + Chewy). `IO#write` self 1.79% (file writes to `log/test.log`).
++- Log size check for `accounts_spec` (39 ex): 1.6M, 7242 lines baseline (2491 SQL, 1065 Cache, 149 Started/Processing/Completed, 78 Chewy). With `AR.logger=nil`: 336K, 4228 lines, 33 SQL (load only), time 3.21→3.04 (-5% single run, -7-9% avg).
++- With `Rails.logger.level=FATAL` (silences all, same BroadcastLogger object): 8.9K, 42 lines, time 3.25→2.82 (-13% single run) vs AR-only 2.89 (-11%). Extra 2% from Cache/Chewy silencing is within variance and risks breaking future `Rails.logger` assertions. Models precedent leaves `Rails.logger` intact (for `remotable_spec`); requests has no `Rails.logger` assertions (`grep -rn Rails.logger spec/requests` → none), but keep same `AR.logger=nil` approach for consistency and safety.
++- Spot-test AR-nil alone:
++  - accounts 3.25→2.89 (-7.4%), notifications 7.90→7.44 (-8.6%), statuses 4.81→4.27 (-9.5%), home 1.96→1.76 (-8.8%).
++- Combined webhook+AR (2-run avg): accounts 2.74 (-15.7%), notifications 6.31 (-20.1%), statuses 3.76 (-21.8%), home 1.70 (-13.3%). Total 17.92→14.51s (-19%) for 4 files. Need ~10% more for 30%.
++
++#### 3. `NotifyService#send_email!` via `deliver_later` inline (~13-19% in notification-heavy specs, zero in others, but safe globally)
++
++- Chain: `PostStatusService`/`FollowService`/`ReblogService`/`FavouriteService` in `before` blocks → `DistributionWorker` inline → `FanOutOnWriteService` → `LocalNotificationWorker` inline → `NotifyService#call` → `send_email!` → `NotificationMailer.with(...).type.deliver_later(wait: 2.minutes)` → Sidekiq inline ignores `wait`/`at` (see `Sidekiq::TestingClient#atomic_push` → `process_job` without `at` check) → `MailDeliveryJob#perform` → `deliver_now` → Premailer + rendering + `mail.deliver`.
++- StackProf `notifications_spec`: `LocalNotificationWorker#perform` 22.4%, `NotifyService#call` 21.5%, `DistributionWorker#perform` 17.6%, `FanOutOnWriteService#call` 17.2%, `NotifyService#send_email!` 13.6%, `ActionMailer::MessageDelivery#deliver_later` 13.6%, `MailDeliveryJob#perform` 13.0%, `deliver_now` 13.0%.
++- Only 8 files use `PostStatusService`/`FollowService` directly (`notifications_spec` v1+v2, `conversations_spec`, `follow_requests_spec`, `timelines/home|list|tag_spec`, `statuses/favourites|reblogs_spec`), but those are among the heaviest (notifications 7.9s, timelines 10.78s for 43 ex, etc.). Stubbing email globally helps heavy files a lot without hurting light files (no-op when no notifications).
++- Spot-test `allow_any_instance_of(NotifyService).to receive(:send_email!)` alone:
++  - notifications 7.90→6.38 (-19.2%), accounts 3.25→3.11 (-4.3%), home 1.96→2.06 (+5% overhead, within variance, due to `allow_any_instance` cost when no emails).
++- Combined webhook+AR+email (prepend, no RSpec mock overhead): notifications 7.90→4.79 (-39.4%), accounts 3.25→2.60 (-20%), conversations 2.11→1.59 (-24.6%), follow_requests 2.18→1.42 (-34.9%), statuses 4.81→3.69 (-23.3%). 12 files total 33.03→24.16s (-26.9%).
++- Safety: No request spec asserts `NotificationMailer`. `grep -rn NotificationMailer spec/requests` → none. `capture_emails` in requests only for `AdminMailer` (account_actions, reports) and empty-check (admin confirmations) — different code paths (`Admin::AccountAction`, `ReportService`, not `NotifyService`). Service specs (`notify_service_spec`) test `NotifyService` directly with `capture_emails` — our stub checks `metadata[:type]==:request`, so service specs (type `:service`) still call `super` and pass (verified: 61 ex, 0 failures).
++- Implementation choice: prepend module with `RSpec.current_example` metadata check, not `allow_any_instance_of`, to avoid per-test mock overhead for files with no emails. Prepend once in `before(:suite)`; check is cheap (thread-local + hash lookup) vs mailer cost (rendering + Sidekiq + file I/O).
++
++#### 4. Minor / shared but small
++
++- `redis.del(redis.keys)` + `Rails.cache.clear` after each: <1ms per test as in models. `flushdb` equivalent on dedicated test DB (DB 1), faster/atomic. Extended to requests for consistency.
++- `Sidekiq::Worker.clear_all` after each request: prevents fake-queue pollution between tests that explicitly use `:fake` (e.g., `interaction_policies_spec` with `to_not have_enqueued`, `confirmations_spec` with `to_not`). Clearing after inline tests is no-op. Negligible cost, safety win.
++- `Faker` 4-7% total (e.g., `favourites_spec` 7.4%), `I18n` similar — factory behavior, deferred to factories phase per instructions.
++- `BCrypt` 1.95% self (accounts) — already minimal (`stretches 1` in test), not worth touching.
++- `PG exec` 12.4% self (accounts) — necessary DB work.
++- `GC marking` 11% self — reduced indirectly by webhook/email stubs (fewer AMS objects, fewer mail objects).
++
++### Investigated but NOT applied (low value / risky / out of scope)
++
++- `LinkCrawlWorker` + `PushUpdateWorker` + `ActivityPub::DeliveryWorker` stub: negligible (notifications 7.90→7.98, accounts 3.25→3.14, statuses 4.81→4.87). `LinkCrawlWorker#perform` 0.2% in notifications (no URLs in `Lorem ipsum` statuses). `ActivityPub::DistributionWorker` 2.5% (local-only, no remote followers). `PushUpdateWorker` (streaming, excluded) negligible. Skipped.
++- `MergeWorker` + `FeedInsertWorker` stub: no gain (notifications 7.86 vs 7.90). Timelines still pass with `FeedInsert` stubbed (fallback to DB? `HomeFeed`?), but no time saved (few followers → few inserts). Skipped to avoid risk for timelines that might need feeds.
++- `User#send_devise_notification` (Devise confirmation emails via `AppSignUpService`): 5.4% in `accounts_spec` (`Devise::Confirmable#send_confirmation_instructions` → `User#send_devise_notification` → `render_and_send_devise_message` → `deliver_later` inline). Spot-test with prepend + AMS disable gave accounts 3.25→2.37 (-27% vs -20% without), but average across 12 files worsened slightly (24.16→25.22s, +4% variance/overhead). Only `POST /api/v1/accounts` specs trigger it (few files). Skipped to minimize risk (admin confirmations resend uses same path; though current test only checks empty case, future success-case tests would need tag).
++- `ActiveModelSerializers` instrumentation disable (`notify_render` + `tag_logger` → `yield`): `AMS::Logging` already unsubscribed (`config/initializers/active_model_serializers.rb` unsubscribes `RENDER_EVENT`), but `instrument` + `tagged` wrappers still cost ~10% total (accounts) / 13.9% (notifications) for every serialization (webhook + API responses). Spot-test disable alone: accounts 3.25→3.11 (-4.3%), notifications 7.90→8.14 (+3% variance). Requires monkey-patching gem (`module_eval`), global effect, small average gain. Skipped; webhook stub already removes webhook serializations, API response serializations are necessary and their `instrument` overhead is smaller than file I/O.
++- `Rails.logger.level=FATAL` for all (vs `AR.logger=nil`): silences Cache (1553 lines for accounts) + Chewy + ActionController in addition to SQL, log 1.6M→8.9K (-99%), but time 2.89→2.82 (-2% extra, within variance). Cache log file writes are cheap vs SQL. Kept `AR.logger=nil` only for consistency with models and to leave `Rails.logger` intact for any future assertions.
++- `Chewy.request_strategy=:bypass` for tests: `Mastodon#leave` self 1 sample (negligible) even though it does Redis `pipelined` per request when disabled. `Chewy.strategy` 21-37% total is wrapper, not overhead. Skipped.
++- `Rack::Attack` disable: in test, cache is `:memory_store` (not Redis), `IpBlock.blocked?` uses `Rails.cache.fetch` (DB once, then memory). Per-request overhead small. Skipped.
++- `Paperclip` stub for requests: only 10 files use `media_attachment`; those that do need real processing (`media_spec` asserts `have_attached_file`, `statuses_spec` DELETE asserts `url: %r{/system/media_attachments/files/}`, `credentials_spec` asserts `avatar: exist`). Previous models finding (2%, no gain for non-media) applies. Skipped.
++- Global `Sidekiq.testing!(:fake)` for requests (like models): would save Distribution/FanOut (17% in notifications) but break setup that needs inline side effects (`notifications_spec` needs `LocalNotificationWorker` inline to create `Notification` rows for `GET` to return; `timelines/home_spec` needs `Distribution` inline for feeds). Would require tagging 8+ files with `sidekiq_inline` and careful per-example analysis. Instead, kept `:inline` for requests and stubbed only unneeded side effects (webhooks, Notify emails). More minimal and safe.
++- `Faker`, `Bookmark`/`login_activity` cascades, `keypairs`: factory behavior, explicitly out of scope (“do not touch factories yet”). Webhook stub already mitigates cascade’s webhook part. Revisit in factories phase.
++
++### Plan for requests phase (no factory edits, no app code, minimal per-example changes)
++
++1. Change `spec/rails_helper.rb` only (config-level, scoped to `type: :request`):
++   - Stub `TriggerWebhookWorker.perform_async` for requests unless `sidekiq_inline: true` (same pattern as models).
++   - Clear `Sidekiq::Worker` jobs after each request test.
++   - Silence `ActiveRecord::Base.logger` (nil during example, restore after) for requests unless `enable_logging: true`.
++   - Skip `NotifyService#send_email!` for requests via `prepend` module checking `RSpec.current_example.metadata` unless `need_notification_email: true`.
++   - Use `redis.flushdb` for requests (extend models optimization).
++2. No tags added to individual request specs (none needed: no webhook assertions, no Notify email assertions, no SQL log assertions). Tags available for future: `sidekiq_inline`, `enable_logging`, `need_notification_email`.
++3. Verify: run representative request files + folders (single-folder runs only, per instructions) + critical Sidekiq/email specs + models spot checks + service specs; ensure 0 failures and ≥30% speedup on requests sample.
++
++## Optimization applied (requests phase, 2026-10-06)
++
++### Changes (1 file, no factories, no app code, no other spec types)
++
++**`spec/rails_helper.rb`** only:
++
++1. `RequestNotifyEmailStub` module + `before(:suite)` prepend:
++   ```ruby
++   module RequestNotifyEmailStub
++     def send_email!
++       example = RSpec.current_example rescue nil
++       return true if example && example.metadata[:type] == :request && !example.metadata[:need_notification_email]
++       super
++     end
++   end
++   config.before(:suite) { NotifyService.prepend(RequestNotifyEmailStub) }
++   ```
++   Zero RSpec mock overhead, scoped via metadata, opt-out via `need_notification_email: true`.
++
++2. Webhook stub for requests (same as models):
++   ```ruby
++   config.before(:each, type: :request) do |example|
++     allow(TriggerWebhookWorker).to receive(:perform_async) unless example.metadata[:sidekiq_inline]
++   end
++   config.after(:each, type: :request) { Sidekiq::Worker.clear_all }
++   ```
++
++3. AR log silencing for requests (same as models):
++   ```ruby
++   config.around(:each, type: :request) do |example|
++     if example.metadata[:enable_logging]
++       example.run
++     else
++       orig = ActiveRecord::Base.logger; ActiveRecord::Base.logger = nil
++       begin; example.run; ensure; ActiveRecord::Base.logger = orig; end
++     end
++   end
++   ```
++
++4. `flushdb` extended to requests:
++   ```ruby
++   if [:model, :request].include?(example.metadata[:type])
++     redis.flushdb
++   else
++     redis.del(redis.keys)
++   end
++   ```
++
++### Why this is safe
++
++- Webhooks: no request spec asserts `TriggerWebhookWorker` via `have_enqueued` or `have_received` (only `admin/webhooks_spec` CRUD). Specs asserting other workers set `:fake` explicitly — unaffected. `inboxes_spec` local stub for `FollowersSynchronizationWorker` is different worker, compatible.
++- Notify emails: no request spec asserts `NotificationMailer` (`grep` none). `capture_emails` in requests only for `AdminMailer` (account_actions, reports) and empty-check (admin confirmations) — different paths, still pass (verified 0 failures). Service specs for `NotifyService` (type `:service`) still call `super` and pass (61 ex, 0 failures).
++- AR logging: no request spec asserts on SQL logs (`grep` none). `Rails.logger` left intact (same as models).
++- `flushdb` vs `del(keys)`: same effect on isolated test DB (DB 1, `redis.flushdb` in `after` + `Rails.cache.clear`). Other types (system, etc.) keep `del(keys)`.
++- `clear_all` after requests: no-op for inline tests, prevents fake-queue pollution for `:fake` tests (e.g., `to_not have_enqueued`).
++- Other spec types (`type != :request`, except models already optimized) keep exact previous behavior (`:inline`, `del(keys)`, logging, real Notify emails).
++
++### Results (after, with `rails_helper` changes, no `--require`)
++
++Per-file (2-run avg or single runs, all 0 failures):
++
++- `accounts_spec` (39 ex): 3.25→**2.45s** (-24.6%)
++- `notifications_spec` (22 ex): 7.90→**4.68s** (-40.7%)
++- `statuses_spec` (36 ex): 4.81→**3.47s** (-27.8%)
++- `home_spec` (6 ex): 1.96→**1.72s** (-12.2%)
++- `conversations_spec` (4 ex): 2.11→**1.33s** (-37%)
++- `follow_requests_spec` (7 ex): 2.18→**1.15s** (-47%)
++- `media_spec` (18 ex): 3.07→**2.67s** (-13%)
++- `admin/accounts_spec` (15 ex): 1.57→**1.16s** (-26%)
++- Email-critical: `admin/confirmations_spec` (3 ex) 0.98s, `reports_spec` (8 ex) 1.36s, `account_actions_spec` (24 ex) 2.46s — all 0 failures.
++- Sidekiq-critical: `credentials_spec` (7 ex) 1.32s, `profiles_spec` (8 ex) 2.63s, `interaction_policies_spec` (6 ex) 1.09s, `pins_spec` (11 ex) 1.31s, `search_spec` v2 (15 ex) 1.34s, `suggestions_spec` (2 ex) 0.90s, `auth/confirmations_spec` (6 ex) 1.37s, `inboxes_spec` (14 ex) 1.07s, `webhooks_spec` (1 ex) 0.76s — all 0 failures.
++- Models spot checks still fast: `account_spec` 2.91s, `status_spec` 4.70s, `user_spec` 2.32s, `notification_spec` 2.93s — all 0 failures (no regression).
++- Services still pass: `notify_service_spec` 6.73s (61 ex), `post_status_service_spec` 4.25s (33 ex) — 0 failures (Notify stub correctly scoped).
++
++Per-folder (single runs, all 0 failures):
++
++- `api/v1/accounts` (53 ex): 5.60→**4.41s** (-21.2%)
++- `api/v1/timelines` (43 ex): 10.78→**7.62s** (-29.3%)
++- `api/v1/statuses` (75 ex): 8.79→**5.56s** (-36.7%)
++- `admin` (91 ex): 5.96→**4.54s** (-23.8%)
++- `api/v2` (112 ex): 16.22→**10.56s** (-34.9%)
++- `activitypub` (108 ex): 28.00→**15.87s** (-43.3%)
++- `auth` (17 ex): 1.81→**1.57s** (-13.2%)
++- `settings` (49 ex): 2.38→**1.96s** (-17.6%)
++
++8 folders total (548 ex, 29% of requests): **79.54→52.09s (with rails_helper, -34.5% time, 1.53x speedup)**. Earlier `--require` sample gave 79.54→51.58s (-35.1%). Both exceed **>30% target** (target was -30-35% vs baseline before any optimization; requests baseline unchanged by models work, so current baseline equals original).
++
++12 single files total: 33.03→~23-24s (-27-30%, lighter files dilute average, but weighted by time heavy files dominate).
++
++Full `spec/requests` estimated: baseline ~220-270s → optimized ~140-180s (-35%). Combined `models + requests` estimated: original ~380-430s → after both phases ~200-240s (~1.8-1.9x). Factories phase (Bookmark/login_activity/Faker) should push combined over 2x.
++
++### Tags for future runs (requests + models)
++
++- `sidekiq_inline: true` — opt into real Sidekiq inline + real webhooks for models *and* requests. Currently used in 3 model email specs; no request spec needs it yet (all request webhook/email assertions use different paths). Use if a future request spec needs to assert webhook delivery or relies on webhook side effects.
++- `enable_logging: true` — opt out of AR log silencing for models *and* requests (none currently need it).
++- `need_notification_email: true` — (new, requests only) opt into real `NotifyService#send_email!` (NotificationMailer via `deliver_later` inline). No current request spec needs it (only AdminMailer asserted). Use if a future request spec captures NotificationMailer emails.
++- Full `spec/requests` sample is now ~35% faster (79.5→52s for 29% sample). Combined `models (58s) + requests (~150s est)` well underway to 2x; factories phase should address `status→bookmark`, `user→2x login_activity`, `Faker`, and re-evaluate `Paperclip` for media-heavy requests.
++
++
++## Factories phase (2026-10-06, models + requests)
++
++### Baseline before factories (after models+requests config opts, no factory changes)
++
++- `spec/models` full: **~58s** (1795 ex, 0 failures; docs: 58.9s seed 60129, 57.97s seed 24293). Re-measured spot files before factories:
++  - `account_statuses_cleanup_policy_spec` (36 ex): **6.36s**
++  - `tag_feed_spec` (33 ex): **4.57s**
++  - `status_spec` (62 ex): **4.73s** (docs spot: 4.70s)
++  - `trends` folder (24 ex): **4.69s**
++  - `account_spec` (122 ex): **~2.91s** (docs spot after requests)
++  - `user_spec` (72 ex): **2.32s**
++  - `notification_spec` (25 ex): **2.93s**
++  - `media_attachment_spec` (27 ex): **~6.75s** (needs real Paperclip, no webhooks)
++- `spec/requests` 8-folder sample (548 ex, 29%): **52.09s** after requests opt (baseline original 79.54s). Per-folder before factories (after requests opt):
++  - `api/v1/accounts` (53 ex): 4.41s
++  - `api/v1/timelines` (43 ex): 7.62s
++  - `api/v1/statuses` (75 ex): 5.56s
++  - `admin` (91 ex): 4.54s
++  - `api/v2` (112 ex): 10.56s
++  - `activitypub` (108 ex): 15.87s
++  - `auth` (17 ex): 1.57s
++  - `settings` (49 ex): 1.96s
++  - Single files before factories: `accounts_spec` 2.53s, `statuses_spec` 3.6s, `notifications_spec` 4.68s.
++
++### Profiling method (factories)
++
++- Counted `Fabricate` usage: `spec/models` 1384 lines, `spec/requests` 971 lines. Hot: `account` 477, `status` 410, `user` 182 (+55 `admin_user`, + shared `with API authentication` per-request user not counted in grep).
++- Micro-benchmark in `RAILS_ENV=test` with `Sidekiq::Testing.fake!` (transaction rollback, warmup):
++  - `Fabricate(:status)` avg **25.3ms** (20x) vs raw `Status save via build` (no bookmark) **4.07ms** → bookmark cascade (~10ms: bookmark + extra account+user) is ~40% of status cost.
++  - `Fabricate(:user)` **11.34ms** vs `Fabricate(:account)` **10.01ms**; `Fabricate(:login_activity)` **1.52ms** each → 2x per user ≈3ms (~25%).
++  - `Fabricate(:account)` local 10ms vs remote 5.8ms (remote has no user, saves ~4ms).
++  - `Fabricate(:status)` creates 2 accounts +2 users +1 status +1 bookmark +0 login_activities (nested users via `Fabricate.build` + autosave do NOT trigger fabricator `after_create`, only explicit `Fabricate(:user)` does). `Fabricate(:account)` creates 1+1+0, `Fabricate(:user)` creates 1+1+2.
++  - `Faker` isolated (5000x): `user_name` 0.569s (113us each) vs plain `user#{i}` 0.002s (0.4us, 250x); `email` 0.839s (167us) vs plain 0.0006s (1000x). Per fabrication Faker is ~1% (0.1-0.3ms vs 10-25ms), but with thousands of fabrications + cascade Faker it sums to 4-7% as seen in earlier profiles.
++- Spot-test by commenting `after_create` in `status`/`user` fabricators (global disable):
++  - `cleanup_policy`: 6.36→2.91s (-54%), `tag_feed`: 4.57→3.23s (-29%), `status`: 4.73→3.37s (-28%), `accounts` (requests): 2.53→2.42s (-4%, 39 users ×3ms≈0.12s), `statuses` (requests): 3.6→3.03s (-16%). ConfirmedBookmark is dominant for status-heavy models, login_activity minor for requests.
++- Checked `grep` for reliance: no `Bookmark.count`/`change(Bookmark)` in models/requests; only `change(LoginActivity,:count).by(1)` in `omniauth_callbacks_spec` (relative delta, filtered out without OIDC, 0 ex run). `cleanup_policy` uses `self_status_reference_exists` (account_id==status.account_id), auto-bookmarks by different account never match. `export_spec`/`backup_service`/`bulk_import` assert `contain_exactly` on explicit bookmarks for same account, auto-bookmarks by other accounts don't pollute.
++
++### Key findings (factories, shared)
++
++#### 1. `status → bookmark` auto-creation (~40% of status fabrication, dominant)
++
++- `spec/fabricators/status_fabricator.rb: after_create { Fabricate(:bookmark, status: status) }`. `Bookmark` fabricator builds new `account` (local + user + keypair) → per status: 1 status +2 accounts +2 users +1 bookmark. Costs: 2x BCrypt (stretches 1) +2x Faker username/email +2x keypair + DB inserts + (previously webhooks, now stubbed).
++- 410 direct `Fabricate(:status)` refs + `Fabricate.times(12, :status)` loops; `cleanup_policy` alone does ~13 statuses ×36 ex≈468 statuses → 468×~7ms≈3.45s (measured 6.36→2.91s).
++- Requests use `PostStatusService`/`FollowService` (model saves, not `Fabricate`) for many statuses, so bookmark saving smaller there (4-16% per file, but `activitypub` heavy with direct `Fabricate` shows -39% incremental).
++
++#### 2. `user → 2x login_activity` auto-creation (~25% of user fabrication, minor but shared)
++
++- `spec/fabricators/user_fabricator.rb: after_create { 2.times { Fabricate(:login_activity, user: user) } }`. Each `login_activity` does `Faker ip` (2us) + `user_agent` (8us) + DB insert (1.5ms). Per user ≈3ms.
++- Only explicit `Fabricate(:user)`/`admin_user`/`moderator_user` triggers; `Fabricate(:account)` nested `Fabricate.build(:user)` does NOT trigger. Requests fabricate ≥1 user per API test via `with API authentication` shared context → ~1900 users ×3ms≈5.7s full-suite estimate, but per-file small (accounts 39×3ms≈0.12s, -4%).
++- Inherited fabricators (`admin_user`, etc. `from: :user`) share callback via parent merge.
++
++#### 3. `Faker` for hot attributes (~1% per fabrication, 4-7% total with cascades)
++
++- Hot: `account.username` (`Faker::Internet.user_name` 113us), `user.email` (`Faker::Internet.email` 167us), `tag.name` (`Faker::Lorem.word`), `domain_block` etc (`Faker::Internet.domain_name`), `login_activity` ip/user_agent, `status` remote `uri` (`Faker::Internet.device_token`), `tagged_object` uri. `domain_allow` already uses fast `example#{i}.com`, `session_activation` uses fast `session_id_#{i}` — align others to same pattern.
++- Validations: `username` `/\A[a-z0-9_]+\z/i` max 30 (local) + `UniqueUsernameValidator` (global seq ensures uniqueness, `user#{i}` won't collide with explicit `alice`/`bob`); `email` valid + unique (`user#{i}@example.com`); `tag` `HASHTAG_NAME_RE` requires ≥1 alpha (`tag#{i}` ok); `domain` `DomainValidator` + unique (`example#{i}.com` ok, distinct from `example.com` for `remote_account`); `status.uri` unique for remote (global `Sequencer`); `tagged_object.uri` no validation (sequence for safety); `login_activity` ip/user_agent no uniqueness (static ok, `BrowserDetection` specs override with explicit Safari UA).
++- No spec asserts on auto-generated Faker values (all override when asserting: `tag_spec` uses `name: 'original'`/`'foo'`, `domain_block_spec` uses explicit domains, `account_spec`/`user_spec` override `username`/`email` when checked).
++
++#### 4. Minor / not applied
++
++- `Paperclip` for non-media specs: `cleanup_policy` stackprof after factories shows `Paperclip::Attachment#assign` 207/2663 (7.7%), `post_process` 196 (VIPS + blurhash). Per-file ~0.23s, full models ~1-2s (2-4%). Previously investigated (2%, no measurable gain with VIPS in-process) and skipped; still skipped to minimize risk (would need `post_process` stub with `media_processing: true` opt-out, but `media_attachment_spec` needs real + `keep_media` logic only checks row existence, not file — could be future win but out of scope for 10-20% target already met).
++- `Lorem` paragraphs for `account_warning` (6 refs), `announcement` (12), `appeal` (9), `rule` (9), `terms` (9) etc: 47×~100us≈5ms total, negligible. Left as `Faker` to minimize diff (specs override `text` when asserting, e.g., `rule_spec` uses `text: 'foo'`).
++- `OpenSSL::PKey::EC.generate` in `web_push_subscription` (8 refs) + `webauthn_credential` (0 refs in models/requests): ~10ms each, <0.1s total, left (specs may need valid keys).
++- `Random.hex` in `keypair` `local_fragment`: ~1us, negligible.
++- Other `Fabricate(:user).id` inside fabricators (`access_grant`, `web_push`, `webauthn`, `conversation` etc): rare in models/requests (≤5 refs each), not hot.
++
++### Optimization applied (factories phase)
++
++1. **`spec/support/factory_optimization.rb`** (new, scoped helper):
++   ```ruby
++   module FactoryOptimization
++     def self.skip_side_effects?(transient_opt_in: nil, tag_opt_in: nil)
++       return false if transient_opt_in
++       return false unless defined?(RSpec) && RSpec.respond_to?(:current_example)
++       example = RSpec.current_example
++       return false if example.nil?
++       return false unless [:model, :request].include?(example.metadata[:type])
++       return false if tag_opt_in && example.metadata[tag_opt_in]
++       return false if example.metadata[:with_factory_side_effects]
++       true
++     end
++     def self.skip_bookmark?(transients) ... end
++     def self.skip_login_activities?(transients) ... end
++   end
++   ```
++   Loaded via `rails_helper` `spec/support/**/*.rb` before lazy `load_definitions`, available in callbacks (callbacks run during tests). Returns `false` (preserve old behavior) for other types, outside RSpec, or on error.
++
++2. **`spec/fabricators/status_fabricator.rb`** (scoped skip + fast URI):
++   - `transient :with_bookmark`
++   - `after_build`: `Faker::Internet.device_token` → `"https://example.com/statuses/#{Fabrication::Sequencer.sequence(:status_remote_uri)}"` (global seq, unique, no I18n).
++   - `after_create do |status, transients|`: `unless FactoryOptimization.skip_bookmark?(transients); Fabricate(:bookmark, status: status); end`
++
++3. **`spec/fabricators/user_fabricator.rb`** (scoped skip + fast email, inherits to `admin/moderator/owner/private_user`):
++   - `transient :with_login_activities`
++   - `email`: `"#{i}#{Faker::Internet.email}"` → `"user#{i}@example.com"`
++   - `after_create do |user, transients|`: `unless FactoryOptimization.skip_login_activities?(transients); 2.times { Fabricate(:login_activity, user: user) }; end`
++
++4. **Hot `Faker` → fast sequences (global, behavior-preserving, unique + valid)**:
++   - `account_fabricator`: `username`: `Faker::Internet.user_name...` → `"user#{i}"`
++   - `tag_fabricator`: `name`: `Faker::Lorem.word` → `"tag#{i}"`
++   - `domain_block`, `email_domain_block`, `unavailable_domain`, `preview_card_provider`, `instance_moderation_note`: `domain`: `"#{i}#{Faker::Internet.domain_name}"` → `"example#{i}.com"` (align with `domain_allow`)
++   - `canonical_email_block`, `email_subscription`: `email` → `"user#{i}@example.com"`
++   - `username_block`: `username`: `Faker::Internet.username` → `"blockeduser#{i}"`
++   - `login_activity`: `ip` → `'127.0.0.1'`, `user_agent` → `'TestAgent'` (no uniqueness needed)
++   - `tagged_object`: `uri`: `Faker::Internet.device_token` → `sequence(:tagged_object_uri) { "https://example.com/tagged/#{i}" }`
++   - Cold `Faker` (`Lorem` paragraphs, `preview_card`, `webhook`, `fasp`, `terms` dates) left unchanged (negligible, minimize risk).
++
++### Why this is safe
++
++- Bookmarks: no `Bookmark.count` assertions; `cleanup_policy` self-checks use different account (verified `self_status_reference_exists` SQL); `export`/`bookmarks`/`backup`/`bulk_import` use explicit `Fabricate(:bookmark, account: X)` + `contain_exactly` (auto by other account doesn't pollute). Verified with `verify_factory_opt_spec` (model/request skip, service preserve, transient/tag opt-ins).
++- LoginActivities: only relative `change.by(1)` in `omniauth` (filtered 0 ex without OIDC) + `sessions_controller` `change(user.login_activities.where(success: true),:count).by(1)` (type `:controller`, preserves old behavior, still passes). No absolute counts. `login_activity_spec` uses `build`.
++- Faker: uniqueness via sequences (per-model namespace `account_username`, `user_email`, etc., global increment, no rollback collisions); validity checked against `USERNAME_RE`, `HASHTAG_NAME_RE`, `DomainValidator`, email format; explicit values in specs that assert (`tag: 'foo'`, `domain: 'example.com'`, `username: 'alice'`) unaffected. Other types (services/controllers/lib) get fast values too but still pass (verified `backup_service` 2.26s, `feed_manager` 9.11s, `sessions_controller` 2.42s, all 0 failures).
++- Other types preserve side effects (scoped check), so `services`/`controllers`/`lib`/`system` behavior unchanged except faster Faker strings. `rails runner` (no `RSpec.current_example`) preserves old behavior.
++- `status.uri` for local stays `nil` (filled by `store_uri`); remote uses `https://example.com/statuses/N` unique via `Sequencer` (no collision with explicit `https://already.bookmarked/1` etc.).
++- No app code changes, no assertion changes. Only factory + new support helper. Previous tags (`sidekiq_inline`, `enable_logging`, `need_notification_email`) untouched.
++
++### Results (after factories, with `rails_helper` + factory changes)
++
++- `spec/models` full: **1795 ex, 0 failures, Finished in 45.79s** (seed 41667, files 2.64s) vs **~58s** before factories (**-21% time, 1.27x**; vs original 162.5s **-71.8%, 3.55x**). Top groups now: `MediaAttachment` 6.72s/27 ex (0.249 avg, dominant, needs real ffmpeg — unchanged), `Trends::Statuses` 1.96s/12 ex (0.163 avg, was 13.42s baseline, 3.49s after webhooks), `Account::Avatar` 0.85s/6 ex, etc. `cleanup_policy`/`tag_feed`/`status` no longer top.
++- Per-file models (single runs, 0 failures):
++  - `cleanup_policy` (36 ex): 6.36→**2.89s** (-54.5%)
++  - `tag_feed` (33 ex): 4.57→**3.02s** (-33.9%)
++  - `status` (62 ex): 4.73→**3.26s** (-31%)
++  - `trends` folder (24 ex): 4.69→**3.28s** (-30%)
++  - `account` (122 ex): 2.91→**2.70s** (-7%)
++  - `notification` (25 ex): 2.93→**2.30s** (-21%)
++  - `user` (72 ex): 2.32→**2.26s** (-2.6%, mostly `build`, few `create`)
++  - `media_attachment` (27 ex): 6.75→**6.89s** (no change, as expected)
++  - `bookmark` (5 ex) 0.81s, `export` (6 ex) 0.69s, `tag` (70 ex) 0.91s, `domain_block` (21 ex) 0.80s, `canonical_email_block` (15 ex) 0.76s, `email_subscription` (4 ex) 0.89s, `login_activity` (6 ex) 0.71s, `username_block` (11 ex) 0.34s, `account_action` (15 ex) 1.20s — all 0 failures.
++- Per-folder requests (single runs, 0 failures):
++  - `api/v1/accounts` (53 ex): 4.41→**4.00s** (-9.3%)
++  - `api/v1/timelines` (43 ex): 7.62→**6.58s** (-13.6%)
++  - `api/v1/statuses` (75 ex): 5.56→**4.26s** (-23.4%)
++  - `admin` (91 ex): 4.54→**4.05s** (-10.8%)
++  - `api/v2` (112 ex): 10.56→**9.85s** (-6.7%)
++  - `activitypub` (108 ex): 15.87→**9.68s** (-39%)
++  - `auth` (17 ex): 1.57→**1.63s** (+3%, variance, light)
++  - `settings` (49 ex): 1.96→**1.89s** (-3.5%)
++  - 8 folders total (548 ex): **52.09→41.94s (-19.5% incremental, 1.24x; vs original 79.54s -47.3%, 1.90x)**.
++  - Single files: `accounts_spec` 2.53→2.41s (-4.7%), `statuses_spec` 3.6→3.04s (-15.5%), `notifications_spec` 4.68→4.40s (-6%), `bookmarks_spec` 1.03→1.24s (variance, 4 ex), `statuses/bookmarks_spec` 1.33s (11 ex) — all 0 failures.
++- Full `spec/requests` estimated: before factories ~140-180s → after factories **~113-145s** (-19.5%). Combined `models + requests` estimated: original ~380-430s → after models+requests opts ~200-240s → after factories **~159-191s (~2.2-2.4x vs original, exceeds 2x target)**.
++- Other types still pass (scoped + global Faker safe): `backup_service` 2.26s (2 ex), `feed_manager` 60 ex 9.11s, `sessions_controller` 23 ex 2.42s — 0 failures. `verify_factory_opt_spec` (model 12 ex, request 3 ex, service 3 ex) all passed (skip vs preserve vs transient/tag opt-ins, fast values, remote URI uniqueness).
++
++### Tags for future runs (factories + previous)
++
++- `with_bookmark: true` — (new, models/requests) opt into auto-`Bookmark` for `Fabricate(:status)`. Or transient `Fabricate(:status, with_bookmark: true)`. No current spec needs it (all create bookmarks explicitly when needed).
++- `with_login_activities: true` — (new, models/requests) opt into 2x `LoginActivity` for `Fabricate(:user)`/`admin_user`/`moderator_user`/`owner_user`. Or transient `Fabricate(:user, with_login_activities: true)`. No current spec needs it (only relative deltas asserted).
++- `with_factory_side_effects: true` — (new, generic) opt into both side effects for models/requests. Use if a future spec asserts on auto-created records.
++- Previous: `sidekiq_inline: true` (3 model email specs), `enable_logging: true` (none), `need_notification_email: true` (requests, none) — still valid, untouched.
++- Future ideas (not applied): `Paperclip post_process` stub for non-media models/requests with `media_processing: true` opt-out (~2-4% models, ~7% in `cleanup_policy` profile, but needs audit of `blurhash`/`thumbnail` assertions); `Lorem` → static text (<1%); `web_push` EC key memoization (<0.1s); `Faker::Date.unique` in `terms` (9 refs) → static date. Combined models+requests already over 2x, so further factory work is diminishing returns — next bottleneck is `MediaAttachment` (6.72s, real ffmpeg) and `PG exec` (10% self) + `GC marking` (12.9% self, reduced indirectly by fewer records).
++
+diff --git a/spec/fabricators/account_fabricator.rb b/spec/fabricators/account_fabricator.rb
+index 6a5218c..a9f46b3 100644
+--- a/spec/fabricators/account_fabricator.rb
++++ b/spec/fabricators/account_fabricator.rb
+@@ -4,7 +4,7 @@ require_relative '../support/signing_keys_helpers'
+ 
+ Fabricator(:account) do
+   transient :suspended, :silenced, :legacy_keypair, :requested_deletion
+-  username              { sequence(:username) { |i| "#{Faker::Internet.user_name(separators: %w(_))}#{i}" } }
++  username              { sequence(:username) { |i| "user#{i}" } }
+   last_webfingered_at   { Time.now.utc }
+   public_key            { |attrs| attrs[:legacy_keypair] ? SigningKeysHelpers::PUBLIC_RSA_TEST_KEY : '' }
+   private_key           { |attrs| attrs[:legacy_keypair] && attrs[:domain].nil? ? SigningKeysHelpers::PRIVATE_RSA_TEST_KEY : nil }
+diff --git a/spec/fabricators/canonical_email_block_fabricator.rb b/spec/fabricators/canonical_email_block_fabricator.rb
+index 1ef53ff..2f7437f 100644
+--- a/spec/fabricators/canonical_email_block_fabricator.rb
++++ b/spec/fabricators/canonical_email_block_fabricator.rb
+@@ -1,6 +1,6 @@
+ # frozen_string_literal: true
+ 
+ Fabricator(:canonical_email_block) do
+-  email { sequence(:email) { |i| "#{i}#{Faker::Internet.email}" } }
++  email { sequence(:email) { |i| "user#{i}@example.com" } }
+   reference_account { Fabricate.build(:account) }
+ end
+diff --git a/spec/fabricators/domain_block_fabricator.rb b/spec/fabricators/domain_block_fabricator.rb
+index c703a18..83db589 100644
+--- a/spec/fabricators/domain_block_fabricator.rb
++++ b/spec/fabricators/domain_block_fabricator.rb
+@@ -1,5 +1,5 @@
+ # frozen_string_literal: true
+ 
+ Fabricator(:domain_block) do
+-  domain { sequence(:domain) { |i| "#{i}#{Faker::Internet.domain_name}" } }
++  domain { sequence(:domain) { |i| "example#{i}.com" } }
+ end
+diff --git a/spec/fabricators/email_domain_block_fabricator.rb b/spec/fabricators/email_domain_block_fabricator.rb
+index a74cca7..a02d624 100644
+--- a/spec/fabricators/email_domain_block_fabricator.rb
++++ b/spec/fabricators/email_domain_block_fabricator.rb
+@@ -1,5 +1,5 @@
+ # frozen_string_literal: true
+ 
+ Fabricator(:email_domain_block) do
+-  domain { sequence(:domain) { |i| "#{i}#{Faker::Internet.domain_name}" } }
++  domain { sequence(:domain) { |i| "example#{i}.com" } }
+ end
+diff --git a/spec/fabricators/email_subscription_fabricator.rb b/spec/fabricators/email_subscription_fabricator.rb
+index 8d61945..334aff9 100644
+--- a/spec/fabricators/email_subscription_fabricator.rb
++++ b/spec/fabricators/email_subscription_fabricator.rb
+@@ -2,6 +2,6 @@
+ 
+ Fabricator(:email_subscription) do
+   account
+-  email { sequence(:email) { |i| "#{i}#{Faker::Internet.email}" } }
++  email { sequence(:email) { |i| "user#{i}@example.com" } }
+   locale 'en'
+ end
+diff --git a/spec/fabricators/instance_moderation_note_fabricator.rb b/spec/fabricators/instance_moderation_note_fabricator.rb
+index 6a8fd3d..6342fe2 100644
+--- a/spec/fabricators/instance_moderation_note_fabricator.rb
++++ b/spec/fabricators/instance_moderation_note_fabricator.rb
+@@ -1,7 +1,7 @@
+ # frozen_string_literal: true
+ 
+ Fabricator(:instance_moderation_note) do
+-  domain { sequence(:domain) { |i| "#{i}#{Faker::Internet.domain_name}" } }
++  domain { sequence(:domain) { |i| "example#{i}.com" } }
+   account { Fabricate.build(:account) }
+   content { Faker::Lorem.sentence }
+ end
+diff --git a/spec/fabricators/login_activity_fabricator.rb b/spec/fabricators/login_activity_fabricator.rb
+index 3309a30..a4b7290 100644
+--- a/spec/fabricators/login_activity_fabricator.rb
++++ b/spec/fabricators/login_activity_fabricator.rb
+@@ -5,6 +5,6 @@ Fabricator(:login_activity) do
+   authentication_method 'password'
+   success               true
+   failure_reason        nil
+-  ip                    { Faker::Internet.ip_v4_address }
+-  user_agent            { Faker::Internet.user_agent }
++  ip                    '127.0.0.1'
++  user_agent            'TestAgent'
+ end
+diff --git a/spec/fabricators/preview_card_provider_fabricator.rb b/spec/fabricators/preview_card_provider_fabricator.rb
+index 3a02762..a70d514 100644
+--- a/spec/fabricators/preview_card_provider_fabricator.rb
++++ b/spec/fabricators/preview_card_provider_fabricator.rb
+@@ -1,5 +1,5 @@
+ # frozen_string_literal: true
+ 
+ Fabricator(:preview_card_provider) do
+-  domain { sequence(:domain) { |i| "#{i}#{Faker::Internet.domain_name}" } }
++  domain { sequence(:domain) { |i| "example#{i}.com" } }
+ end
+diff --git a/spec/fabricators/status_fabricator.rb b/spec/fabricators/status_fabricator.rb
+index 2539d48..5293c54 100644
+--- a/spec/fabricators/status_fabricator.rb
++++ b/spec/fabricators/status_fabricator.rb
+@@ -1,14 +1,24 @@
+ # frozen_string_literal: true
+ 
+ Fabricator(:status) do
++  transient :with_bookmark
+   account { Fabricate.build(:account) }
+   text 'Lorem ipsum dolor sit amet'
+ 
+   after_build do |status|
+-    status.uri = Faker::Internet.device_token if !status.account.local? && status.uri.nil?
++    # Fast deterministic URI for remote statuses (was Faker::Internet.device_token, ~100us + I18n).
++    # Status validates `uri` uniqueness for remote, so use global sequence for uniqueness.
++    # Local statuses keep `uri=nil` (filled by `store_uri` callback).
++    if !status.account.local? && status.uri.nil?
++      status.uri = "https://example.com/statuses/#{Fabrication::Sequencer.sequence(:status_remote_uri)}"
++    end
+   end
+ 
+-  after_create do |status|
+-    Fabricate(:bookmark, status: status)
++  after_create do |status, transients|
++    # Optimization: skip auto-bookmark for models/requests (saves ~7-10ms per status).
++    # See `spec/support/factory_optimization.rb` for rationale and opt-ins.
++    unless FactoryOptimization.skip_bookmark?(transients)
++      Fabricate(:bookmark, status: status)
++    end
+   end
+ end
+diff --git a/spec/fabricators/tag_fabricator.rb b/spec/fabricators/tag_fabricator.rb
+index a7b52e9..506c168 100644
+--- a/spec/fabricators/tag_fabricator.rb
++++ b/spec/fabricators/tag_fabricator.rb
+@@ -1,5 +1,5 @@
+ # frozen_string_literal: true
+ 
+ Fabricator(:tag) do
+-  name { sequence(:hashtag) { |i| "#{Faker::Lorem.word}#{i}" } }
++  name { sequence(:hashtag) { |i| "tag#{i}" } }
+ end
+diff --git a/spec/fabricators/tagged_object_fabricator.rb b/spec/fabricators/tagged_object_fabricator.rb
+index 5c0b6b9..38545b8 100644
+--- a/spec/fabricators/tagged_object_fabricator.rb
++++ b/spec/fabricators/tagged_object_fabricator.rb
+@@ -4,5 +4,5 @@ Fabricator(:tagged_object) do
+   status
+   object  nil
+   ap_type 'FeaturedCollection'
+-  uri     { Faker::Internet.device_token }
++  uri     { sequence(:tagged_object_uri) { |i| "https://example.com/tagged/#{i}" } }
+ end
+diff --git a/spec/fabricators/unavailable_domain_fabricator.rb b/spec/fabricators/unavailable_domain_fabricator.rb
+index 88e605c..f471401 100644
+--- a/spec/fabricators/unavailable_domain_fabricator.rb
++++ b/spec/fabricators/unavailable_domain_fabricator.rb
+@@ -1,5 +1,5 @@
+ # frozen_string_literal: true
+ 
+ Fabricator(:unavailable_domain) do
+-  domain { sequence(:domain) { |i| "#{i}#{Faker::Internet.domain_name}" } }
++  domain { sequence(:domain) { |i| "example#{i}.com" } }
+ end
+diff --git a/spec/fabricators/user_fabricator.rb b/spec/fabricators/user_fabricator.rb
+index c82a3c9..c51f8d7 100644
+--- a/spec/fabricators/user_fabricator.rb
++++ b/spec/fabricators/user_fabricator.rb
+@@ -1,20 +1,26 @@
+ # frozen_string_literal: true
+ 
+ Fabricator(:user) do
++  transient :with_login_activities
++
+   account do |attrs|
+     Fabricate.build(
+       :account,
+       attrs.fetch(:account_attributes, {}).merge(user: nil)
+     )
+   end
+-  email        { sequence(:email) { |i| "#{i}#{Faker::Internet.email}" } }
++  email        { sequence(:email) { |i| "user#{i}@example.com" } }
+   password     '123456789'
+   confirmed_at { Time.zone.now }
+   current_sign_in_at { Time.zone.now }
+   agreement true
+ 
+-  after_create do |user|
+-    2.times { Fabricate(:login_activity, user: user) }
++  after_create do |user, transients|
++    # Optimization: skip auto-login_activities for models/requests (saves ~3ms per user).
++    # See `spec/support/factory_optimization.rb` for rationale and opt-ins.
++    unless FactoryOptimization.skip_login_activities?(transients)
++      2.times { Fabricate(:login_activity, user: user) }
++    end
+   end
+ end
+ 
+diff --git a/spec/fabricators/username_block_fabricator.rb b/spec/fabricators/username_block_fabricator.rb
+index edca541..84843e3 100644
+--- a/spec/fabricators/username_block_fabricator.rb
++++ b/spec/fabricators/username_block_fabricator.rb
+@@ -1,7 +1,7 @@
+ # frozen_string_literal: true
+ 
+ Fabricator(:username_block) do
+-  username { sequence(:email) { |i| "#{i}#{Faker::Internet.username}" } }
++  username { sequence(:email) { |i| "blockeduser#{i}" } }
+   exact false
+   allow_with_approval false
+ end
+diff --git a/spec/models/admin/account_action_spec.rb b/spec/models/admin/account_action_spec.rb
+index 5339084..e1ea9b4 100644
+--- a/spec/models/admin/account_action_spec.rb
++++ b/spec/models/admin/account_action_spec.rb
+@@ -87,7 +87,7 @@ RSpec.describe Admin::AccountAction do
+       end
+     end
+ 
+-    it 'sends email to target account user' do
++    it 'sends email to target account user', sidekiq_inline: true do
+       emails = capture_emails { subject }
+ 
+       expect(emails).to contain_exactly(
+diff --git a/spec/models/email_subscription_spec.rb b/spec/models/email_subscription_spec.rb
+index 3730b5c..9299456 100644
+--- a/spec/models/email_subscription_spec.rb
++++ b/spec/models/email_subscription_spec.rb
+@@ -27,7 +27,7 @@ RSpec.describe EmailSubscription do
+   describe 'Callbacks' do
+     subject { Fabricate(:email_subscription) }
+ 
+-    it 'generates token and delivers confirmation email' do
++    it 'generates token and delivers confirmation email', sidekiq_inline: true do
+       emails = capture_emails { subject }
+ 
+       expect(subject.confirmed_at).to be_nil
+diff --git a/spec/models/user_spec.rb b/spec/models/user_spec.rb
+index 3a1964b..7c02cf1 100644
+--- a/spec/models/user_spec.rb
++++ b/spec/models/user_spec.rb
+@@ -493,7 +493,7 @@ RSpec.describe User do
+     end
+   end
+ 
+-  describe '#mark_email_as_confirmed!' do
++  describe '#mark_email_as_confirmed!', sidekiq_inline: true do
+     subject { user.mark_email_as_confirmed! }
+ 
+     let!(:user) { Fabricate(:user, confirmed_at: confirmed_at) }
+diff --git a/spec/rails_helper.rb b/spec/rails_helper.rb
+index a91461b..63247d9 100644
+--- a/spec/rails_helper.rb
++++ b/spec/rails_helper.rb
+@@ -46,6 +46,29 @@ Devise::Test::ControllerHelpers.module_eval do
+   end
+ end
+ 
++# Optimization for `spec/requests`: skip NotificationMailer emails triggered via
++# `NotifyService#send_email!` (ActionMailer + Sidekiq inline + Premailer, ~13-19%
++# of wall time in notification-heavy request specs). No request spec asserts
++# NotificationMailer deliveries (only AdminMailer via `capture_emails` in 3 files,
++# which use different code paths), so this is safe. Opt out with
++# `need_notification_email: true` tag.
++module RequestNotifyEmailStub
++  def send_email!
++    example = nil
++    begin
++      example = RSpec.current_example
++    rescue StandardError
++      example = nil
++    end
++
++    if example && example.metadata[:type] == :request && !example.metadata[:need_notification_email]
++      return true
++    end
++
++    super
++  end
++end
++
+ RSpec.configure do |config|
+   # By default, skip specs that need full JS browser
+   config.filter_run_excluding :js
+@@ -56,6 +79,11 @@ RSpec.configure do |config|
+   # By default, skip specs that need the streaming server
+   config.filter_run_excluding :streaming
+ 
++  # Prepend NotifyService email stub once (scoped to type: :request via metadata check)
++  config.before(:suite) do
++    NotifyService.prepend(RequestNotifyEmailStub)
++  end
++
+   config.fixture_paths = [
+     Rails.root.join('spec', 'fixtures'),
+   ]
+@@ -105,8 +133,79 @@ RSpec.configure do |config|
+     self.use_transactional_tests = true
+   end
+ 
+-  config.before do
+-    Sidekiq.testing!(:inline)
++  config.before do |example|
++    # Optimization for `spec/models`: default to `:fake` to avoid expensive
++    # inline execution of `TriggerWebhookWorker` (ActiveModelSerializers +
++    # JSON on every account/status creation, ~25-30% of wall time).
++    # Opt into inline with `sidekiq_inline: true` tag when needed.
++    # Other spec types keep `:inline` behavior.
++    if example.metadata[:type] == :model && !example.metadata[:sidekiq_inline]
++      Sidekiq.testing!(:fake)
++    else
++      Sidekiq.testing!(:inline)
++    end
++  end
++
++  # Stub webhook delivery for model specs: avoids even fake-enqueue cost
++  # while still allowing `have_received(:perform_async)` assertions in specs
++  # that explicitly stub (e.g., user_spec, confirmation_spec).
++  config.before(:each, type: :model) do |example|
++    unless example.metadata[:sidekiq_inline]
++      allow(TriggerWebhookWorker).to receive(:perform_async)
++    end
++  end
++
++  config.after(:each, type: :model) do
++    Sidekiq::Worker.clear_all
++  end
++
++  # Optimization for `spec/requests`: stub webhook delivery (same rationale as
++  # models, ~8-12% of wall time in request specs via Fabricate cascades).
++  # No request spec asserts webhook delivery (`admin/webhooks_spec` only tests
++  # CRUD, not delivery). Opt into real delivery with `sidekiq_inline: true`.
++  config.before(:each, type: :request) do |example|
++    unless example.metadata[:sidekiq_inline]
++      allow(TriggerWebhookWorker).to receive(:perform_async)
++    end
++  end
++
++  config.after(:each, type: :request) do
++    Sidekiq::Worker.clear_all
++  end
++
++  # Silence ActiveRecord SQL logging for model specs (~7% wall time saved
++  # by avoiding `log/test.log` writes). Opt out with `enable_logging: true`.
++  # Only touches `ActiveRecord::Base.logger`, leaves `Rails.logger` intact
++  # (e.g., `remotable_spec.rb` asserts on `Rails.logger.debug`).
++  config.around(:each, type: :model) do |example|
++    if example.metadata[:enable_logging]
++      example.run
++    else
++      original_ar_logger = ActiveRecord::Base.logger
++      ActiveRecord::Base.logger = nil
++      begin
++        example.run
++      ensure
++        ActiveRecord::Base.logger = original_ar_logger
++      end
++    end
++  end
++
++  # Silence ActiveRecord SQL logging for request specs (same rationale as
++  # models, ~7-9% wall time saved). No request spec asserts on SQL logs.
++  # Opt out with `enable_logging: true`.
++  config.around(:each, type: :request) do |example|
++    if example.metadata[:enable_logging]
++      example.run
++    else
++      original_ar_logger = ActiveRecord::Base.logger
++      ActiveRecord::Base.logger = nil
++      begin
++        example.run
++      ensure
++        ActiveRecord::Base.logger = original_ar_logger
++      end
++    end
+   end
+ 
+   config.before :each, type: :cli do
+@@ -128,9 +227,16 @@ RSpec.configure do |config|
+     host! 'localhost:3000'
+   end
+ 
+-  config.after do
++  config.after do |example|
+     Rails.cache.clear
+-    redis.del(redis.keys)
++    if [:model, :request].include?(example.metadata[:type])
++      # `flushdb` is equivalent to `del(keys)` on dedicated test DB but
++      # faster and atomic. Scoped to models and requests to avoid touching
++      # other types (e.g., system specs).
++      redis.flushdb
++    else
++      redis.del(redis.keys)
++    end
+   end
+ 
+   # Assign types based on dir name for non-inferred types
+diff --git a/spec/support/factory_optimization.rb b/spec/support/factory_optimization.rb
+new file mode 100644
+index 0000000..72be158
+--- /dev/null
++++ b/spec/support/factory_optimization.rb
+@@ -0,0 +1,65 @@
++# frozen_string_literal: true
++
++# Optimization for `spec/models` and `spec/requests`: skip expensive factory
++# side effects that are not asserted by those suites.
++#
++# - `Fabricate(:status)` auto-creates a `Bookmark` (+ extra Account+User) via
++#   `after_create`. Saves ~7-10ms per status (40% of status fabrication).
++# - `Fabricate(:user)` auto-creates 2x `LoginActivity` via `after_create`.
++#   Saves ~3ms per user (~25% of user fabrication).
++#
++# No model/request spec asserts on these auto-created records:
++# - Bookmarks: `account_statuses_cleanup_policy_spec` checks self-bookmarks
++#   explicitly created via `Fabricate(:bookmark, account: account, ...)`;
++#   auto-bookmarks are by a different account and use `self_status_reference_exists`
++#   (account_id == status.account_id), so they never match. `export_spec` and
++#   `bookmarks_spec` create bookmarks explicitly. No `Bookmark.count` assertions.
++# - LoginActivities: only `omniauth_callbacks_spec` asserts `change(LoginActivity, :count)`
++#   by 1 (relative delta, unaffected by fewer records in `before` blocks).
++#   `login_activity_spec` uses `Fabricate.build`. No absolute count assertions.
++#
++# Skipping is scoped to `type: :model` and `type: :request` to avoid touching
++# other suites (services, controllers, etc.). Opt in via:
++# - Transient: `Fabricate(:status, with_bookmark: true)` or
++#   `Fabricate(:user, with_login_activities: true)` (also works for
++#   `admin_user`/`moderator_user`/`owner_user` via inheritance).
++# - Tag: `with_bookmark: true`, `with_login_activities: true`, or generic
++#   `with_factory_side_effects: true` on example/group.
++#
++# For other spec types or outside RSpec (e.g., `rails runner`), old behavior
++# is preserved (side effects created).
++module FactoryOptimization
++  def self.skip_side_effects?(transient_opt_in: nil, tag_opt_in: nil)
++    # Explicit transient opt-in always creates
++    return false if transient_opt_in
++
++    begin
++      # RSpec may not be defined outside test env
++      return false unless defined?(RSpec) && RSpec.respond_to?(:current_example)
++
++      example = RSpec.current_example
++      return false if example.nil?
++
++      type = example.metadata[:type]
++      return false unless [:model, :request].include?(type)
++
++      # Tag opt-ins
++      return false if tag_opt_in && example.metadata[tag_opt_in]
++      return false if example.metadata[:with_factory_side_effects]
++
++      true
++    rescue StandardError
++      false
++    end
++  end
++
++  def self.skip_bookmark?(transients)
++    transients ||= {}
++    skip_side_effects?(transient_opt_in: transients[:with_bookmark] || transients['with_bookmark'], tag_opt_in: :with_bookmark)
++  end
++
++  def self.skip_login_activities?(transients)
++    transients ||= {}
++    skip_side_effects?(transient_opt_in: transients[:with_login_activities] || transients['with_login_activities'], tag_opt_in: :with_login_activities)
++  end
++end

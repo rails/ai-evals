@@ -9,6 +9,7 @@ tags:
 - action-controller
 - action-view
 - serialization
+- http-api
 metadata:
   category: full-features
 restore:

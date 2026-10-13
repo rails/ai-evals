@@ -1,0 +1,741 @@
+diff --git a/docs/test-suite-profiling.md b/docs/test-suite-profiling.md
+new file mode 100644
+index 0000000..edbab38
+--- /dev/null
++++ b/docs/test-suite-profiling.md
+@@ -0,0 +1,383 @@
++# Test suite profiling & optimization log
++
++This document tracks the effort to speed up the RSpec suite (`spec/models` and
++`spec/requests` first), and records baseline metrics, methodology and findings
++so future optimization runs can build on them.
++
++## Environment / methodology
++
++- Local run: single process (`bundle exec rspec spec/models --seed 1234`),
++  PostgreSQL 17 + Redis running on localhost, `config.eager_load = false`
++  (CI sets `CI=1` which enables eager loading).
++- Every run below uses `--seed 1234` for comparability (suite order is random).
++- Profiling tools already in the bundle:
++  - `test-prof` (needs explicit `-rtest_prof` because the Gemfile uses
++    `require: false`):
++    - `RD_PROF=1 bundle exec rspec -rtest_prof -rtest_prof/rspec_dissect ...`
++      — time split between `before` hooks / `let` / examples per suite.
++    - `EVENT_PROF=sidekiq.inline bundle exec rspec -rtest_prof -rtest_prof/event_prof/rspec ...`
++      — time spent executing Sidekiq jobs inline.
++    - `EVENT_PROF=sql.active_record ...` — time spent in SQL.
++  - `stackprof` for CPU profiles.
++- NOTE: never run the whole suite at once locally; run single folders
++  (`rspec spec/models` is ~3 min). System specs and `:streaming`/`:search`
++  tagged specs are excluded by default.
++
++## Phase 1: `spec/models`
++
++### Baseline (before any change)
++
++| Metric                    | Value          |
++|---------------------------|----------------|
++| Examples                  | 1795           |
++| RSpec time (seed 1234)    | 2m39s (159 s)  |
++| Wall time incl. boot      | ~162 s         |
++| sidekiq.inline total      | 41.3 s (25.8%) |
++| sql.active_record total   | 25.1 s (15.6%) |
++| Setup (before+let) total  | 137 s of 167 s |
++
++Key facts from profiling (test-prof):
++
++- **Sidekiq jobs run inline** (`Sidekiq.testing!(:inline)` in a global
++  `config.before` hook in `spec/rails_helper.rb`). 3908 inline job executions
++  across 1795 examples == **25.8% of total runtime** (TriggerWebhookWorker,
++  feed MergeWorker, BootstrapTimelineWorker, etc.). Worst offenders:
++  Trends::Statuses 37%, Status 30%, TagFeed 27%, AccountStatusesCleanupPolicy
++  29%, PublicFeed 25% of their suite time.
++- Setup time (before hooks + `let` fabrication) is 82% of example time —
++  fabrication of statuses/accounts/users dominates, and part of that cost is
++  the inline workers triggered by model callbacks.
++- SQL is ~16% of runtime (~114k queries).
++- `config.after { Rails.cache.clear; redis.del(redis.keys) }` runs after every
++  example: wipes the Settings cache (every `Setting.foo` re-hits the DB in the
++  next example) and does a KEYS+DEL round-trip on Redis.
++- Only `Keypair#private_key` uses ActiveRecord encryption; the account
++  fabricator already provides pre-generated test keys, so no RSA keygen cost
++  in fabrication (2048-bit RSA generation would be ~50-200 ms otherwise).
++
++### Gotchas discovered while profiling
++
++- **Manual `Fabricate(...)` calls from `rails runner`/`ruby -e` COMMIT to the
++  test DB** (no transactional rollback) and poison later suite runs with
++  order-dependent failures (e.g. `spec/models/fasp/backfill_request_spec.rb`,
++  `TermsOfService#scope_for_notification`, `User::Confirmation`). If that
++  happens, truncate all tables (suite seeds are re-created by `load_seed` in
++  `before :suite`).
++- Overlapping rspec processes skew wall-clock measurements; always benchmark
++  one run at a time.
++- Fabrication benchmark (warm, fake Sidekiq, `Fabricate(:status)` ≈ 30 ms,
++  creates account+user and a bookmark with its own account+user — 2 bcrypt
++  hashes per status; `Fabricate(:user)` ≈ 15 ms, `Fabricate(:account)` ≈ 10 ms).
++- Per-example framework overhead (empty `type: :model` example): ~4 ms, mostly
++  GC + hook machinery; transaction + `Rails.cache.clear` +
++  `redis.del(redis.keys)` are only ~0.05 ms.
++- Route reloading is NOT per-example (only 2 draws/process) despite the
++  `reload_routes_unless_loaded` before-hook.
++- SQL query logging is expensive: every one of the ~114k SQL statements per
++  run is formatted for `log/test.log` (binds, colors) and written to disk.
++  `ActiveRecord::Base.logger = nil` makes `LogSubscriber#call` short-circuit
++  (`super if logger` in `ActiveSupport::LogSubscriber`), skipping the
++  formatting entirely.
++- ActiveJob uses the **Sidekiq adapter in test too**
++  (`config.active_job.queue_adapter = :sidekiq` in
++  `config/application.rb`), so `deliver_later` mails only happen when Sidekiq
++  runs jobs inline. Specs asserting `capture_emails` after model callbacks
++  therefore need inline Sidekiq (`:sidekiq_inline` tag): user_spec welcome
++  email, email_subscription confirmation, admin/account_action notification
++  email.
++
++### Optimizations applied
++
++1. **Sidekiq fake mode by default for `type: :model` specs**
++   (`spec/rails_helper.rb`). Examples that depend on jobs actually running are
++   tagged with `:sidekiq_inline` (the tag hook is registered after the
++   `type: :model` hook, so inline wins when both apply). Tagged examples:
++   `user_spec` welcome email, `email_subscription_spec` confirmation email,
++   `admin/account_action_spec` notification email (all assert delivered mails
++   via `capture_emails`, which requires `deliver_later` to actually run).
++   - sidekiq.inline was 41.3 s (25.8%) of the baseline run.
++2. **Disable ActiveRecord query logging in `type: :model` specs**
++   (`ActiveRecord::Base.logger = nil` around each example, restored
++   afterwards). With ~114k queries per run, the `ActiveRecord::LogSubscriber`
++   formatting + `log/test.log` writes were the single largest remaining
++   overhead after fixing inline Sidekiq.
++
++### Results
++
++| Run                                   | RSpec time | Wall time |
++|---------------------------------------|------------|-----------|
++| Baseline (seed 1234)                  | 158.6 s    | 162 s     |
++| After fake Sidekiq + no SQL log       | 59.8 s     | 63 s      |
++| After changes, different seed (999)   | 58.7 s     | 62 s      |
++
++**≈ 62% faster (2.7x speed-up), 0 failures, well above the 30-35% target.**
++
++### Remaining known costs in `spec/models` (for the factories phase)
++
++- **BCrypt password hashing: ~7% of run time** (~4 s). Every fabricated user
++  runs `BCrypt::Password.create` (0.9 ms even at cost 1); each
++  `Fabricate(:status)` creates 2 users (status author + bookmark author).
++  Fix later by setting a pre-computed `encrypted_password` in the user
++  fabricator.
++- Fabrication volume itself (~101 s of before/let time in the baseline
++  profile): the `:status` fabricator always creates a bookmark, the `:user`
++  fabricator always creates 2 login activities, media attachments run real
++  libvips/paperclip processing (`MediaAttachment` spec: ~330 ms/attachment).
++- GC pressure ~10% (allocation churn; nothing actionable at config level).
++- `update_statistics` (ActivityTracker Redis writes) on every local status
++  creation (~0.3 ms each) — small; stubbing it in model specs is possible but
++  risks masking behavior, not done.
++- Per-example framework overhead ~4 ms (hooks, transaction, RSpec machinery);
++  `Rails.cache.clear` + `redis.del(redis.keys)` are negligible (~0.05 ms).
++
++### Reusable profiling commands
++
++```bash
++# Full run with timings (one folder only, ~1 min after optimizations)
++bundle exec rspec spec/models --seed 1234 --format progress
++
++# Setup/let breakdown per suite
++RD_PROF=1 RD_PROF_TOP=15 bundle exec rspec -rtest_prof -rtest_prof/rspec_dissect spec/models
++
++# Inline Sidekiq cost
++EVENT_PROF=sidekiq.inline bundle exec rspec -rtest_prof -rtest_prof/event_prof/rspec spec/models
++
++# SQL cost
++EVENT_PROF=sql.active_record bundle exec rspec -rtest_prof -rtest_prof/event_prof/rspec spec/models
++
++# CPU profile of the example phase only (skips boot) — wrap in a support file:
++#   RSpec.configure { |c| c.before(:suite) { StackProf.start(mode: :cpu, interval: 500, raw: true) }
++#                         c.after(:suite)  { StackProf.stop; StackProf.results('tmp/stackprof.dump') } }
++bundle exec rspec -r<that file> spec/models
++stackprof tmp/stackprof.dump --text --limit 50
++```
++
++### Ideas for the next phases (`spec/requests`, factories)
++
++- Apply the same Sidekiq fake-by-default + SQL-log disabling to `type: :request`
++  (check `capture_emails` usage there — several request specs assert mails and
++  will need `:sidekiq_inline`; also `ActiveJob` jobs like push subscriptions).
++- The `:sidekiq_inline` tag is available suite-wide; keep it.
++- Factories: pre-computed `encrypted_password`, optional bookmark/login
++  activity creation, stubbed media processing.
++- `spec/requests` additionally pays for full middleware stack per request;
++  watch for `Rails.application.reload_routes_unless_loaded` and Devise
++  session activation (`SessionActivation.deactivate` on every `sign_in`).
++
++## Phase 2: `spec/requests`
++
++### Baseline (before any request-specific change; model-phase config active)
++
++| Metric                 | Value           |
++|------------------------|-----------------|
++| Examples               | 1877            |
++| RSpec time (seed 1234) | 3m00.7s (181 s) |
++| Failures               | 0               |
++
++Note: the phase-1 optimizations (`type: :model` hooks) do not affect request
++specs, so this equals the pre-optimization baseline for this group.
++
++### Profiling results (before request-specific changes)
++
++- **sidekiq.inline: 54.4 s of 177.5 s (30.7%)**, 7592 inline job executions
++  across 1877 examples. Worst: cache_spec 10.9 s, activitypub/replies 5.7 s
++  (927 jobs — its shared `before` fabricates 7 statuses per example),
++  notifications v1/v2 ~9.6 s (65% of their suite time).
++- **Setup (before+let) is 81% of example time** (143.6 s of 176.9 s).
++- **sql.active_record: 25.3 s (20.2%)**, ~168k queries.
++- StackProf (CPU, whole run):
++  - `BCrypt` password hashing 4.3% (user fabrication — factories phase).
++  - **Route (re)drawing ≈ 8.5%**: `signature_verification_spec` called
++    `Rails.application.routes.draw` + `reload_routes!` around *every* example
++    — 92 full route-set draws for 30 examples (each draw clears the route
++    set, re-evaluates all of config/routes.rb and re-defines ~1500 URL
++    helper methods; `Module#define_method` 3.7% + `remove_method` 1.0% of
++    CPU). Measured with a `LazyRouteSet#draw` counter patch.
++  - GC ≈ 6.8%; PG exec ≈ 3.3%; `IO#write` (log file) ≈ 0.8%.
++  - `Kernel#caller` from `Chewy::Strategy#debug` — Chewy debug logging is
++    active because the shared test logger sits at :debug level.
++- **Logging is huge in request specs**: `log/test.log` was 75 MB. All
++  loggers (`Rails.logger`, `ActiveRecord::Base.logger`, `Chewy.logger`,
++  `ActionView::Base.logger`) are the SAME BroadcastLogger object at
++  :debug level, so every request/render/cache-read/Chewy-call formats
++  messages nobody reads. Rails registers LogSubscriber events with level
++  checks (`subscribe_log_level`) and cache stores check `logger.debug?`
++  before formatting, so **raising the level skips the formatting work**
++  (not just the writes).
++
++### Optimizations applied (phase 2)
++
++1. **Sidekiq fake mode by default for `type: :request` too**
++   (`spec/rails_helper.rb`, one hook per type: `type: %i[model request]`
++   does NOT match — RSpec metadata filters don't support
++   one-of-several-values). Examples that assert job side effects are tagged
++   `:sidekiq_inline` (registered after, so inline wins):
++   - `api/v1/notifications_spec`, `api/v2/notifications_spec`,
++     `api/v2/notifications/accounts_spec` — notifications are created by
++     `LocalNotificationWorker` (async) from Reblog/Favourite/Follow/mention
++     service calls; whole files tagged.
++   - `api/v1/timelines/home_spec` ("when the timeline is available") —
++     home feed fan-out happens in `DistributionWorker` (async).
++   - `api/v1/conversations_spec` (GET describe) — `AccountConversation`
++     records are created by fan-out (`deliver_to_conversation!`).
++   - `api/v1/statuses/favourites_spec` (unfavourite describe) — the
++     controller's `destroy` enqueues `UnfavouriteWorker` instead of calling
++     the service synchronously.
++   - `api/v1/reports_spec` ("creates a report") and
++     `api/v1/admin/account_actions_spec` ("a successful notification
++     delivery" shared example) — `capture_emails` needs `deliver_later` to
++     actually run.
++   - NOT tagged on purpose: `admin/confirmations_spec` also uses
++     `capture_emails` but passes under fake mode (its mail is sent
++     synchronously); inbox specs only assert 202s; specs asserting
++     `have_enqueued_sidekiq_job` already call `Sidekiq.testing!(:fake)`
++     themselves.
++2. **Log-level silencing around model+request examples**: the existing
++   `ActiveRecord::Base.logger = nil` around hook now also sets
++   `Rails.logger.level = :unknown` for the example duration (restored in
++   `ensure`). Safe: no spec reads the log; the one spec mocking
++   `Rails.logger.debug` (remotable_spec) intercepts the method regardless
++   of level.
++3. **`cache_spec.rb` (was 36.7 s, the heaviest suite)**: the shared
++   fabrication before-hook (alice + moderator + 2 statuses + invite + poll
++   + token + follow, read-only for all 258 examples) moved to
++   test-prof's `before_all` (one group-level transaction; per-example
++   transactions roll back to it). Required
++   `require 'test_prof/recipes/rspec/before_all'` in rails_helper. Now ~5.4 s.
++4. **`signature_verification_spec.rb`**: route draw hoisted to
++   `before(:context)` and `reload_routes!` to `after(:context)` (92 draws →
++   5; file: 4.2 s → 1.4 s). Examples of one top-level group run
++   contiguously even with random ordering, so the stripped route set never
++   leaks into other specs; the controller const stub stays per-example
++   (rspec-mocks is unavailable in context hooks).
++
++### Results
++
++| Run                                      | RSpec time | Failures |
++|------------------------------------------|------------|----------|
++| Baseline (seed 1234)                     | 3m00.7s    | 0        |
++| Fake Sidekiq + no SQL log (untagged)     | 1m52.7s    | 41       |
++| Same, `:sidekiq_inline` tags added       | 2m03.2s    | 0        |
++| + log-level silencing + before_all +     | 1m33.0s    | 0        |
++|   route-draw hoist (seed 1234)           |            |          |
++| Final, seed 999 (order-dependence check) | 1m48.2s    | 0        |
++| Final, seed 1234 stability re-run        | 1m36.7s    | 0        |
++| spec/models re-verify (same hook covers  | 55.4s      | 0        |
++|   models now; was 59.8s after phase 1)   |            |          |
++
++**spec/requests: 180.7 s → 93.0 s (48.5% faster; target was >30%).**
++**models + requests combined: 339.3 s → 148.4 s (≈ 2.3x; target was 2x).**
++
++### Remaining known costs in `spec/requests` (for the factories phase)
++
++- Fabrication volume (before/let dominated suites: activitypub/replies
++  fabricates 7 statuses/example; BCrypt hashing ~4-5 s; media attachment
++  processing). `replies_spec`'s `before` cannot be `before_all`'d: it
++  references the per-example `let(:status)`.
++- SQL ~25 s (real work; transactions already used).
++- GC ~7% (allocation churn).
++- `Kernel#caller` in `Chewy::Strategy#debug` only fires at debug level —
++  already neutralized by the log-level silencing.
++
++## Phase 3: factory usage (`spec/models` + `spec/requests`)
++
++### Baseline for this phase (after phases 1-2)
++
++| Metric                     | spec/models | spec/requests |
++|----------------------------|-------------|---------------|
++| RSpec time (seed 1234)     | 59.68 s     | 96.04 s       |
++| FactoryProf total time     | 49.5 s      | 55.4 s        |
++
++### Key findings (FactoryProf + micro-benchmarks)
++
++- **The `:status` fabricator created a `Bookmark` in `after_create`** for every
++  fabricated status — with a brand-new account+user for the bookmarker.
++  FactoryProf: `bookmark` was fabricated 1019× in `spec/models` (only 17
++  top-level!) at 11.5 s, and 945× in `spec/requests` (9 top-level) at 10.8 s.
++  Each auto-bookmark ≈ account + user + 2 login_activities + inserts ≈ 11 ms.
++  No example anywhere asserts on that bookmark (verified by grepping the whole
++  spec tree; `spec/lib/mastodon/cli/media_spec.rb` even had to destroy it to
++  obtain a "non-interacted" status — now a harmless no-op).
++- **The `:user` fabricator created 2 `LoginActivity` rows in `after_create`**:
++  2456 fabrications in `spec/requests` alone (1.9 s + GC churn). Consumers all
++  fabricate their own records or assert deltas (`change(..., :count)`), so
++  nothing depended on them.
++- **BCrypt hashing per fabricated user** (`password '123456789'` runs
++  `Devise::Encryptor.digest` in the `password=` setter): ~0.9 ms × ~2.5 k
++  user creations/run. Fixed by assigning a pre-computed
++  `encrypted_password` digest (constant `TEST_USER_ENCRYPTED_PASSWORD`,
++  computed once per process) instead of `password`.
++- **Faker in the two hottest fabricators**: `Faker::Internet.email` ≈ 0.15 ms,
++  `Faker::Internet.user_name` ≈ 0.08 ms per call (+allocation/GC churn).
++  Replaced with deterministic `user#{i}@example.com` / `user_#{i}` (uniqueness
++  still comes from `sequence`; no spec asserts on the random shape of these
++  values — verified).
++- Micro-benchmark methodology: `GC.disable` + monotonic clock inside a
++  rolled-back transaction (see phase-1 gotcha: manual `Fabricate` commits!).
++  GC pauses inflate in-suite factory times massively (a `Fabricate(:status)`
++  is 25 ms with GC disabled, 34-135 ms with GC on).
++
++### Gotchas discovered
++
++- **fabrication 3.0 semantics** (verified in gem source): all attribute
++  *values* are computed first (statics in declaration order, then procs —
++  overrides replace same-name attributes in place or append), then assigned
++  via setters in that order, then `after_build` runs. Proc attributes receive
++  the already-resolved values hash, so `attrs.key?(:password)` is true iff
++  the caller passed `password:` (the fabricator itself no longer declares
++  it). Specs pass `password: '...'`, `password: nil` (external users) and
++  `encrypted_password: ''` — all three keep working because the
++  `encrypted_password` proc reproduces what the `password=` setter would
++  have stored, and `after_build` restores `@password`
++  (`user.instance_variable_set(:@password, ...)`) only when the setter never
++  ran, so `user.password` and Devise's presence/length validations behave
++  exactly as before.
++- `Fabricate(:user, encrypted_password: '')` fails validation
++  ("Password can't be blank") unless `@password` is set — Devise
++  `validatable` requires the virtual `password` on create even when the
++  digest is forced to blank. This was the one failure caught when changing
++  the fabricator.
++- Beware: `sed`/`cat -A` style checks of spec files in this environment
++  display-escape `"` as `\"`; use `od -c` on the file when in doubt.
++
++### Optimizations applied (phase 3)
++
++1. `spec/fabricators/status_fabricator.rb`: removed the `after_create`
++   auto-bookmark (comment explains why). No spec changes needed.
++2. `spec/fabricators/user_fabricator.rb`: removed the `after_create` login
++   activities; pre-computed BCrypt digest assigned via `encrypted_password`
++   proc (handles `password:`/`encrypted_password:` overrides transparently);
++   `@password` restored in `after_build`; Faker-free email.
++3. `spec/fabricators/account_fabricator.rb`: Faker-free username.
++
++### Results
++
++| Run                                  | spec/models | spec/requests |
++|--------------------------------------|-------------|---------------|
++| Phase-3 baseline (seed 1234)         | 59.68 s     | 96.04 s       |
++| After factory fixes (seed 1234)      | 41.35 s     | 78.93 s       |
++| After factory fixes (seed 999)       | 44.2 s wall | 83.3 s wall   |
++
++**spec/models: −30.7%; spec/requests: −17.8%; combined 155.7 s → 120.3 s
++(−22.7%). Target was 10-20%. 0 failures on seeds 1234 and 999.**
++
++Cumulative since the beginning (models+requests): **339.3 s → 120.3 s
++(≈ 2.8x).**
++
++### Remaining known factory costs (future runs)
++
++- `media_attachment`: 40× in models (6.8 s incl. GC), 34× in requests
++  (2.2 s). Real per-attachment work ≈ 35-40 ms (GC disabled): 2 ImageMagick
++  `convert` spawns (original metadata stripping is unconditional for local
++  accounts + `small` resize), vips thumbnail for blurhash, pure-Ruby
++  `Blurhash.encode` (~10 ms), file writes. `spec/models/media_attachment_spec.rb`
++  (17 fabrications) asserts real processing output, so processing cannot just
++  be skipped globally; a `with_processing`-style opt-in trait + tagging the
++  processing specs is the viable path.
++- `custom_emoji` (44× ≈ 27 ms each in models) and `preview_card` (22× ≈ 52 ms
++  in requests) — same image-processing story.
++- `account` (1194× in models, 9.1 ms each) is now the top factory time
++  (10.9 s): 3 inserts (account + user + keypair) + validations; nothing
++  obviously removable without semantic changes.
++- GC pauses remain the biggest amplifier of all fabrication costs (GC ≈ 7-10%
++  of suite time; ~1 GC cycle per heavy fabrication in micro-benchmarks).
+diff --git a/spec/fabricators/account_fabricator.rb b/spec/fabricators/account_fabricator.rb
+index 6a5218c..1469657 100644
+--- a/spec/fabricators/account_fabricator.rb
++++ b/spec/fabricators/account_fabricator.rb
+@@ -4,7 +4,7 @@ require_relative '../support/signing_keys_helpers'
+ 
+ Fabricator(:account) do
+   transient :suspended, :silenced, :legacy_keypair, :requested_deletion
+-  username              { sequence(:username) { |i| "#{Faker::Internet.user_name(separators: %w(_))}#{i}" } }
++  username              { sequence(:username) { |i| "user_#{i}" } } 
+   last_webfingered_at   { Time.now.utc }
+   public_key            { |attrs| attrs[:legacy_keypair] ? SigningKeysHelpers::PUBLIC_RSA_TEST_KEY : '' }
+   private_key           { |attrs| attrs[:legacy_keypair] && attrs[:domain].nil? ? SigningKeysHelpers::PRIVATE_RSA_TEST_KEY : nil }
+diff --git a/spec/fabricators/status_fabricator.rb b/spec/fabricators/status_fabricator.rb
+index 2539d48..bbaeea7 100644
+--- a/spec/fabricators/status_fabricator.rb
++++ b/spec/fabricators/status_fabricator.rb
+@@ -8,7 +8,9 @@ Fabricator(:status) do
+     status.uri = Faker::Internet.device_token if !status.account.local? && status.uri.nil?
+   end
+ 
+-  after_create do |status|
+-    Fabricate(:bookmark, status: status)
+-  end
++  # NOTE: this fabricator intentionally does NOT create any associated records
++  # (bookmarks, favourites, ...). It used to fabricate a `Bookmark` from a
++  # random account on every created status, which nearly doubled the cost of
++  # the most-used factory in the suite (account + user + inserts) while no
++  # example relied on it. Fabricate bookmarks explicitly when needed.
+ end
+diff --git a/spec/fabricators/user_fabricator.rb b/spec/fabricators/user_fabricator.rb
+index c82a3c9..f325fa6 100644
+--- a/spec/fabricators/user_fabricator.rb
++++ b/spec/fabricators/user_fabricator.rb
+@@ -1,5 +1,13 @@
+ # frozen_string_literal: true
+ 
++# Default credentials for fabricated users.
++#
++# The BCrypt digest is pre-computed once: assigning the `password` attribute
++# makes Devise re-hash it on every fabrication (~1 ms per user), and nearly
++# every fabricated record pulls in a user through the account fabricator.
++TEST_USER_PASSWORD = '123456789'
++TEST_USER_ENCRYPTED_PASSWORD = Devise::Encryptor.digest(User, TEST_USER_PASSWORD)
++
+ Fabricator(:user) do
+   account do |attrs|
+     Fabricate.build(
+@@ -7,14 +15,30 @@ Fabricator(:user) do
+       attrs.fetch(:account_attributes, {}).merge(user: nil)
+     )
+   end
+-  email        { sequence(:email) { |i| "#{i}#{Faker::Internet.email}" } }
+-  password     '123456789'
++  email        { sequence(:email) { |i| "user#{i}@example.com" } }
+   confirmed_at { Time.zone.now }
+   current_sign_in_at { Time.zone.now }
+   agreement true
+ 
+-  after_create do |user|
+-    2.times { Fabricate(:login_activity, user: user) }
++  # NOTE: `password` is intentionally not declared so the hot path skips
++  # Devise's `password=` setter (which hashes with BCrypt). Specs may still
++  # pass `password:` (including `nil` for external users); in that case this
++  # attribute yields exactly what assigning the password would have produced.
++  encrypted_password do |attrs|
++    if attrs.key?(:password)
++      attrs[:password].presence ? Devise::Encryptor.digest(User, attrs[:password]) : ''
++    else
++      TEST_USER_ENCRYPTED_PASSWORD
++    end
++  end
++
++  after_build do |user|
++    # Keep `user.password` and Devise's password validations behaving as if
++    # the password had been assigned normally (e.g. when only
++    # `encrypted_password:` is overridden). A `password:` override — even
++    # `nil` for external users, whose validations are skipped — takes
++    # precedence through the `password=` setter.
++    user.instance_variable_set(:@password, TEST_USER_PASSWORD) if user.password.nil?
+   end
+ end
+ 
+diff --git a/spec/models/admin/account_action_spec.rb b/spec/models/admin/account_action_spec.rb
+index 5339084..6dafbb3 100644
+--- a/spec/models/admin/account_action_spec.rb
++++ b/spec/models/admin/account_action_spec.rb
+@@ -87,7 +87,7 @@ RSpec.describe Admin::AccountAction do
+       end
+     end
+ 
+-    it 'sends email to target account user' do
++    it 'sends email to target account user', :sidekiq_inline do
+       emails = capture_emails { subject }
+ 
+       expect(emails).to contain_exactly(
+diff --git a/spec/models/email_subscription_spec.rb b/spec/models/email_subscription_spec.rb
+index 3730b5c..148fa75 100644
+--- a/spec/models/email_subscription_spec.rb
++++ b/spec/models/email_subscription_spec.rb
+@@ -27,7 +27,7 @@ RSpec.describe EmailSubscription do
+   describe 'Callbacks' do
+     subject { Fabricate(:email_subscription) }
+ 
+-    it 'generates token and delivers confirmation email' do
++    it 'generates token and delivers confirmation email', :sidekiq_inline do
+       emails = capture_emails { subject }
+ 
+       expect(subject.confirmed_at).to be_nil
+diff --git a/spec/models/user_spec.rb b/spec/models/user_spec.rb
+index 3a1964b..1b7990c 100644
+--- a/spec/models/user_spec.rb
++++ b/spec/models/user_spec.rb
+@@ -501,7 +501,7 @@ RSpec.describe User do
+     context 'when user is new' do
+       let(:confirmed_at) { nil }
+ 
+-      it 'confirms user and delivers welcome email' do
++      it 'confirms user and delivers welcome email', :sidekiq_inline do
+         emails = capture_emails { subject }
+ 
+         expect(user.confirmed_at).to be_present
+diff --git a/spec/rails_helper.rb b/spec/rails_helper.rb
+index a91461b..8207126 100644
+--- a/spec/rails_helper.rb
++++ b/spec/rails_helper.rb
+@@ -19,6 +19,10 @@ require 'capybara/rspec'
+ require 'chewy/rspec'
+ require 'pundit/rspec'
+ 
++# `before_all` (test-prof) for shared per-group setup that would otherwise be
++# repeated verbatim in front of every example of a group
++require 'test_prof/recipes/rspec/before_all'
++
+ Rails.root.glob('spec/support/**/*.rb').each { |f| require f }
+ 
+ ActiveRecord::Migration.maintain_test_schema!
+@@ -109,6 +113,52 @@ RSpec.configure do |config|
+     Sidekiq.testing!(:inline)
+   end
+ 
++  # Run Sidekiq jobs in fake mode in model and request specs: examples almost
++  # never depend on jobs being executed, while inline execution significantly
++  # slows down record fabrication and request handling (every model callback
++  # or service call performing `perform_async` would otherwise run the whole
++  # worker, e.g. feed fan-out, ActivityPub delivery, web push). Tag an example
++  # or group with `:sidekiq_inline` to opt back into inline execution.
++  #
++  # NOTE: RSpec metadata filters do not support matching one of several
++  # values, so one hook per spec type is registered.
++  %i(model request).each do |spec_type|
++    config.before(:each, type: spec_type) do
++      Sidekiq.testing!(:fake)
++    end
++  end
++
++  # NOTE: registered after the `type: :model`/`:request` hooks above so that
++  # inline execution wins when both apply.
++  config.before(:each, :sidekiq_inline) do
++    Sidekiq.testing!(:inline)
++  end
++
++  # Query logging through `ActiveRecord::LogSubscriber` formats every single
++  # SQL statement for the test log file. That is pure overhead when running
++  # specs (and `LogSubscriber#call` short-circuits when the logger is `nil`),
++  # so disable the ActiveRecord logger in model and request specs.
++  #
++  # On top of that, the shared test logger (also used for request, rendering,
++  # cache store and Chewy strategy logging) sits at :debug level, so every
++  # request, rendered template and cache read/write formats log messages
++  # nobody reads (hundreds of MB in log/test.log per suite run). Rails
++  # registers LogSubscriber events with level checks (`subscribe_log_level`),
++  # so raising the level for the duration of an example skips the formatting
++  # work entirely instead of merely discarding the output.
++  %i(model request).each do |spec_type|
++    config.around(:each, type: spec_type) do |example|
++      ar_logger = ActiveRecord::Base.logger
++      ActiveRecord::Base.logger = nil
++      log_level = Rails.logger.level
++      Rails.logger.level = :unknown
++      example.run
++    ensure
++      ActiveRecord::Base.logger = ar_logger
++      Rails.logger.level = log_level
++    end
++  end
++
+   config.before :each, type: :cli do
+     stub_reset_connection_pools
+   end
+diff --git a/spec/requests/api/v1/admin/account_actions_spec.rb b/spec/requests/api/v1/admin/account_actions_spec.rb
+index b67db3d..f378260 100644
+--- a/spec/requests/api/v1/admin/account_actions_spec.rb
++++ b/spec/requests/api/v1/admin/account_actions_spec.rb
+@@ -6,7 +6,7 @@ RSpec.describe 'Account actions' do
+   include_context 'with API authentication', user_fabricator: :admin_user, oauth_scopes: 'admin:write admin:write:accounts'
+ 
+   shared_examples 'a successful notification delivery' do
+-    it 'notifies the user about the action taken' do
++    it 'notifies the user about the action taken', :sidekiq_inline do
+       emails = capture_emails { subject }
+ 
+       expect(emails.size)
+diff --git a/spec/requests/api/v1/conversations_spec.rb b/spec/requests/api/v1/conversations_spec.rb
+index aed3645..42e3ae6 100644
+--- a/spec/requests/api/v1/conversations_spec.rb
++++ b/spec/requests/api/v1/conversations_spec.rb
+@@ -9,7 +9,7 @@ RSpec.describe 'API V1 Conversations' do
+ 
+   let(:other) { Fabricate(:user) }
+ 
+-  describe 'GET /api/v1/conversations' do
++  describe 'GET /api/v1/conversations', :sidekiq_inline do
+     before do
+       user.account.follow!(other.account)
+       PostStatusService.new.call(other.account, text: 'Hey @alice', visibility: 'direct')
+diff --git a/spec/requests/api/v1/notifications_spec.rb b/spec/requests/api/v1/notifications_spec.rb
+index 15183d2..7515b16 100644
+--- a/spec/requests/api/v1/notifications_spec.rb
++++ b/spec/requests/api/v1/notifications_spec.rb
+@@ -2,7 +2,7 @@
+ 
+ require 'rails_helper'
+ 
+-RSpec.describe 'Notifications' do
++RSpec.describe 'Notifications', :sidekiq_inline do
+   include_context 'with API authentication', oauth_scopes: 'read:notifications write:notifications'
+ 
+   let(:user)    { Fabricate(:user, account_attributes: { username: 'alice' }) }
+diff --git a/spec/requests/api/v1/reports_spec.rb b/spec/requests/api/v1/reports_spec.rb
+index 52cd581..aa3e19e 100644
+--- a/spec/requests/api/v1/reports_spec.rb
++++ b/spec/requests/api/v1/reports_spec.rb
+@@ -32,7 +32,7 @@ RSpec.describe 'Reports' do
+ 
+     it_behaves_like 'forbidden for wrong scope', 'read read:reports'
+ 
+-    it 'creates a report', :aggregate_failures do
++    it 'creates a report', :aggregate_failures, :sidekiq_inline do
+       emails = capture_emails { subject }
+ 
+       expect(response).to have_http_status(200)
+diff --git a/spec/requests/api/v1/statuses/favourites_spec.rb b/spec/requests/api/v1/statuses/favourites_spec.rb
+index 0e58f3e..24a59bf 100644
+--- a/spec/requests/api/v1/statuses/favourites_spec.rb
++++ b/spec/requests/api/v1/statuses/favourites_spec.rb
+@@ -74,7 +74,7 @@ RSpec.describe 'Favourites' do
+     end
+   end
+ 
+-  describe 'POST /api/v1/statuses/:status_id/unfavourite' do
++  describe 'POST /api/v1/statuses/:status_id/unfavourite', :sidekiq_inline do
+     subject do
+       post "/api/v1/statuses/#{status.id}/unfavourite", headers: headers
+     end
+diff --git a/spec/requests/api/v1/timelines/home_spec.rb b/spec/requests/api/v1/timelines/home_spec.rb
+index 6ff0a51..bf33274 100644
+--- a/spec/requests/api/v1/timelines/home_spec.rb
++++ b/spec/requests/api/v1/timelines/home_spec.rb
+@@ -17,7 +17,7 @@ RSpec.describe 'Home' do
+ 
+     it_behaves_like 'forbidden for wrong scope', 'write write:statuses'
+ 
+-    context 'when the timeline is available' do
++    context 'when the timeline is available', :sidekiq_inline do
+       let(:home_statuses) { bob.statuses + ana.statuses }
+       let!(:bob)          { Fabricate(:account) }
+       let!(:tim)          { Fabricate(:account) }
+diff --git a/spec/requests/api/v2/notifications/accounts_spec.rb b/spec/requests/api/v2/notifications/accounts_spec.rb
+index ddc9c5d..4a6b209 100644
+--- a/spec/requests/api/v2/notifications/accounts_spec.rb
++++ b/spec/requests/api/v2/notifications/accounts_spec.rb
+@@ -2,7 +2,7 @@
+ 
+ require 'rails_helper'
+ 
+-RSpec.describe 'Accounts in grouped notifications' do
++RSpec.describe 'Accounts in grouped notifications', :sidekiq_inline do
+   let(:user)    { Fabricate(:user, account_attributes: { username: 'alice' }) }
+   let(:token)   { Fabricate(:accessible_access_token, resource_owner_id: user.id, scopes: scopes) }
+   let(:scopes)  { 'read:notifications write:notifications' }
+diff --git a/spec/requests/api/v2/notifications_spec.rb b/spec/requests/api/v2/notifications_spec.rb
+index 23e617f..58d2128 100644
+--- a/spec/requests/api/v2/notifications_spec.rb
++++ b/spec/requests/api/v2/notifications_spec.rb
+@@ -2,7 +2,7 @@
+ 
+ require 'rails_helper'
+ 
+-RSpec.describe 'Notifications' do
++RSpec.describe 'Notifications', :sidekiq_inline do
+   include_context 'with API authentication', oauth_scopes: 'read:notifications write:notifications'
+ 
+   let(:user)    { Fabricate(:user, account_attributes: { username: 'alice' }) }
+diff --git a/spec/requests/cache_spec.rb b/spec/requests/cache_spec.rb
+index 8fa5a03..d54e3c2 100644
+--- a/spec/requests/cache_spec.rb
++++ b/spec/requests/cache_spec.rb
+@@ -171,7 +171,11 @@ RSpec.describe 'Caching behavior' do
+   let(:user) { User.find_by(email: 'user@host.example') }
+   let(:token) { Doorkeeper::AccessToken.find_by(resource_owner_id: user.id) }
+ 
+-  before do
++  # These records are only read (never modified) by the examples below, so
++  # create them once for the whole group instead of in front of each of its
++  # 250+ examples (each example is wrapped in its own transaction that rolls
++  # back to the state left by `before_all`).
++  before_all do
+     alice = Fabricate(:account, username: 'alice')
+     user = Fabricate(:moderator_user, email: 'user@host.example')
+     status = Fabricate(:status, account: alice, id: 110_224_538_612_341_312)
+diff --git a/spec/requests/signature_verification_spec.rb b/spec/requests/signature_verification_spec.rb
+index 9556911..1144035 100644
+--- a/spec/requests/signature_verification_spec.rb
++++ b/spec/requests/signature_verification_spec.rb
+@@ -3,14 +3,23 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'signature verification concern' do
++  # Drawing routes is expensive (the route set is cleared, all of
++  # config/routes.rb is re-evaluated and every URL helper is re-defined), so
++  # do it once for the whole group instead of around every example. Examples
++  # of a single top-level group run contiguously, so the stripped-down route
++  # set is never visible to other specs.
++  before(:context) do # rubocop:disable RSpec/BeforeAfterAll -- only the route set is replaced, no records are created
++    draw_tests_controller_routes
++  end
++
+   before do
+-    stub_tests_controller
++    stub_const('ActivityPub::TestsController', activitypub_tests_controller)
+ 
+     # Signature checking is time-dependent, so travel to a fixed date
+     travel_to '2023-12-20T10:00:00Z'
+   end
+ 
+-  after { Rails.application.reload_routes! }
++  after(:context) { Rails.application.reload_routes! } # rubocop:disable RSpec/BeforeAfterAll -- restores the full route set
+ 
+   # Include the private key so the tests can be easily adjusted and reviewed
+   let(:actor_keypair) do
+@@ -765,9 +774,7 @@ RSpec.describe 'signature verification concern' do
+ 
+   private
+ 
+-  def stub_tests_controller
+-    stub_const('ActivityPub::TestsController', activitypub_tests_controller)
+-
++  def draw_tests_controller_routes
+     Rails.application.routes.draw do
+       # NOTE: RouteSet#draw removes all routes, so we need to re-insert one
+       resource :instance_actor, path: 'actor', only: [:show]

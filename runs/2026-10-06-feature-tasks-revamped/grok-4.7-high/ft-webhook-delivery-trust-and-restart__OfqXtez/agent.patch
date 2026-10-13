@@ -1,0 +1,848 @@
+diff --git a/app/helpers/webhooks_helper.rb b/app/helpers/webhooks_helper.rb
+index 2468595..4635914 100644
+--- a/app/helpers/webhooks_helper.rb
++++ b/app/helpers/webhooks_helper.rb
+@@ -22,6 +22,20 @@ module WebhooksHelper
+     ACTION_LABELS[action] || action.to_s.humanize
+   end
+ 
++  def webhook_delivery_outcome(delivery)
++    summary = delivery.response_summary
++
++    if summary.nil?
++      delivery.state.humanize
++    elsif summary[:error].present?
++      summary[:error].to_s.humanize
++    elsif summary[:code]
++      summary[:code].to_s
++    else
++      delivery.state.humanize
++    end
++  end
++
+   def link_to_webhooks(board, &)
+     link_to board_webhooks_path(board_id: board),
+         class: [ "btn btn--circle-mobile", { "btn--reversed": board.webhooks.any? } ],
+diff --git a/app/jobs/event/relay_job.rb b/app/jobs/event/relay_job.rb
+new file mode 100644
+index 0000000..1c8761d
+--- /dev/null
++++ b/app/jobs/event/relay_job.rb
+@@ -0,0 +1,9 @@
++class Event::RelayJob < ApplicationJob
++  queue_as :webhooks
++
++  discard_on ActiveJob::DeserializationError
++
++  def perform(event)
++    event.relay_now
++  end
++end
+diff --git a/app/jobs/webhook/delivery_job.rb b/app/jobs/webhook/delivery_job.rb
+new file mode 100644
+index 0000000..2011952
+--- /dev/null
++++ b/app/jobs/webhook/delivery_job.rb
+@@ -0,0 +1,9 @@
++class Webhook::DeliveryJob < ApplicationJob
++  queue_as :webhooks
++
++  discard_on ActiveJob::DeserializationError
++
++  def perform(delivery)
++    delivery.deliver_now
++  end
++end
+diff --git a/app/models/concerns/eventable.rb b/app/models/concerns/eventable.rb
+index c5e58cc..6db6e6c 100644
+--- a/app/models/concerns/eventable.rb
++++ b/app/models/concerns/eventable.rb
+@@ -6,7 +6,7 @@ module Eventable
+   end
+ 
+   def track_event(action, creator: Current.user, board: self.board, **particulars)
+-    if should_track_event?
++    if should_track_event? && !Event.suppressed
+       board.events.create!(action: "#{eventable_prefix}_#{action}", creator:, board:, eventable: self, particulars:)
+     end
+   end
+diff --git a/app/models/event.rb b/app/models/event.rb
+index 5c85165..463224e 100644
+--- a/app/models/event.rb
++++ b/app/models/event.rb
+@@ -1,5 +1,5 @@
+ class Event < ApplicationRecord
+-  include Notifiable, Particulars, Promptable
++  include Notifiable, Particulars, Promptable, Relaying
+ 
+   belongs_to :account, default: -> { board.account }
+   belongs_to :board
+diff --git a/app/models/event/relaying.rb b/app/models/event/relaying.rb
+new file mode 100644
+index 0000000..830c8e1
+--- /dev/null
++++ b/app/models/event/relaying.rb
+@@ -0,0 +1,45 @@
++module Event::Relaying
++  extend ActiveSupport::Concern
++
++  included do
++    thread_mattr_accessor :suppressed, instance_accessor: false, default: false
++
++    after_create_commit :relay_later
++  end
++
++  class_methods do
++    def suppress
++      was_suppressed = suppressed
++      self.suppressed = true
++      yield
++    ensure
++      self.suppressed = was_suppressed
++    end
++  end
++
++  def relay_later
++    if relaying?
++      Event::RelayJob.perform_later(self)
++    end
++  end
++
++  def relay_now
++    return if self.class.suppressed
++
++    with_lock do
++      webhooks_for_relay.find_each do |webhook|
++        delivery = webhook.deliveries.find_or_create_by!(event: self)
++        delivery.deliver_later if delivery.pending?
++      end
++    end
++  end
++
++  private
++    def relaying?
++      !self.class.suppressed && webhooks_for_relay.exists?
++    end
++
++    def webhooks_for_relay
++      board.webhooks.active.subscribed_to(action)
++    end
++end
+diff --git a/app/models/webhook.rb b/app/models/webhook.rb
+index 5ecb714..4040423 100644
+--- a/app/models/webhook.rb
++++ b/app/models/webhook.rb
+@@ -1,4 +1,6 @@
+ class Webhook < ApplicationRecord
++  USER_AGENT = "fizzy/1.0.0 Webhook"
++
+   SLACK_WEBHOOK_URL_REGEX = %r{//hooks\.slack\.com/services/T[^\/]+/B[^\/]+/[^\/]+\Z}i
+   CAMPFIRE_WEBHOOK_URL_REGEX = %r{/rooms/\d+/\d+-[^\/]+/messages\Z}i
+   BASECAMP_CAMPFIRE_WEBHOOK_URL_REGEX = %r{/\d+/integrations/[^\/]+/buckets/\d+/chats/\d+/lines\Z}i
+@@ -21,6 +23,7 @@ class Webhook < ApplicationRecord
+   has_secure_token :signing_secret
+ 
+   has_many :deliveries, dependent: :delete_all
++  has_one :delinquency_tracker, dependent: :destroy
+ 
+   belongs_to :account, default: -> { board.account }
+   belongs_to :board
+@@ -29,6 +32,9 @@ class Webhook < ApplicationRecord
+ 
+   scope :ordered, -> { order(name: :asc, id: :desc) }
+   scope :active, -> { where(active: true) }
++  scope :subscribed_to, ->(action) {
++    where("instr(subscribed_actions, ?) > 0", %("#{action}"))
++  }
+ 
+   normalizes :subscribed_actions, with: ->(value) { Array.wrap(value).map(&:to_s).uniq & PERMITTED_ACTIONS }
+   normalizes :url, with: -> { it.strip }
+@@ -36,8 +42,13 @@ class Webhook < ApplicationRecord
+   validates :name, presence: true
+   validate :validate_url
+ 
++  after_create :create_delinquency_tracker!
++
+   def activate
+-    update! active: true unless active?
++    transaction do
++      update!(active: true) unless active?
++      delinquency_tracker&.reset
++    end
+   end
+ 
+   def deactivate
+@@ -56,7 +67,19 @@ class Webhook < ApplicationRecord
+     url.match? SLACK_WEBHOOK_URL_REGEX
+   end
+ 
++  def ensure_delinquency_tracker
++    delinquency_tracker || create_delinquency_tracker!
++  end
++
+   private
++    def create_delinquency_tracker!
++      if delinquency_tracker
++        delinquency_tracker
++      else
++        build_delinquency_tracker(account: account).tap(&:save!)
++      end
++    end
++
+     def validate_url
+       uri = URI.parse(url.presence)
+ 
+diff --git a/app/models/webhook/delinquency_tracker.rb b/app/models/webhook/delinquency_tracker.rb
+new file mode 100644
+index 0000000..8a20163
+--- /dev/null
++++ b/app/models/webhook/delinquency_tracker.rb
+@@ -0,0 +1,42 @@
++class Webhook::DelinquencyTracker < ApplicationRecord
++  FAILURE_THRESHOLD = 10
++  FAILURE_WINDOW = 1.hour
++
++  belongs_to :account, default: -> { webhook.account }
++  belongs_to :webhook
++
++  def record_success
++    with_lock do
++      reset if consecutive_failures_count.positive? || first_failure_at.present?
++    end
++  end
++
++  def record_failure(at: Time.current)
++    with_lock do
++      if streak_expired?(at)
++        update!(consecutive_failures_count: 1, first_failure_at: at)
++      else
++        self.first_failure_at ||= at
++        self.consecutive_failures_count += 1
++        save!
++      end
++
++      webhook.deactivate if delinquent?(at)
++    end
++  end
++
++  def reset
++    update!(consecutive_failures_count: 0, first_failure_at: nil)
++  end
++
++  private
++    def streak_expired?(at)
++      first_failure_at.nil? || first_failure_at < at - FAILURE_WINDOW
++    end
++
++    def delinquent?(at)
++      consecutive_failures_count >= FAILURE_THRESHOLD &&
++        first_failure_at.present? &&
++        first_failure_at >= at - FAILURE_WINDOW
++    end
++end
+diff --git a/app/models/webhook/delivery.rb b/app/models/webhook/delivery.rb
+index 4ecfeb8..942ec5d 100644
+--- a/app/models/webhook/delivery.rb
++++ b/app/models/webhook/delivery.rb
+@@ -1,4 +1,10 @@
+ class Webhook::Delivery < ApplicationRecord
++  RETENTION_PERIOD = 1.week
++  OPEN_TIMEOUT = 5
++  READ_TIMEOUT = 10
++
++  class Unreachable < StandardError; end
++
+   belongs_to :account, default: -> { webhook.account }
+   belongs_to :webhook
+   belongs_to :event
+@@ -10,6 +16,24 @@ class Webhook::Delivery < ApplicationRecord
+ 
+   scope :ordered, -> { order created_at: :desc, id: :desc }
+ 
++  class << self
++    def cleanup
++      where(created_at: ...RETENTION_PERIOD.ago).delete_all
++    end
++  end
++
++  def deliver_later
++    Webhook::DeliveryJob.perform_later(self)
++  end
++
++  def deliver_now
++    if webhook.active?
++      deliver_pending if pending?
++    else
++      skip_inactive
++    end
++  end
++
+   def sanitized_request
+     if headers = request&.dig("headers")&.except("X-Webhook-Signature")
+       { headers: headers }
+@@ -29,4 +53,120 @@ class Webhook::Delivery < ApplicationRecord
+   def succeeded?
+     completed? && response[:error].blank? && response[:code].between?(200, 299)
+   end
++
++  private
++    def skip_inactive
++      update!(state: :errored, response: { error: "inactive" }) if pending?
++    end
++
++    def deliver_pending
++      body = Webhook::Payload.new(webhook, event).body
++      headers = request_headers(body)
++
++      if claim
++        update!(request: { headers: headers })
++        http_response = transmit(body, headers)
++        complete_with(code: http_response.code.to_i)
++      end
++    rescue Unreachable
++      complete_with_error("destination_unreachable")
++    rescue StandardError => error
++      Rails.logger.error("Webhook delivery #{id} failed: #{error.class}: #{error.message}")
++      if in_progress?
++        complete_with_error("destination_unreachable")
++      elsif pending?
++        update!(state: :errored, response: { error: "payload_error" })
++      else
++        raise
++      end
++    end
++
++    def claim
++      claimed = self.class.where(id: id, state: "pending").update_all(state: "in_progress", updated_at: Time.current) == 1
++      reload if claimed
++      claimed
++    end
++
++    def request_headers(body)
++      {
++        "User-Agent" => Webhook::USER_AGENT,
++        "Content-Type" => "application/json",
++        "X-Webhook-Timestamp" => event.created_at.utc.iso8601(3),
++        "X-Webhook-Signature" => signature_for(body)
++      }
++    end
++
++    def signature_for(body)
++      OpenSSL::HMAC.hexdigest("SHA256", webhook.signing_secret, body)
++    end
++
++    def transmit(body, headers)
++      uri = URI.parse(webhook.url)
++      raise Unreachable, "unsupported scheme" unless uri.scheme.in?(%w[ http https ])
++
++      ip = public_ip_for(uri)
++      raise Unreachable, "no public address for #{uri.host}" if ip.blank?
++
++      http = Net::HTTP.new(uri.host, uri.port)
++      http.ipaddr = ip
++      http.use_ssl = uri.scheme == "https"
++      http.open_timeout = OPEN_TIMEOUT
++      http.read_timeout = READ_TIMEOUT
++
++      request = Net::HTTP::Post.new(request_path(uri))
++      headers.each { |name, value| request[name] = value }
++      request.body = body
++
++      http.request(request)
++    rescue Unreachable
++      raise
++    rescue StandardError => error
++      raise Unreachable, error.message
++    end
++
++    def public_ip_for(uri)
++      host = uri.host
++      return if host.blank?
++
++      if literal_ip?(host)
++        host unless SsrfProtection.blocked_address?(host)
++      else
++        SsrfProtection.resolve_public_ip(host)
++      end
++    end
++
++    def literal_ip?(host)
++      IPAddr.new(host)
++      true
++    rescue IPAddr::InvalidAddressError
++      false
++    end
++
++    def request_path(uri)
++      uri.request_uri.presence || "/"
++    end
++
++    def complete_with(code:)
++      transaction do
++        update!(state: :completed, response: { code: code, error: nil })
++        report_to_tracker
++      end
++    end
++
++    def complete_with_error(error)
++      transaction do
++        update!(state: :errored, response: { error: error })
++        report_to_tracker
++      end
++    end
++
++    def report_to_tracker
++      tracker = webhook.ensure_delinquency_tracker
++
++      if succeeded?
++        tracker.record_success
++      elsif failed?
++        tracker.record_failure
++      end
++    end
+ end
+diff --git a/app/models/webhook/payload.rb b/app/models/webhook/payload.rb
+new file mode 100644
+index 0000000..50ff857
+--- /dev/null
++++ b/app/models/webhook/payload.rb
+@@ -0,0 +1,82 @@
++class Webhook::Payload
++  def initialize(webhook, event)
++    @webhook = webhook
++    @event = event
++  end
++
++  def body
++    if webhook.for_slack?
++      { text: plain_message }.to_json
++    elsif webhook.for_campfire?
++      { body: html_message }.to_json
++    elsif webhook.for_basecamp?
++      { content: html_message }.to_json
++    else
++      event_json
++    end
++  end
++
++  private
++    attr_reader :webhook, :event
++
++    def plain_message
++      [ plain_description, event_url ].compact_blank.join("\n")
++    end
++
++    def plain_description
++      CGI.unescapeHTML(event.description_for(nil).to_plain_text.to_s)
++    end
++
++    def html_message
++      render(:html).strip
++    end
++
++    def event_json
++      render(:json)
++    end
++
++    def event_url
++      if event.eventable
++        Rails.application.routes.url_helpers.polymorphic_url(event.eventable, **url_options)
++      end
++    end
++
++    def render(format)
++      previous_url_options = ActiveStorage::Current.url_options
++      ActiveStorage::Current.url_options = url_options
++
++      renderer.render(
++        template: "webhooks/event",
++        assigns: { event: event },
++        formats: [ format ],
++        layout: false
++      )
++    ensure
++      ActiveStorage::Current.url_options = previous_url_options
++    end
++
++    def renderer
++      ApplicationController.renderer.new(
++        http_host: http_host,
++        https: url_options[:protocol].to_s == "https",
++        script_name: webhook.account.slug
++      )
++    end
++
++    def http_host
++      if url_options[:port]
++        "#{url_options[:host]}:#{url_options[:port]}"
++      else
++        url_options[:host]
++      end
++    end
++
++    def url_options
++      @url_options ||= begin
++        options = Rails.application.routes.default_url_options.presence ||
++          Rails.application.config.action_mailer.default_url_options ||
++          {}
++        options.merge(script_name: webhook.account.slug)
++      end
++    end
++end
+diff --git a/app/views/webhooks/_delivery.html.erb b/app/views/webhooks/_delivery.html.erb
+index 8dba2f4..ab65ad6 100644
+--- a/app/views/webhooks/_delivery.html.erb
++++ b/app/views/webhooks/_delivery.html.erb
+@@ -1,7 +1,6 @@
+-<%= tag.li id: dom_id(delivery), class: token_list(delivery.succeeded? && "delivery--succeeded") do %>
+-  <strong>
+-    <%= delivery.state %>
+-  </strong>
++<%= tag.li id: dom_id(delivery), class: token_list(delivery.succeeded? && "delivery--succeeded", delivery.failed? && "delivery--failed") do %>
++  <strong><%= webhook_delivery_outcome(delivery) %></strong>
++  <span><%= webhook_action_label(delivery.event.action) %></span>
+   <div class="txt-subtle">
+     <%= time_tag delivery.created_at, time_ago_in_words(delivery.created_at) %>
+   </div>
+diff --git a/app/views/webhooks/event.html.erb b/app/views/webhooks/event.html.erb
+index f2920e8..c070ea2 100644
+--- a/app/views/webhooks/event.html.erb
++++ b/app/views/webhooks/event.html.erb
+@@ -1,4 +1,4 @@
+-<%= @event.description_for(Current.user).to_plain_text %>
++<%= @event.description_for(nil).to_plain_text %>
+ <% if @event.eventable %>
+ <%= link_to "↗︎", polymorphic_url(@event.eventable) %>
+ <% end %>
+diff --git a/app/views/webhooks/show.html.erb b/app/views/webhooks/show.html.erb
+index 2fe01f0..1e81543 100644
+--- a/app/views/webhooks/show.html.erb
++++ b/app/views/webhooks/show.html.erb
+@@ -31,7 +31,7 @@
+     <strong><code><%= @webhook.signing_secret %></code></strong>
+     <p class="txt-small txt-subtle margin-none">
+       We'll send a <code>X-Webhook-Signature</code> header with each request.
+-      You can generate a <code>HMAC</code> using <code>SHA256</code> of the request body with this secret
++      You can generate a hex-encoded <code>HMAC-SHA256</code> of the raw request body with this secret
+       to verify that the request came from us.
+     </p>
+   </div>
+@@ -55,7 +55,7 @@
+         <p class="margin-none txt-subtle">This Webhook hasn't been triggered yet</p>
+       <% else %>
+         <ul class="margin-none unpad-block">
+-          <%= render partial: "webhooks/delivery", collection: @webhook.deliveries.ordered.limit(20), as: :delivery %>
++          <%= render partial: "webhooks/delivery", collection: @webhook.deliveries.ordered.includes(:event).limit(20), as: :delivery %>
+         </ul>
+       <% end %>
+     </div>
+diff --git a/docs/api/sections/webhooks.md b/docs/api/sections/webhooks.md
+index a4f48b5..3958154 100644
+--- a/docs/api/sections/webhooks.md
++++ b/docs/api/sections/webhooks.md
+@@ -2,6 +2,21 @@
+ 
+ Webhooks notify another application when something happens on a board. Only account admins can list, view, create, update, delete, or reactivate webhooks.
+ 
++## Delivery
++
++When a subscribed event happens, Fizzy POSTs JSON to the payload URL exactly once.
++
++Generic endpoints receive the event. Slack incoming-webhook URLs receive `{ "text": "..." }`. Campfire message URLs receive `{ "body": "..." }`. Basecamp chat line URLs receive `{ "content": "..." }`.
++
++Each request includes:
++
++- `User-Agent: fizzy/1.0.0 Webhook`
++- `Content-Type: application/json`
++- `X-Webhook-Timestamp`: the event time
++- `X-Webhook-Signature`: hex-encoded HMAC-SHA256 of the raw request body, using the webhook signing secret
++
++The delivery log records the outcome. Logs are kept for one week. A webhook is switched off after ten consecutive failures within an hour, and can be turned back on with the activation endpoint.
++
+ ## `GET /:account_slug/boards/:board_id/webhooks`
+ 
+ Returns a paginated list of webhooks for a board.
+diff --git a/test/controllers/webhooks_controller_test.rb b/test/controllers/webhooks_controller_test.rb
+index 674be64..19a3a62 100644
+--- a/test/controllers/webhooks_controller_test.rb
++++ b/test/controllers/webhooks_controller_test.rb
+@@ -20,7 +20,17 @@ class WebhooksControllerTest < ActionDispatch::IntegrationTest
+     assert_response :success
+   end
+ 
+-  test "new" do
++test "show lists how deliveries went" do
++  webhook = webhooks(:active)
++  get board_webhook_path(webhook.board, webhook)
++
++  assert_response :success
++  assert_select "li##{dom_id(webhook_deliveries(:successfully_completed))}", text: /200/
++  assert_select "li##{dom_id(webhook_deliveries(:successfully_completed))}", text: /Card added/
++  assert_select "li##{dom_id(webhook_deliveries(:errored))}", text: /Destination unreachable/
++end
++
++test "new" do
+     get new_board_webhook_path(boards(:writebook))
+     assert_response :success
+     assert_select "form"
+diff --git a/test/models/event/relaying_test.rb b/test/models/event/relaying_test.rb
+new file mode 100644
+index 0000000..223e950
+--- /dev/null
++++ b/test/models/event/relaying_test.rb
+@@ -0,0 +1,255 @@
++require "test_helper"
++
++class Event::RelayingTest < ActiveSupport::TestCase
++  PUBLIC_IP = "93.184.216.34"
++
++  setup do
++    @board = boards(:writebook)
++    @board.webhooks.update_all(active: false)
++    @url = "https://hooks.example.com/fizzy"
++    @webhook = @board.webhooks.create!(
++      name: "Receiver",
++      url: @url,
++      subscribed_actions: %w[ card_published card_closed comment_created ]
++    )
++    SsrfProtection.stubs(:resolve_public_ip).returns(PUBLIC_IP)
++  end
++
++  test "creating a webhook starts a delinquency tracker" do
++    assert @webhook.delinquency_tracker.persisted?
++    assert_equal 0, @webhook.delinquency_tracker.consecutive_failures_count
++  end
++
++  test "an event posts once and the delivery log records the outcome" do
++    request = stub_request(:post, @url)
++      .with(ipaddr: PUBLIC_IP)
++      .to_return(status: 200, body: "ok")
++
++    event = publish_event
++    deliver_webhooks
++
++    assert_requested request, times: 1
++    delivery = @webhook.deliveries.find_by!(event: event)
++    assert delivery.succeeded?
++    assert_equal 200, delivery.response_summary[:code]
++    assert_equal "fizzy/1.0.0 Webhook", delivery.sanitized_request[:headers]["User-Agent"]
++    assert_equal "application/json", delivery.sanitized_request[:headers]["Content-Type"]
++    assert_equal event.created_at.utc.iso8601(3), delivery.sanitized_request[:headers]["X-Webhook-Timestamp"]
++    assert_not delivery.sanitized_request[:headers].key?("X-Webhook-Signature")
++
++    signature = nil
++    body = nil
++    assert_requested :post, @url do |posted|
++      body = posted.body
++      signature = posted.headers["X-Webhook-Signature"]
++    end
++    assert_equal OpenSSL::HMAC.hexdigest("SHA256", @webhook.signing_secret, body), signature
++    assert_equal "card_published", JSON.parse(body)["action"]
++    assert_equal event.id, JSON.parse(body)["id"]
++
++    delivery.deliver_now
++    assert_requested request, times: 1
++  end
++
++  test "relaying the same event does not post twice" do
++    request = stub_request(:post, @url).with(ipaddr: PUBLIC_IP).to_return(status: 204)
++
++    event = publish_event
++    deliver_webhooks
++    event.relay_now
++    perform_enqueued_jobs only: Webhook::DeliveryJob
++
++    assert_requested request, times: 1
++    assert_equal 1, @webhook.deliveries.where(event: event).count
++  end
++
++  test "inactive webhooks and unsubscribed actions are not delivered" do
++    request = stub_request(:post, @url).to_return(status: 200)
++    @webhook.deactivate
++
++    publish_event
++    deliver_webhooks
++    assert_not_requested request
++
++    @webhook.activate
++    publish_event("card_triaged")
++    deliver_webhooks
++    assert_not_requested request
++    assert_empty @webhook.deliveries
++  end
++
++  test "a suppressed event is not relayed" do
++    assert_no_enqueued_jobs only: Event::RelayJob do
++      Event.suppress do
++        publish_event
++      end
++    end
++
++    assert_no_difference -> { Event.count } do
++      Event.suppress do
++        @board.cards.create!(title: "Quiet card", creator: users(:david), status: :published)
++      end
++    end
++
++    assert_not Event.suppressed
++  end
++
++  test "publishing a card and adding a comment deliver to subscribed receivers" do
++    stub_request(:post, @url).with(ipaddr: PUBLIC_IP).to_return(status: 200)
++    Current.session = sessions(:david)
++
++    card = @board.cards.create!(title: "Ship the webhook", creator: users(:david), status: :published)
++    card.comments.create!(body: "Looks good", creator: users(:david))
++    deliver_webhooks
++
++    actions = @webhook.deliveries.includes(:event).map { |delivery| delivery.event.action }
++    assert_includes actions, "card_published"
++    assert_includes actions, "comment_created"
++    assert @webhook.deliveries.all?(&:succeeded?)
++    assert_requested :post, @url, times: 2
++  end
++
++  test "ten consecutive failures within an hour switch the webhook off" do
++    stub_request(:post, @url).with(ipaddr: PUBLIC_IP).to_return(status: 500)
++
++    travel_to Time.zone.parse("2026-04-08 12:00:00 UTC") do
++      9.times do
++        publish_event
++        deliver_webhooks
++      end
++
++      assert @webhook.reload.active?
++      assert_equal 9, @webhook.delinquency_tracker.reload.consecutive_failures_count
++
++      publish_event
++      deliver_webhooks
++
++      assert_not @webhook.reload.active?
++      assert_equal 10, @webhook.delinquency_tracker.consecutive_failures_count
++      assert @webhook.deliveries.ordered.first.failed?
++    end
++  end
++
++  test "failures spread over more than an hour do not switch the webhook off" do
++    stub_request(:post, @url).with(ipaddr: PUBLIC_IP).to_return(status: 500)
++
++    travel_to Time.zone.parse("2026-04-08 12:00:00 UTC") do
++      9.times do
++        publish_event
++        deliver_webhooks
++      end
++
++      travel 61.minutes
++      publish_event
++      deliver_webhooks
++
++      assert @webhook.reload.active?
++      assert_equal 1, @webhook.delinquency_tracker.reload.consecutive_failures_count
++    end
++  end
++
++  test "a success resets the failure streak" do
++    @webhook.delinquency_tracker.update!(consecutive_failures_count: 4, first_failure_at: 10.minutes.ago)
++    stub_request(:post, @url).with(ipaddr: PUBLIC_IP).to_return(status: 201)
++
++    publish_event
++    deliver_webhooks
++
++    tracker = @webhook.delinquency_tracker.reload
++    assert_equal 0, tracker.consecutive_failures_count
++    assert_nil tracker.first_failure_at
++  end
++
++  test "a private address is not requested and counts as a failure" do
++    SsrfProtection.unstub(:resolve_public_ip)
++    @webhook.update!(url: "http://127.0.0.1/hook")
++    request = stub_request(:post, "http://127.0.0.1/hook")
++
++    publish_event
++    deliver_webhooks
++
++    assert_not_requested request
++    delivery = @webhook.deliveries.last
++    assert delivery.errored?
++    assert_equal "destination_unreachable", delivery.response_summary[:error]
++    assert_equal 1, @webhook.delinquency_tracker.reload.consecutive_failures_count
++  end
++
++  test "slack, campfire, and basecamp receive a short message" do
++    slack = @board.webhooks.create!(
++      name: "Slack",
++      url: "https://hooks.slack.com/services/T12345678/B12345678/abcdefghijklmnopqrstuvwx",
++      subscribed_actions: %w[ card_published ]
++    )
++    campfire = @board.webhooks.create!(
++      name: "Campfire",
++      url: "https://campfire.example.com/rooms/123/456-room-name/messages",
++      subscribed_actions: %w[ card_published ]
++    )
++    basecamp = @board.webhooks.create!(
++      name: "Basecamp",
++      url: "https://3.basecamp.com/999/integrations/some-token/buckets/111/chats/222/lines",
++      subscribed_actions: %w[ card_published ]
++    )
++
++    slack_request = stub_request(:post, slack.url).with(ipaddr: PUBLIC_IP).to_return(status: 200)
++    campfire_request = stub_request(:post, campfire.url).with(ipaddr: PUBLIC_IP).to_return(status: 200)
++    basecamp_request = stub_request(:post, basecamp.url).with(ipaddr: PUBLIC_IP).to_return(status: 200)
++    generic_request = stub_request(:post, @url).with(ipaddr: PUBLIC_IP).to_return(status: 200)
++
++    publish_event
++    deliver_webhooks
++
++    assert_requested slack_request
++    assert_requested campfire_request
++    assert_requested basecamp_request
++    assert_requested generic_request
++
++    assert_requested :post, slack.url do |posted|
++      JSON.parse(posted.body).key?("text")
++    end
++    assert_requested :post, campfire.url do |posted|
++      JSON.parse(posted.body).key?("body")
++    end
++    assert_requested :post, basecamp.url do |posted|
++      JSON.parse(posted.body).key?("content")
++    end
++  end
++
++  test "delivery log keeps a week" do
++    old_delivery = @webhook.deliveries.create!(event: events(:logo_published), created_at: 8.days.ago)
++    recent_delivery = @webhook.deliveries.create!(event: events(:layout_published), created_at: 6.days.ago)
++
++    Webhook::Delivery.cleanup
++
++    assert_not Webhook::Delivery.exists?(old_delivery.id)
++    assert Webhook::Delivery.exists?(recent_delivery.id)
++  end
++
++  test "reactivating a webhook clears the failure streak" do
++    @webhook.delinquency_tracker.update!(consecutive_failures_count: 10, first_failure_at: Time.current)
++    @webhook.deactivate
++
++    @webhook.activate
++
++    tracker = @webhook.delinquency_tracker.reload
++    assert @webhook.active?
++    assert_equal 0, tracker.consecutive_failures_count
++    assert_nil tracker.first_failure_at
++  end
++
++  private
++    def publish_event(action = "card_published")
++      @board.events.create!(
++        action: action,
++        creator: users(:david),
++        eventable: cards(:logo),
++        particulars: action == "card_triaged" ? { particulars: { column: "Doing" } } : {}
++      )
++    end
++
++    def deliver_webhooks
++      perform_enqueued_jobs only: Event::RelayJob
++      perform_enqueued_jobs only: Webhook::DeliveryJob
++    end
++end

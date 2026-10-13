@@ -1,6 +1,10 @@
 require "test_helper"
 
+LemansReport.base_credit = 1.0
+
 class VerifierTest < ActionDispatch::IntegrationTest
+  include LemansReport::Assertions
+
   RECURRING_TASKS_IN_THE_BASE = %i[ auto_postpone_all_due delete_unused_tags clear_solid_queue_finished_jobs
     cleanup_webhook_deliveries cleanup_magic_links cleanup_exports cleanup_imports incineration yabeda_actioncable ]
 

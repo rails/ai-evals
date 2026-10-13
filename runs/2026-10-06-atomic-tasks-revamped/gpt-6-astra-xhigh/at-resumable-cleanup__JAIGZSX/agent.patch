@@ -1,0 +1,234 @@
+diff --git a/app/jobs/title_cleanup_job.rb b/app/jobs/title_cleanup_job.rb
+index 13721ed..115425e 100644
+--- a/app/jobs/title_cleanup_job.rb
++++ b/app/jobs/title_cleanup_job.rb
+@@ -1,7 +1,17 @@
+ class TitleCleanupJob < ApplicationJob
++  include ActiveJob::Continuable
++
++  # Resque does not support delayed retries without resque-scheduler.
++  self.resume_options = {}
++
+   def perform
+-    Leaf.find_each(order: :asc) do |leaf|
+-      leaf.update!(title: cleaned(leaf.title))
++    step :clean_titles do |step|
++      Leaf.find_each(start: step.cursor&.first, order: :asc) do |leaf|
++        # A replay must clean the original title, not strip another layer of quotes.
++        original_title = step.cursor&.first == leaf.id ? step.cursor.last : leaf.title
++        step.set! [ leaf.id, original_title ]
++        leaf.update!(title: cleaned(original_title))
++      end
+     end
+   end
+ 
+diff --git a/lib/rails_ext/resque_worker.rb b/lib/rails_ext/resque_worker.rb
+new file mode 100644
+index 0000000..008e1e7
+--- /dev/null
++++ b/lib/rails_ext/resque_worker.rb
+@@ -0,0 +1,8 @@
++# Procfile runs Resque workers with FORK_PER_JOB=false, so shutdown and job
++# execution share an adapter. Let continuable jobs checkpoint before exiting.
++Resque::Worker.prepend(Module.new do
++  def shutdown
++    super
++    ActiveJob::Base.queue_adapter.stopping = true
++  end
++end)
+diff --git a/test/jobs/title_cleanup_job_test.rb b/test/jobs/title_cleanup_job_test.rb
+new file mode 100644
+index 0000000..8424006
+--- /dev/null
++++ b/test/jobs/title_cleanup_job_test.rb
+@@ -0,0 +1,190 @@
++require "test_helper"
++require "active_job/continuation"
++
++class TitleCleanupJobTest < ActiveJob::TestCase
++  setup do
++    @leaves = Leaf.order(:id).to_a
++    @titles = [ '"Quoted" opening', 'Ending in "quotes"', '"Entirely quoted"', 'An "inner" quote' ]
++    @leaves.zip(@titles).each do |leaf, title|
++      leaf.update_columns(title: %Q("#{title}"))
++    end
++  end
++
++  teardown do
++    queue_adapter.stopping = false
++  end
++
++  test "cleans every title once in ascending ID order" do
++    track_updates do |updated_ids|
++      TitleCleanupJob.perform_now
++
++      assert_equal @leaves.map(&:id), updated_ids
++      assert_clean_titles
++      assert_no_enqueued_jobs only: TitleCleanupJob
++    end
++  end
++
++  test "resumes before the next write without revisiting earlier leaves" do
++    track_updates do |updated_ids|
++      queue_adapter.stopping = -> { updated_ids.size == 1 }
++      assert_enqueued_with(job: TitleCleanupJob) { TitleCleanupJob.perform_now }
++
++      assert_equal [ @leaves.first.id ], updated_ids
++      assert_equal @titles.first, @leaves.first.reload.title
++      assert_equal %Q("#{@titles.second}"), @leaves.second.reload.title
++
++      queue_adapter.stopping = false
++      resume_cleanup
++
++      assert_equal @leaves.map(&:id), updated_ids
++      assert_clean_titles
++    end
++  end
++
++  [ 0, 1, 2, 3 ].each do |index|
++    test "resumes after saving leaf #{index} without removing its inner quotes" do
++      track_updates do |updated_ids|
++        interrupt_after_save(@leaves[index]) do
++          assert_enqueued_with(job: TitleCleanupJob) { TitleCleanupJob.perform_now }
++        end
++
++        assert_equal @leaves.take(index + 1).map(&:id), updated_ids
++        assert_equal @titles[index], @leaves[index].reload.title
++
++        resume_cleanup
++
++        assert_equal @leaves.take(index + 1).map(&:id) + @leaves.drop(index).map(&:id), updated_ids
++        assert_clean_titles
++      end
++    end
++  end
++
++  test "repeated resumptions of the same leaf retain its original title" do
++    track_updates do |updated_ids|
++      interrupt_after_save(@leaves.second) do
++        assert_enqueued_with(job: TitleCleanupJob) { TitleCleanupJob.perform_now }
++        2.times do
++          resume_cleanup
++          assert_equal @titles.second, @leaves.second.reload.title
++          assert_enqueued_jobs 1, only: TitleCleanupJob
++        end
++      end
++
++      resume_cleanup
++
++      assert_equal [ @leaves.first.id ] + [ @leaves.second.id ] * 4 + @leaves.drop(2).map(&:id), updated_ids
++      assert_clean_titles
++    end
++  end
++
++  [ :shutdown, :shutdown! ].each do |shutdown_method|
++    test "Resque #{shutdown_method} requeues at the next leaf" do
++      worker = Resque::Worker.new("default")
++      worker.term_child = false
++      first_leaf_id = @leaves.first.id
++      callback = ->(leaf) { worker.public_send(shutdown_method) if leaf.id == first_leaf_id }
++
++      with_after_save(callback) do
++        assert_enqueued_with(job: TitleCleanupJob) { TitleCleanupJob.perform_now }
++      end
++
++      assert worker.shutdown?
++      assert queue_adapter.stopping?
++      assert_equal @titles.first, @leaves.first.reload.title
++      assert_equal %Q("#{@titles.second}"), @leaves.second.reload.title
++      assert_nil enqueued_jobs.first["scheduled_at"]
++
++      queue_adapter.stopping = false
++      resume_cleanup
++      assert_clean_titles
++    end
++  end
++
++  test "can stop before saving the first leaf" do
++    queue_adapter.stopping = true
++    assert_enqueued_with(job: TitleCleanupJob) { TitleCleanupJob.perform_now }
++    assert_equal @titles.map { |title| %Q("#{title}") }, @leaves.map { |leaf| leaf.reload.title }
++
++    queue_adapter.stopping = false
++    resume_cleanup
++    assert_clean_titles
++  end
++
++  test "a deleted current leaf does not supply the next leaf's original title" do
++    interrupt_after_save(@leaves.second) do
++      assert_enqueued_with(job: TitleCleanupJob) { TitleCleanupJob.perform_now }
++    end
++    @leaves.delete_at(1).delete
++    @titles.delete_at(1)
++
++    resume_cleanup
++    assert_clean_titles
++  end
++
++  test "resuming a completed job skips cleanup" do
++    track_updates do |updated_ids|
++      job = TitleCleanupJob.new
++      job.perform_now
++      ActiveJob::Base.execute(JSON.parse(job.serialize.to_json))
++
++      assert_equal @leaves.map(&:id), updated_ids
++      assert_clean_titles
++    end
++  end
++
++  test "handles empty and unquoted titles without changing the cleanup rule" do
++    originals = [ "", '""', "No quotes", '"An "inner" quote"' ]
++    @titles = [ "", "", "No quotes", 'An "inner" quote' ]
++    @leaves.zip(originals).each { |leaf, title| leaf.update_columns(title: title) }
++
++    TitleCleanupJob.perform_now
++
++    assert_clean_titles
++  end
++
++  test "handles an empty collection" do
++    Leaf.delete_all
++
++    TitleCleanupJob.perform_now
++
++    assert_no_enqueued_jobs only: TitleCleanupJob
++  end
++
++  private
++    def assert_clean_titles
++      assert_equal @titles, @leaves.map { |leaf| leaf.reload.title }
++    end
++
++    def resume_cleanup
++      payload = enqueued_jobs.shift
++      assert_not_nil payload
++      # Round-trip through JSON like a queue backend, then execute a fresh job instance.
++      payload = payload.select { |key, _| key.is_a?(String) }
++      ActiveJob::Base.execute(JSON.parse(payload.to_json))
++    end
++
++    def track_updates
++      updated_ids = []
++      callback = ->(leaf) { updated_ids << leaf.id }
++      Leaf.set_callback :update, :before, callback
++      yield updated_ids
++    ensure
++      Leaf.skip_callback :update, :before, callback
++    end
++
++    def interrupt_after_save(leaf, &block)
++      callback = ->(updated_leaf) do
++        if updated_leaf.id == leaf.id
++          raise ActiveJob::Continuation::Interrupt, "Deployment after saving a title"
++        end
++      end
++      with_after_save(callback, &block)
++    end
++
++    def with_after_save(callback)
++      Leaf.after_update_commit callback
++      yield
++    ensure
++      Leaf.skip_callback :commit, :after, callback
++    end
++end

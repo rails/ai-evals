@@ -1,0 +1,309 @@
+diff --git a/app/controllers/books/searches_controller.rb b/app/controllers/books/searches_controller.rb
+index 5268c55..9c0e0a6 100644
+--- a/app/controllers/books/searches_controller.rb
++++ b/app/controllers/books/searches_controller.rb
+@@ -1,9 +1,16 @@
+ class Books::SearchesController < ApplicationController
+   allow_unauthenticated_access
+ 
++  before_action :limit_searches, only: :create
++
+   include BookScoped
+ 
+   def create
+     @leaves = @book.leaves.active.search(params[:search]).favoring_title.limit(50)
+   end
++
++  private
++    def limit_searches
++      head :too_many_requests unless BookSearchRateLimiter.new(store: cache_store).allow?(request.remote_ip)
++    end
+ end
+diff --git a/lib/book_search_rate_limiter.rb b/lib/book_search_rate_limiter.rb
+new file mode 100644
+index 0000000..380780d
+--- /dev/null
++++ b/lib/book_search_rate_limiter.rb
+@@ -0,0 +1,56 @@
++# A rolling window, shared by every book. Production uses the existing Redis
++# cache so concurrent requests in different web workers share one allowance.
++class BookSearchRateLimiter
++  LIMIT = 30
++  WINDOW = 1.minute
++
++  # Prune, check, and record atomically. Only accepted requests are retained, so
++  # storage is bounded and refused requests cannot extend the cooldown.
++  REDIS_SCRIPT = <<~LUA.freeze
++    local key = KEYS[1]
++    local now = tonumber(ARGV[1])
++    local window = tonumber(ARGV[2])
++    local limit = tonumber(ARGV[3])
++
++    redis.call('ZREMRANGEBYSCORE', key, '-inf', now - window)
++    if redis.call('ZCARD', key) >= limit then
++      return 0
++    end
++
++    redis.call('ZADD', key, now, ARGV[4])
++    redis.call('EXPIRE', key, window)
++    return 1
++  LUA
++
++  def initialize(store:)
++    @store = store
++  end
++
++  def allow?(ip_address)
++    key = "book-search-rate-limit:#{ip_address}"
++    now = Time.current.to_f
++
++    case @store
++    when ActiveSupport::Cache::RedisCacheStore
++      @store.redis.then do |redis|
++        redis.eval(REDIS_SCRIPT, keys: [ key ], argv: [ now, WINDOW.to_i, LIMIT, SecureRandom.uuid ])
++      end == 1
++    when ActiveSupport::Cache::MemoryStore
++      # Development and isolated tests use the same window semantics in memory.
++      @store.synchronize do
++        timestamps = Array(@store.read(key)).select { |timestamp| timestamp > now - WINDOW }
++        if timestamps.size < LIMIT
++          @store.write(key, timestamps << now, expires_in: WINDOW)
++          true
++        else
++          false
++        end
++      end
++    when ActiveSupport::Cache::NullStore
++      # As with Rails' rate_limit, a null cache disables limiting.
++      true
++    else
++      raise ArgumentError, "Book search rate limiting requires a Redis or memory cache"
++    end
++  end
++end
+diff --git a/test/integration/book_search_rate_limiting_test.rb b/test/integration/book_search_rate_limiting_test.rb
+new file mode 100644
+index 0000000..d4fd48c
+--- /dev/null
++++ b/test/integration/book_search_rate_limiting_test.rb
+@@ -0,0 +1,137 @@
++require "test_helper"
++
++class BookSearchRateLimitingTest < ActionDispatch::IntegrationTest
++  setup do
++    @original_cache_store = Books::SearchesController.cache_store
++    Books::SearchesController.cache_store = ActiveSupport::Cache::MemoryStore.new
++
++    books(:handbook).update!(published: true)
++    books(:manual).update!(published: true)
++    Leaf.reindex_all
++    travel_to Time.utc(2026, 1, 1, 12)
++  end
++
++  teardown do
++    Books::SearchesController.cache_store = @original_cache_store
++    travel_back
++  end
++
++  test "thirty anonymous searches succeed and further searches are refused before querying" do
++    use_search_allowance
++    assert_select "a", text: /Thanks for reading/i
++    assert_not cookies[:session_token].present?
++
++    queries = []
++    subscriber = ->(event) { queries << event.payload[:sql] }
++    ActiveSupport::Notifications.subscribed(subscriber, "sql.active_record") do
++      3.times do
++        search
++        assert_response :too_many_requests
++        assert_nil response.headers["Location"]
++      end
++    end
++    assert_empty queries.grep(/leaf_search_index/i)
++  end
++
++  test "starting a fresh anonymous session does not reset an IP's allowance" do
++    get book_slug_path(books(:handbook)), env: { "REMOTE_ADDR" => "198.51.100.1" }
++    assert_response :success
++    use_search_allowance
++
++    reader = open_session
++    reader.post book_search_path(books(:handbook)), params: { search: "Thanks" },
++      env: { "REMOTE_ADDR" => "198.51.100.1" }
++    assert_equal 429, reader.response.status
++  end
++
++  test "the allowance belongs to an IP address across all books" do
++    30.times do |index|
++      search book: books(index.even? ? :handbook : :manual)
++      assert_response :success
++    end
++
++    search book: books(:handbook)
++    assert_response :too_many_requests
++    search book: books(:manual)
++    assert_response :too_many_requests
++  end
++
++  test "another anonymous IP can search the same book while the first is refused" do
++    use_search_allowance
++    search
++    assert_response :too_many_requests
++
++    use_search_allowance from: "198.51.100.2"
++    assert_select "a", text: /Thanks for reading/i
++    assert_not cookies[:session_token].present?
++
++    search
++    assert_response :too_many_requests
++  end
++
++  test "a refused IP can still open the book and its pages" do
++    use_search_allowance
++    search
++    assert_response :too_many_requests
++
++    get book_slug_path(books(:handbook)), env: { "REMOTE_ADDR" => "198.51.100.1" }
++    assert_response :success
++
++    get leafable_slug_path(leaves(:welcome_page)), env: { "REMOTE_ADDR" => "198.51.100.1" }
++    assert_response :success
++    assert_in_body "a great handbook."
++
++    search
++    assert_response :too_many_requests
++  end
++
++  test "the allowance recovers automatically after a burst" do
++    use_search_allowance
++    search
++    assert_response :too_many_requests
++
++    travel 59.seconds
++    search
++    assert_response :too_many_requests
++
++    travel 1.second
++    use_search_allowance
++    search
++    assert_response :too_many_requests
++
++    travel 5.minutes
++    search
++    assert_response :success
++  end
++
++  test "the limit covers a rolling minute rather than resetting an entire counter" do
++    search
++    assert_response :success
++
++    travel 59.seconds
++    29.times do
++      search
++      assert_response :success
++    end
++    search
++    assert_response :too_many_requests
++
++    travel 2.seconds
++    search
++    assert_response :success
++    search
++    assert_response :too_many_requests
++  end
++
++  private
++    def search(book: books(:handbook), from: "198.51.100.1")
++      post book_search_path(book), params: { search: "Thanks" }, env: { "REMOTE_ADDR" => from }
++    end
++
++    def use_search_allowance(**options)
++      30.times do
++        search(**options)
++        assert_response :success
++      end
++    end
++end
+diff --git a/test/lib/book_search_rate_limiter_test.rb b/test/lib/book_search_rate_limiter_test.rb
+new file mode 100644
+index 0000000..997c8a3
+--- /dev/null
++++ b/test/lib/book_search_rate_limiter_test.rb
+@@ -0,0 +1,77 @@
++require "test_helper"
++
++class BookSearchRateLimiterTest < ActiveSupport::TestCase
++  setup do
++    @store = ActiveSupport::Cache::MemoryStore.new
++    @limiter = BookSearchRateLimiter.new(store: @store)
++    freeze_time
++  end
++
++  test "Redis uses one atomic script through the cache connection pool" do
++    client = Struct.new(:calls) do
++      def eval(script, keys:, argv:)
++        calls << { script: script, keys: keys, argv: argv }
++        calls.size == 1 ? 1 : 0
++      end
++    end.new([])
++    store = ActiveSupport::Cache::RedisCacheStore.new(redis: client)
++    limiter = BookSearchRateLimiter.new(store: store)
++
++    assert limiter.allow?("198.51.100.1")
++    assert_not limiter.allow?("198.51.100.1")
++
++    assert_equal 2, client.calls.size
++    client.calls.each do |call|
++      assert_equal BookSearchRateLimiter::REDIS_SCRIPT, call[:script]
++      assert_equal [ "book-search-rate-limit:198.51.100.1" ], call[:keys]
++      assert_equal [ Time.current.to_f, 60, 30 ], call[:argv].first(3)
++    end
++    assert_not_equal client.calls.first[:argv].last, client.calls.last[:argv].last
++  end
++
++  test "concurrent requests share one allowance even across limiter instances" do
++    results = 60.times.map do
++      Thread.new { BookSearchRateLimiter.new(store: @store).allow?("198.51.100.1") }
++    end.map(&:value)
++
++    assert_equal 30, results.count(true)
++    assert_equal 30, results.count(false)
++  end
++
++  test "IPv6 addresses have independent allowances" do
++    30.times { assert @limiter.allow?("2001:db8::1") }
++    assert_not @limiter.allow?("2001:db8::1")
++    assert @limiter.allow?("2001:db8::2")
++  end
++
++  test "each request leaves the rolling window individually" do
++    15.times { assert @limiter.allow?("198.51.100.1") }
++    travel 30.seconds
++    15.times { assert @limiter.allow?("198.51.100.1") }
++    assert_not @limiter.allow?("198.51.100.1")
++
++    travel 30.seconds
++    15.times { assert @limiter.allow?("198.51.100.1") }
++    assert_not @limiter.allow?("198.51.100.1")
++
++    travel 30.seconds
++    15.times { assert @limiter.allow?("198.51.100.1") }
++    assert_not @limiter.allow?("198.51.100.1")
++  end
++
++  test "refused requests do not accumulate or prolong the cooldown" do
++    30.times { assert @limiter.allow?("198.51.100.1") }
++    travel 59.seconds
++    100.times { assert_not @limiter.allow?("198.51.100.1") }
++
++    assert_equal 30, @store.read("book-search-rate-limit:198.51.100.1").size
++    travel 1.second
++    assert @limiter.allow?("198.51.100.1")
++  end
++
++  test "inactive addresses expire from the cache" do
++    assert @limiter.allow?("198.51.100.1")
++    travel 1.minute
++    assert_nil @store.read("book-search-rate-limit:198.51.100.1")
++  end
++end

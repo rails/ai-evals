@@ -1,0 +1,786 @@
+diff --git a/app/models/concerns/profile_image_attachable.rb b/app/models/concerns/profile_image_attachable.rb
+index b42e953..7dabe46 100644
+--- a/app/models/concerns/profile_image_attachable.rb
++++ b/app/models/concerns/profile_image_attachable.rb
+@@ -1,26 +1,21 @@
+-# Profile pictures of users and organizations are being migrated, one deploy at a time, from
+-# CarrierWave (the `profile_image` column, mounted with {ProfileImageUploader}) to Active Storage
+-# (the `avatar` attachment).
+-#
+-# In this step of the migration:
++# Profile pictures of users and organizations are stored with Active Storage (the `avatar`
++# attachment). They used to be stored with CarrierWave (the `profile_image` column), which is not
++# mounted on users and organizations anymore. Other uploads stay on CarrierWave.
+ #
+ # * New profile pictures (uploaded files and remote URLs, assigned through the usual
+ #   `profile_image=` and `remote_profile_image_url=` writers) are validated and processed with the
+-#   very same rules as before, and are stored with Active Storage.
+-# * Existing profile pictures stay where they are: the `profile_image` column and the CarrierWave
+-#   files are never modified nor deleted here. That way the pictures and the URLs to them which
+-#   are cached/denormalized elsewhere (articles, notifications, search indexes, CDNs...) keep
+-#   working, and so do servers still running (or rolled back to) the previous release.
+-# * Existing profile pictures are copied into Active Storage by `bin/rails profile_images:copy`
+-#   (see ProfileImages::Copy), which runs after the deploy and can be run again at any time. The
+-#   copy only reads the CarrierWave pictures, which keep working wherever they are referenced.
+-# * If a save still changes the CarrierWave picture (e.g. a CarrierWave cache name is assigned),
+-#   the now stale Active Storage picture is dropped and the new one is copied in the background.
+-# * Readers ({#profile_image_url} and friends) prefer the Active Storage avatar and fall back to
+-#   the CarrierWave picture.
+-#
+-# NOTE: this module must be included *after* `mount_uploader :profile_image` so that its methods
+-#       take precedence over the ones defined by CarrierWave.
++#   very same rules as before (see ProfileImageStagingUploader), and are stored with Active Storage.
++#   Validation errors are reported on `profile_image`, with the same messages as before.
++# * Retired CarrierWave pictures are left where they are: the `profile_image` column keeps their
++#   identifier and their files are kept, so URLs to them which are cached/denormalized elsewhere
++#   (articles, notifications, search indexes, CDNs...) keep working, and so do servers still
++#   running (or rolled back to) the previous release. The column is never written to anymore,
++#   except to clear it when a picture is removed.
++# * Retired pictures are copied into Active Storage by `bin/rails profile_images:copy`
++#   (see ProfileImages::Copy), which can be run again at any time.
++# * Readers ({#profile_image_url} and friends) prefer the Active Storage avatar and fall back to the
++#   retired picture (see ProfileImages::LegacyPicture), so pictures which haven't been copied (yet)
++#   are still served, from the very same URL as before.
+ module ProfileImageAttachable
+   extend ActiveSupport::Concern
+ 
+@@ -30,70 +25,65 @@ module ProfileImageAttachable
+     download: CarrierWave::DownloadError
+   }.freeze
+ 
+-  ACTIVE_STORAGE_TABLES = %w[active_storage_blobs active_storage_attachments].freeze
+-
+-  # Active Storage tables are created by a migration shipped with this code. Until it has run
+-  # (e.g. a process booted before the migrations ran) we keep using CarrierWave only, rather than
+-  # failing to render every profile picture.
+-  #
+-  # @return [Boolean]
+-  def self.active_storage_available?
+-    return true if @active_storage_available
+-
+-    connection = ActiveRecord::Base.connection
+-    @active_storage_available = ACTIVE_STORAGE_TABLES.all? { |table| connection.data_source_exists?(table) }
+-  end
+-
+   included do
+     has_one_attached :avatar
+ 
++    validate :validate_new_profile_image
++
+     before_save :prepare_avatar_change
+     after_commit :copy_profile_image_later, if: -> { @copy_profile_image_after_commit }
++    after_commit :delete_retired_legacy_profile_images, on: %i[update destroy]
++    after_rollback { @retired_legacy_profile_images = nil }
+   end
+ 
+   class_methods do
+-    # The CarrierWave column alone is not enough anymore to render a profile picture.
++    # The `profile_image` column alone is not enough to render a profile picture.
+     def with_profile_image
+       with_attached_avatar
+     end
+   end
+ 
+-  # @note Like with CarrierWave, assigning a blank value removes the picture.
+-  # @note Non blank strings are CarrierWave cache names/identifiers (e.g. from
+-  #       `profile_image_cache`), they are still handled by CarrierWave.
++  # Assigns a new profile picture, which is validated, processed and stored with Active Storage.
++  #
++  # @param new_image [ActionDispatch::Http::UploadedFile, File, IO, String, nil]
++  # @note Like before, assigning a blank value removes the picture.
++  # @note Strings used to be CarrierWave identifiers or cache names. There's no CarrierWave cache
++  #       for profile pictures anymore, so they are ignored (the current picture is kept).
+   def profile_image=(new_image)
++    @avatar_staging_errors = []
++
+     if new_image.blank?
+       self.avatar = nil if avatar_attachment_available? && avatar.attached?
+-      return super
++      write_attribute(:profile_image, nil)
++      return
+     end
+-    return super if new_image.is_a?(String) || !ProfileImageAttachable.active_storage_available?
++    return if new_image.is_a?(String)
+ 
+     stage_avatar { |uploader| uploader.cache!(new_image) }
+   end
+ 
+-  def remote_profile_image_url=(url)
+-    return super if url.blank? || !ProfileImageAttachable.active_storage_available?
++  attr_reader :remote_profile_image_url
+ 
++  # Downloads (safely, see ProfileImageUploader) a new profile picture from the given URL.
++  def remote_profile_image_url=(url)
+     @remote_profile_image_url = url
+-    stage_avatar { |uploader| uploader.download!(url) }
+-  end
++    return if url.blank?
+ 
+-  def remote_profile_image_url
+-    @remote_profile_image_url || super
++    @avatar_staging_errors = []
++    stage_avatar { |uploader| uploader.download!(url) }
+   end
+ 
+-  # Errors raised while validating a new picture are reported through CarrierWave's own
+-  # validations (validates_integrity_of, validates_processing_of, validates_download_of).
+-  STAGING_ERRORS.each_key do |kind|
++  # Errors raised while validating a new picture, by kind (like CarrierWave used to expose them).
++  STAGING_ERRORS.each do |kind, error_class|
+     define_method(:"profile_image_#{kind}_errors") do
+-      super() + avatar_staging_errors.grep(STAGING_ERRORS[kind])
++      avatar_staging_errors.grep(error_class)
+     end
+   end
+ 
+-  # @return [String, nil] the URL of the profile picture, from Active Storage if any, otherwise
+-  #   from CarrierWave.
+-  def profile_image_url(*args)
+-    avatar_url || super
++  # @return [String, nil] the URL of the profile picture, from Active Storage if any, otherwise the
++  #   URL the retired (CarrierWave) picture has always been served from.
++  def profile_image_url(*)
++    avatar_url || legacy_profile_image.url
+   end
+ 
+   # @return [String, nil] a permanent, absolute URL to the Active Storage profile picture.
+@@ -109,9 +99,9 @@ def avatar_url
+   end
+ 
+   # @return [Boolean] whether there's a profile picture, either in Active Storage (including one
+-  #   pending to be saved) or in CarrierWave.
++  #   pending to be saved) or a retired one.
+   def profile_image_present?
+-    (avatar_attachment_available? && avatar.attached?) || profile_image.present?
++    (avatar_attachment_available? && avatar.attached?) || legacy_profile_image.present?
+   end
+ 
+   # @return [Boolean] whether the last save changed the profile picture, in either storage.
+@@ -119,7 +109,7 @@ def saved_change_to_profile_picture?
+     saved_change_to_profile_image? || @avatar_changed_in_last_save == true
+   end
+ 
+-  # `as_json`/`serializable_hash` keep the shape of the CarrierWave uploader serialization
++  # `as_json`/`serializable_hash` keep the shape of the former CarrierWave serialization
+   # (`{ "url" => ... }`) for the `profile_image` attribute, wherever the picture is stored.
+   def read_attribute_for_serialization(name)
+     return { "url" => profile_image_url } if name.to_s == "profile_image"
+@@ -132,10 +122,17 @@ def remove_avatar!
+     avatar.purge if avatar_attachment_available? && avatar.attached?
+   end
+ 
++  # @return [ProfileImages::LegacyPicture] the retired (CarrierWave) picture, read only
++  def legacy_profile_image
++    identifier = has_attribute?(:profile_image) ? self[:profile_image].presence : nil
++    return @legacy_profile_image if @legacy_profile_image && @legacy_profile_image.identifier == identifier
++
++    @legacy_profile_image = ProfileImages::LegacyPicture.new(self)
++  end
++
+   private
+ 
+   def stage_avatar
+-    @avatar_staging_errors = []
+     uploader = ProfileImageStagingUploader.new(self, :profile_image)
+     yield uploader
+     file = uploader.file
+@@ -168,6 +165,16 @@ def avatar_staging_errors
+     @avatar_staging_errors || []
+   end
+ 
++  # Same errors (and messages) as CarrierWave's validates_{integrity,processing,download}_of.
++  def validate_new_profile_image
++    STAGING_ERRORS.each_key do |kind|
++      public_send(:"profile_image_#{kind}_errors").each do |error|
++        errors.add(:profile_image, :"carrierwave_#{kind}_error",
++                   message: (error.message != error.class.to_s) && error.message)
++      end
++    end
++  end
++
+   def stored_avatar_blob
+     return unless avatar_attachment_available?
+ 
+@@ -177,24 +184,21 @@ def stored_avatar_blob
+ 
+   # Records loaded with a partial `select` (without the primary key) can't look up attachments.
+   def avatar_attachment_available?
+-    return false unless ProfileImageAttachable.active_storage_available?
+-
+     !persisted? || (has_attribute?(self.class.primary_key) && id.present?)
+   end
+ 
+-  # Runs after CarrierWave's own before_save callbacks, which write the `profile_image` column.
+   def prepare_avatar_change
+     @copy_profile_image_after_commit = false
+-    if ProfileImageAttachable.active_storage_available?
+-      sync_avatar_with_carrierwave
+-      lock_for_avatar_change
+-    end
++    track_retired_legacy_profile_image
++    sync_avatar_with_legacy_column
++    lock_for_avatar_change
+     @avatar_changed_in_last_save = attachment_changes.key?("avatar")
+   end
+ 
+-  # A new CarrierWave picture (e.g. assigned with a CarrierWave cache name) makes the Active Storage
+-  # one stale: drop it, and copy the new one into Active Storage once it's stored.
+-  def sync_avatar_with_carrierwave
++  # A new picture written straight to the `profile_image` column (e.g. by a server still running
++  # the previous release) makes the Active Storage one stale: drop it, and copy the new one into
++  # Active Storage once it's stored.
++  def sync_avatar_with_legacy_column
+     return if attachment_changes.key?("avatar") || !will_save_change_to_attribute?(:profile_image)
+ 
+     self.avatar = nil if persisted? && avatar_attachment_available? && avatar.attached?
+@@ -215,4 +219,28 @@ def copy_profile_image_later
+     @copy_profile_image_after_commit = false
+     ProfileImages::CopyWorker.perform_async(self.class.name, id)
+   end
++
++  # Like CarrierWave did, the file of a retired picture is deleted once the picture is removed or
++  # replaced in the `profile_image` column (never when a new Active Storage picture is uploaded,
++  # which leaves the column alone), and when its owner is deleted.
++  def track_retired_legacy_profile_image
++    return unless persisted? && will_save_change_to_attribute?(:profile_image)
++
++    previous = attribute_in_database(:profile_image)
++    retire_legacy_profile_image(previous) if previous.present?
++  end
++
++  def retire_legacy_profile_image(identifier)
++    (@retired_legacy_profile_images ||= []) << identifier
++  end
++
++  def delete_retired_legacy_profile_images
++    retire_legacy_profile_image(self[:profile_image]) if destroyed? && self[:profile_image].present?
++
++    identifiers = @retired_legacy_profile_images.to_a.uniq
++    @retired_legacy_profile_images = nil
++    identifiers.each do |identifier|
++      ProfileImages::LegacyPicture.new(self, identifier: identifier).delete
++    end
++  end
+ end
+diff --git a/app/models/organization.rb b/app/models/organization.rb
+index 90fb918..ccf50f5 100644
+--- a/app/models/organization.rb
++++ b/app/models/organization.rb
+@@ -99,8 +99,7 @@ class Organization < ApplicationRecord
+ 
+   unique_across_models :slug, length: { in: 2..30 }
+ 
+-  mount_uploader :profile_image, ProfileImageUploader
+-  # NOTE: must be included after mount_uploader, see the module for details
++  # Profile pictures are stored with Active Storage, see ProfileImageAttachable.
+   include ProfileImageAttachable
+   mount_uploader :cover_image, CoverImageUploader
+ 
+@@ -321,7 +320,7 @@ def validate_social_links
+     end
+   end
+ 
+-  # The picture can either be stored by CarrierWave or by Active Storage, see ProfileImageAttachable.
++  # The picture can either be in Active Storage or a retired one, see ProfileImageAttachable.
+   def profile_image_must_be_present
+     errors.add(:profile_image, :blank) unless profile_image_present?
+   end
+diff --git a/app/models/user.rb b/app/models/user.rb
+index 1ec9ba9..354fa32 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -168,8 +168,7 @@ def cached_recent_user_ids
+     end
+   end
+ 
+-  mount_uploader :profile_image, ProfileImageUploader
+-  # NOTE: must be included after mount_uploader, see the module for details
++  # Profile pictures are stored with Active Storage, see ProfileImageAttachable.
+   include ProfileImageAttachable
+ 
+   devise :invitable, :omniauthable, :registerable, :database_authenticatable, :confirmable, :rememberable,
+diff --git a/app/services/authentication/providers/apple.rb b/app/services/authentication/providers/apple.rb
+index e135411..665d923 100644
+--- a/app/services/authentication/providers/apple.rb
++++ b/app/services/authentication/providers/apple.rb
+@@ -34,11 +34,7 @@ def new_user_data
+           name: name
+         }
+ 
+-        user_data[:profile_image] = if Rails.env.test?
+-                                      Settings::General.mascot_image_url
+-                                    else
+-                                      Images::ProfileImageGenerator.call
+-                                    end
++        user_data[:profile_image] = Images::ProfileImageGenerator.call
+ 
+         user_data
+       end
+diff --git a/app/services/moderator/banish_user.rb b/app/services/moderator/banish_user.rb
+index 8f48c56..ccc1cf9 100644
+--- a/app/services/moderator/banish_user.rb
++++ b/app/services/moderator/banish_user.rb
+@@ -54,8 +54,8 @@ def reassign_and_bust_username
+     def remove_profile_info
+       user.profile.clear!
+       user.update_columns(profile_image: DEFAULT_PROFILE_IMAGE)
+-      # The default picture lives in the CarrierWave column, which is only used when there's
+-      # no Active Storage picture.
++      # The default picture is an absolute URL in the (retired) CarrierWave column, which is only
++      # used when there's no Active Storage picture (see ProfileImages::LegacyPicture).
+       user.remove_avatar!
+     end
+ 
+diff --git a/app/services/profile_images/copy.rb b/app/services/profile_images/copy.rb
+index bc641f0..3a08ec7 100644
+--- a/app/services/profile_images/copy.rb
++++ b/app/services/profile_images/copy.rb
+@@ -1,6 +1,7 @@
+ module ProfileImages
+-  # Copies the CarrierWave profile picture of a user or an organization into Active Storage (the
+-  # `avatar` attachment, see ProfileImageAttachable), so that it's served from Active Storage.
++  # Copies the retired CarrierWave profile picture of a user or an organization (see
++  # ProfileImages::LegacyPicture) into Active Storage (the `avatar` attachment, see
++  # ProfileImageAttachable), so that it's served from Active Storage.
+   #
+   # It's safe to run at any time, as many times as needed (e.g. after an interruption):
+   #
+@@ -21,6 +22,7 @@ class Copy
+     ALREADY_COPIED = :already_copied # an Active Storage picture is already there
+     NO_PICTURE = :no_picture # nothing to copy
+     MISSING = :missing # the CarrierWave file doesn't exist (anymore), it keeps being served as is
++    EXTERNAL = :external # the picture is an absolute URL (not a file), it keeps being served as is
+     CHANGED = :changed # the record changed (or was deleted) while copying, try again later
+ 
+     # @param record [User, Organization]
+@@ -36,9 +38,6 @@ def self.call(record)
+     # @yield [record, outcome_or_error] after each record, e.g. to report progress
+     # @return [Hash{Symbol => Integer}] the number of records per outcome (and `:failed`)
+     def self.all(models: MODELS, batch_size: 500)
+-      raise ArgumentError, "Active Storage tables are missing, run the migrations first" unless
+-        ProfileImageAttachable.active_storage_available?
+-
+       counts = Hash.new(0)
+       models.each do |model_name|
+         pending(model_name.constantize).select(:id, :profile_image).find_each(batch_size: batch_size) do |record|
+@@ -69,6 +68,7 @@ def call
+       identifier = record.read_attribute(:profile_image)
+       return NO_PICTURE if identifier.blank?
+       return ALREADY_COPIED if avatar_exists?
++      return EXTERNAL if ProfileImages::LegacyPicture.new(record).absolute_url?
+ 
+       # NOTE: no lock is held while transferring files.
+       data = read_carrierwave_file
+@@ -90,10 +90,7 @@ def call
+     attr_reader :record, :model
+ 
+     def read_carrierwave_file
+-      file = record.profile_image.file
+-      return unless file&.exists?
+-
+-      file.read.presence&.b
++      ProfileImages::LegacyPicture.new(record).read
+     end
+ 
+     def build_blob(identifier, data)
+diff --git a/app/services/profile_images/legacy_picture.rb b/app/services/profile_images/legacy_picture.rb
+new file mode 100644
+index 0000000..4fedf19
+--- /dev/null
++++ b/app/services/profile_images/legacy_picture.rb
+@@ -0,0 +1,75 @@
++module ProfileImages
++  # Read-only access to a retired profile picture: one uploaded with CarrierWave before profile
++  # pictures of users and organizations moved to Active Storage (see ProfileImageAttachable).
++  #
++  # CarrierWave is not mounted on users and organizations anymore, but their `profile_image`
++  # column still holds the identifier of the old picture, and the file is still where CarrierWave
++  # stored it. Pictures which haven't been copied into Active Storage yet (see ProfileImages::Copy)
++  # keep being served from there, with the very same URL as before (URLs to them are cached and
++  # denormalized in many places: articles, notifications, search indexes, CDNs...).
++  #
++  # The URL is computed with the CarrierWave configuration the file was stored with (storage,
++  # asset host, bucket, signed URLs for private buckets...), which is shared with the uploads that
++  # stay on CarrierWave. Nothing is ever written through this class.
++  class LegacyPicture
++    COLUMN = :profile_image
++
++    # Some identifiers are absolute URLs rather than CarrierWave file names (e.g. the default
++    # picture set by Moderator::BanishUser), they are served as they are.
++    ABSOLUTE_URL = %r{\Ahttps?://}i
++
++    # @param record [User, Organization]
++    # @param identifier [String, nil] defaults to the one in the record's `profile_image` column
++    def initialize(record, identifier: (record.read_attribute(COLUMN) if record.has_attribute?(COLUMN)))
++      @record = record
++      @identifier = identifier.presence
++    end
++
++    attr_reader :identifier
++
++    delegate :present?, to: :identifier
++
++    def absolute_url?
++      present? && identifier.match?(ABSOLUTE_URL)
++    end
++
++    # @return [String, nil] the URL the picture has always been served from
++    def url
++      return if identifier.blank?
++      return identifier if absolute_url?
++
++      uploader.url.presence
++    end
++
++    # @return [String, nil] the (binary) content of the stored file, nil if there's no such file
++    def read
++      return if identifier.blank? || absolute_url?
++
++      file = uploader.file
++      return unless file&.exists?
++
++      file.read.presence&.b
++    end
++
++    # Deletes the stored file, e.g. once the picture has been removed or its owner deleted.
++    # Failures are only logged: a leftover file doesn't break anything.
++    def delete
++      return if identifier.blank? || absolute_url?
++
++      uploader.remove!
++    rescue StandardError => e
++      Rails.logger.error("Could not delete the legacy profile image #{identifier} of " \
++                         "#{record.class.name} #{record.id}: #{e.class}: #{e.message}")
++    end
++
++    private
++
++    attr_reader :record
++
++    def uploader
++      @uploader ||= ProfileImageUploader.new(record, COLUMN).tap do |uploader|
++        uploader.retrieve_from_store!(identifier)
++      end
++    end
++  end
++end
+diff --git a/spec/models/concerns/profile_image_attachable_spec.rb b/spec/models/concerns/profile_image_attachable_spec.rb
+index 1d05673..6ed8ecd 100644
+--- a/spec/models/concerns/profile_image_attachable_spec.rb
++++ b/spec/models/concerns/profile_image_attachable_spec.rb
+@@ -10,22 +10,49 @@
+   describe "existing (CarrierWave) profile pictures" do
+     let(:user) { create(:user, :with_carrierwave_profile_image) }
+ 
+-    it "keeps serving them from CarrierWave" do
++    it "keep being served from the same URL as before, without CarrierWave" do
++      expect(User.uploaders).not_to have_key(:profile_image)
++      expect(user.profile_image).to eq(user.read_attribute(:profile_image))
+       expect(user.avatar).not_to be_attached
+       expect(user.profile_image_url).to match(carrierwave_url_pattern)
+-      expect(user.profile_image_url).to eq(user.profile_image.url)
+-      expect(user.profile_image_90).to eq(Images::Profile.call(user.profile_image.url, length: 90))
++      expect(user.profile_image_url).to eq(carrierwave_profile_image(user).url)
++      expect(user.profile_image_90).to eq(Images::Profile.call(carrierwave_profile_image(user).url, length: 90))
+     end
+ 
+     it "does not touch them when saving other attributes" do
+       expect { user.update!(name: "Another name") }.not_to change { user.reload.read_attribute(:profile_image) }
+       expect(user.profile_image_url).to match(carrierwave_url_pattern)
+-      expect(File).to exist(user.profile_image.path)
++      expect(File).to exist(carrierwave_profile_image(user).path)
++    end
++
++    it "are kept when a string (e.g. a former CarrierWave cache name or a URL) is assigned" do
++      expect do
++        user.update!(profile_image: "https://example.com/avatar.png")
++      end.not_to change { user.reload.profile_image_url }
++      expect(user.avatar).not_to be_attached
++    end
++
++    it "can be removed, which deletes the file like CarrierWave did" do
++      legacy_path = carrierwave_profile_image(user).path
++
++      user.update!(profile_image: nil)
++
++      expect(user.reload.read_attribute(:profile_image)).to be_nil
++      expect(user.profile_image_present?).to be(false)
++      expect(File).not_to exist(legacy_path)
++    end
++
++    it "are deleted with their owner, like CarrierWave did" do
++      legacy_path = carrierwave_profile_image(user).path
++
++      user.destroy!
++
++      expect(File).not_to exist(legacy_path)
+     end
+ 
+     it "keeps them in place when a new picture is uploaded" do
+       legacy_identifier = user.read_attribute(:profile_image)
+-      legacy_path = user.profile_image.path
++      legacy_path = carrierwave_profile_image(user).path
+ 
+       user.update!(profile_image: new_image)
+       user.reload
+@@ -86,6 +113,15 @@
+       expect { user.save }.not_to change(ActiveStorage::Blob, :count)
+     end
+ 
++    it "report the same validation errors as CarrierWave did" do
++      user = create(:user)
++      user.profile_image = Rack::Test::UploadedFile.new(Rails.root.join("README.md"), "text/plain")
++      user.valid?
++
++      expect(user.profile_image_integrity_errors).to contain_exactly(an_instance_of(CarrierWave::IntegrityError))
++      expect(user.errors.details[:profile_image]).to include(a_hash_including(error: :carrierwave_integrity_error))
++    end
++
+     it "report download errors like before" do
+       stub_request(:get, "https://example.com/missing.png").to_return(status: 404)
+       user = create(:user)
+@@ -93,6 +129,15 @@
+ 
+       expect(user).not_to be_valid
+       expect(user.errors[:profile_image]).to be_present
++      expect(user.profile_image_download_errors).to be_present
++    end
++
++    it "can be uploaded again after an invalid one" do
++      user = create(:user)
++      user.profile_image = Rack::Test::UploadedFile.new(Rails.root.join("README.md"), "text/plain")
++      user.profile_image = new_image
++
++      expect(user).to be_valid
+     end
+ 
+     it "don't break the URL while an invalid upload is pending" do
+@@ -103,7 +148,7 @@
+       expect(user.profile_image_url).to eq(url)
+     end
+ 
+-    it "fall back to CarrierWave while a new upload is not saved yet" do
++    it "fall back to the retired picture while a new upload is not saved yet" do
+       user = create(:user, :with_carrierwave_profile_image)
+       user.profile_image = new_image
+ 
+@@ -154,24 +199,17 @@
+     end
+   end
+ 
+-  context "when the Active Storage tables don't exist yet (migrations not run)" do
+-    before { allow(described_class).to receive(:active_storage_available?).and_return(false) }
+-
+-    it "keeps using CarrierWave" do
+-      user = create(:user, profile_image: new_image)
++  describe "absolute URLs in the profile_image column" do
++    it "are served as they are (e.g. the default picture of banished users)" do
++      user = create(:user)
++      user.avatar.purge
++      user.update_columns(profile_image: "https://example.com/default.png")
+ 
+-      expect(user.read_attribute(:profile_image)).to be_present
+-      expect(user.profile_image_url).to eq(user.profile_image.url)
++      expect(user.reload.profile_image_url).to eq("https://example.com/default.png")
+       expect(user.profile_image_present?).to be(true)
+     end
+   end
+ 
+-  describe ".active_storage_available?" do
+-    it "is true once the migrations have run" do
+-      expect(described_class.active_storage_available?).to be(true)
+-    end
+-  end
+-
+   describe "serialization" do
+     it "keeps the shape of the CarrierWave serialization for new pictures" do
+       user = create(:user)
+@@ -180,7 +218,7 @@
+ 
+     it "is unchanged for existing pictures" do
+       user = create(:user, :with_carrierwave_profile_image)
+-      expect(user.as_json["profile_image"]).to eq(user.profile_image.as_json)
++      expect(user.as_json["profile_image"]).to eq(carrierwave_profile_image(user).as_json)
+     end
+   end
+ 
+@@ -218,7 +256,8 @@
+       expect(organization.profile_image_url).to match(%r{/rails/active_storage/blobs/redirect/})
+     end
+ 
+-    it "keep serving existing pictures from CarrierWave" do
++    it "keep serving existing pictures from where CarrierWave stored them" do
++      expect(Organization.uploaders).not_to have_key(:profile_image)
+       organization = create(:organization, :with_carrierwave_profile_image)
+       expect(organization.avatar).not_to be_attached
+       expect(organization.profile_image_url).to match(%r{/uploads/organization/profile_image/\d+/[\w-]+\.png\z})
+@@ -266,12 +305,13 @@
+       expect(user.reload.avatar).not_to be_attached
+     end
+ 
+-    it "make way for a new CarrierWave picture, which gets copied too" do
++    it "make way for a new picture written to the column (e.g. by the previous release), which gets copied too" do
+       uploader = ProfileImageUploader.new(user, :profile_image)
+-      uploader.cache!(Rack::Test::UploadedFile.new(png_path, "image/png"))
++      uploader.store!(Rack::Test::UploadedFile.new(png_path, "image/png"))
+ 
+       sidekiq_assert_enqueued_with(job: ProfileImages::CopyWorker, args: ["User", user.id]) do
+-        user.update!(profile_image: uploader.cache_name)
++        user[:profile_image] = uploader.identifier
++        user.save!
+       end
+       user.reload
+       # the stale Active Storage picture doesn't hide the new one
+diff --git a/spec/requests/active_storage_profile_images_spec.rb b/spec/requests/active_storage_profile_images_spec.rb
+index 7269d8b..fb1b1c0 100644
+--- a/spec/requests/active_storage_profile_images_spec.rb
++++ b/spec/requests/active_storage_profile_images_spec.rb
+@@ -37,6 +37,25 @@
+     expect(response).to have_http_status(:found)
+     get URI.parse(response.location).request_uri
+     expect(response).to have_http_status(:ok)
+-    expect(response.body.b).to eq(File.binread(legacy.profile_image.path))
++    expect(response.body.b).to eq(File.binread(carrierwave_profile_image(legacy).path))
++  end
++
++  it "keeps serving retired (CarrierWave) profile pictures which haven't been copied" do
++    legacy = create(:user, :with_carrierwave_profile_image)
++
++    get legacy.profile_image_url
++    expect(response).to have_http_status(:ok)
++    expect(response.body.b).to eq(File.binread(carrierwave_profile_image(legacy).path))
++  end
++
++  it "returns the new picture's URL in the same JSON shape as before (used by onboarding)" do
++    sign_in user
++
++    put user_path(user), params: { user: { profile_image: Rack::Test::UploadedFile.new(png_path, "image/png") } },
++                         headers: { "Accept" => "application/json" }
++
++    expect(response).to have_http_status(:ok)
++    expect(response.parsed_body.dig("user", "profile_image", "url")).to eq(user.reload.profile_image_url)
++    expect(response.parsed_body.dig("user", "profile_image", "url")).to match(%r{/rails/active_storage/blobs/redirect/})
+   end
+ end
+diff --git a/spec/services/authentication/authenticator_spec.rb b/spec/services/authentication/authenticator_spec.rb
+index 15f16cf..a3f1a66 100644
+--- a/spec/services/authentication/authenticator_spec.rb
++++ b/spec/services/authentication/authenticator_spec.rb
+@@ -98,7 +98,7 @@
+ 
+         expect(user.email).to eq(info.email)
+         expect(user.name).to eq("#{info.first_name} #{info.last_name}")
+-        expect(user.profile_image).not_to be_nil
++        expect(user.profile_image_present?).to be(true)
+         expect(user.apple_username).to match(/#{info.first_name.downcase}_\w+/)
+       end
+ 
+diff --git a/spec/services/images/profile_spec.rb b/spec/services/images/profile_spec.rb
+index ddfb218..52a90fa 100644
+--- a/spec/services/images/profile_spec.rb
++++ b/spec/services/images/profile_spec.rb
+@@ -32,7 +32,7 @@
+   describe ".get" do
+     it "returns the profile_image_url of a user with an existing (CarrierWave) picture" do
+       user = create(:user, :with_carrierwave_profile_image)
+-      expect(described_class.call(user.profile_image_url)).to eq(user.profile_image.url)
++      expect(described_class.call(user.profile_image_url)).to eq(carrierwave_profile_image(user).url)
+     end
+ 
+     it "returns user profile_image_url" do
+diff --git a/spec/services/moderator/banish_user_spec.rb b/spec/services/moderator/banish_user_spec.rb
+index 2341a00..3662412 100644
+--- a/spec/services/moderator/banish_user_spec.rb
++++ b/spec/services/moderator/banish_user_spec.rb
+@@ -68,7 +68,8 @@
+     user.reload
+     expect(user.avatar).not_to be_attached
+     expect(user.read_attribute(:profile_image)).to eq(described_class::DEFAULT_PROFILE_IMAGE)
+-    expect(user.profile_image_url).to eq(user.profile_image.url)
++    # served as it is (CarrierWave used to turn it into a broken URL under the user's upload dir)
++    expect(user.profile_image_url).to eq(described_class::DEFAULT_PROFILE_IMAGE)
+   end
+ 
+   it "removes everything", :aggregate_failures do
+diff --git a/spec/services/profile_images/copy_spec.rb b/spec/services/profile_images/copy_spec.rb
+index 776dff3..07cb29b 100644
+--- a/spec/services/profile_images/copy_spec.rb
++++ b/spec/services/profile_images/copy_spec.rb
+@@ -20,7 +20,7 @@ def avatar_attachments(record)
+ 
+       user.reload
+       expect(user.avatar).to be_attached
+-      expect(user.avatar.download).to eq(File.binread(user.profile_image.path))
++      expect(user.avatar.download).to eq(File.binread(carrierwave_profile_image(user).path))
+       expect(user.avatar.filename.to_s).to eq(legacy_identifier)
+       expect(user.avatar.content_type).to eq("image/jpeg")
+       expect(user.profile_image_url).to match(active_storage_url_pattern)
+@@ -29,13 +29,13 @@ def avatar_attachments(record)
+ 
+     it "leaves the CarrierWave picture in place, so that URLs to it keep working" do
+       legacy_identifier = user.read_attribute(:profile_image)
+-      legacy_path = user.profile_image.path
++      legacy_path = carrierwave_profile_image(user).path
+ 
+       described_class.call(user)
+ 
+       expect(user.reload.read_attribute(:profile_image)).to eq(legacy_identifier)
+       expect(File).to exist(legacy_path)
+-      expect(user.profile_image.url).to end_with(legacy_identifier)
++      expect(carrierwave_profile_image(user).url).to end_with(legacy_identifier)
+     end
+ 
+     it "does not save nor touch the record" do
+@@ -63,7 +63,7 @@ def avatar_attachments(record)
+ 
+     it "does not replace a picture uploaded while copying" do
+       stale = User.select(:id, :profile_image).find(user.id)
+-      allow(stale.profile_image.file).to receive(:read).and_wrap_original do |original|
++      allow_any_instance_of(ProfileImages::LegacyPicture).to receive(:read).and_wrap_original do |original| # rubocop:disable RSpec/AnyInstance
+         User.find(user.id).update!(profile_image: new_image) # concurrent upload
+         original.call
+       end
+@@ -97,6 +97,14 @@ def avatar_attachments(record)
+       expect(ActiveStorage::Blob.count).to eq(0)
+     end
+ 
++    it "skips records whose picture is an absolute URL, which is served as it is" do
++      user.update_column(:profile_image, "https://example.com/default.png")
++
++      expect(described_class.call(user.reload)).to eq(:external)
++      expect(user.reload.avatar).not_to be_attached
++      expect(user.profile_image_url).to eq("https://example.com/default.png")
++    end
++
+     it "skips records without a picture" do
+       user.update_column(:profile_image, nil)
+ 
+@@ -107,7 +115,7 @@ def avatar_attachments(record)
+       organization = create(:organization, :with_carrierwave_profile_image)
+ 
+       expect(described_class.call(organization)).to eq(:copied)
+-      expect(organization.reload.avatar.download).to eq(File.binread(organization.profile_image.path))
++      expect(organization.reload.avatar.download).to eq(File.binread(carrierwave_profile_image(organization).path))
+       expect(organization.profile_image_url).to match(active_storage_url_pattern)
+     end
+ 
+diff --git a/spec/support/legacy_profile_image_helpers.rb b/spec/support/legacy_profile_image_helpers.rb
+new file mode 100644
+index 0000000..11e767a
+--- /dev/null
++++ b/spec/support/legacy_profile_image_helpers.rb
+@@ -0,0 +1,14 @@
++# Profile pictures of users and organizations used to be stored with CarrierWave (see
++# ProfileImageAttachable). CarrierWave is not mounted on them anymore, these helpers give access
++# to such a retired picture the way CarrierWave stored and served it, as a reference in specs.
++module LegacyProfileImageHelpers
++  def carrierwave_profile_image(record)
++    ProfileImageUploader.new(record, :profile_image).tap do |uploader|
++      uploader.retrieve_from_store!(record.read_attribute(:profile_image))
++    end
++  end
++end
++
++RSpec.configure do |config|
++  config.include LegacyProfileImageHelpers
++end

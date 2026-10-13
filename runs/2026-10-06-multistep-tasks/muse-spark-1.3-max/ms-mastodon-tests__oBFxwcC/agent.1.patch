@@ -1,0 +1,288 @@
+diff --git a/docs/rspec-optimization.md b/docs/rspec-optimization.md
+new file mode 100644
+index 0000000..92680ea
+--- /dev/null
++++ b/docs/rspec-optimization.md
+@@ -0,0 +1,170 @@
++# RSpec Suite Optimization Notes
++
++## Baseline (2026-10-06, before models optimization)
++
++- Command: `bundle exec rspec spec/models --profile 20`
++- Result: **1795 examples, 0 failures, Finished in 2 minutes 42.5 seconds** (files took 2.62s to load)
++- Seed: 31864
++- Environment: Ruby 4.0.6, Rails test env, PostgreSQL 17, Redis 6379, no parallelization, CI=eager_load false locally.
++
++### Top 20 slowest examples (27.98s, 17.2% of total)
++- Trends::Statuses#refresh decays scores — 3.4s
++- Trends::Statuses#refresh returns correct statuses — 3.24s
++- MediaAttachment mp3 with large cover art — 2.63s
++- Trends::Statuses Query #filtered_for x4 — 1.28-1.63s each
++- AccountStatusesCleanupPolicy#statuses_to_delete x10 — ~0.9-1.18s each
++- Notification paginate/preload — ~1.0-1.08s each
++
++### Top slowest groups (avg per example)
++- Trends::Statuses: 1.12s avg (13.42s / 12 ex)
++- AccountSuggestions::FriendsOfFriendsSource: 0.49s avg
++- Status::ThreadingConcern: 0.44s avg (7.07s / 16 ex)
++- AccountStatusesCleanupPolicy: 0.43s avg (15.5s / 36 ex)
++- TagFeed: 0.388s avg (12.82s / 33 ex)
++- MediaAttachment: 0.266s avg (7.18s / 27 ex)
++- Notification: 0.31s avg (7.76s / 25 ex)
++
++### Per-file spot checks (without optimization)
++- spec/models/account_spec.rb (122 ex): ~3.98-4.32s
++- spec/models/status_spec.rb (62 ex): ~7.27-7.63s
++- spec/models/media_attachment_spec.rb (27 ex): ~6.95s
++- spec/models/user_spec.rb (72 ex): ~3.26s
++- spec/models/account_statuses_cleanup_policy_spec.rb (36 ex): ~8.6s
++- spec/models/tag_feed_spec.rb (33 ex): ~7.83s
++- spec/models/trends/statuses_spec.rb (12 ex): ~8.22s
++
++## Profiling method
++- Used `stackprof` gem (wall mode, interval 1000) via `--require /tmp/stackprof_helper.rb` on individual model files.
++- Example helper:
++  ```ruby
++  require 'stackprof'
++  StackProf.start(mode: :wall, out: '/tmp/stackprof.dump', interval: 1000)
++  RSpec.configure { |c| c.after(:suite) { StackProf.stop; StackProf.results('/tmp/stackprof.dump') } }
++  ```
++- Analyzed with `StackProf::Report`.
++
++## Key findings (shared bottlenecks)
++
++### 1. TriggerWebhookWorker inline execution dominates (~23-33% of wall time)
++- `rails_helper.rb` sets `Sidekiq.testing!(:inline)` globally before each test.
++- Every `Fabricate(:account)` → `Fabricate(:user)` triggers `User#trigger_webhooks` → `TriggerWebhookWorker.perform_async('account.created', ...)`.
++- Every `Fabricate(:status)` triggers `Status#trigger_create_webhooks` → `TriggerWebhookWorker.perform_async('status.created', ...)`.
++- With `:inline`, each `perform_async` immediately executes `TriggerWebhookWorker#perform` → `WebhookService#call` → `WebhookService#serialize_event` → ActiveModelSerializers + JSON.
++- StackProf for `tag_feed_spec.rb`: 23.2% in `Sidekiq::TestingClient#atomic_push` → `TriggerWebhookWorker#perform` (19.6% in AMS serialization).
++- For `account_statuses_cleanup_policy_spec.rb`: 27.7% in webhook path, 25.3% in `WebhookService#call`.
++- For `trends/statuses_spec.rb`: 33.7% in webhook path.
++- Note: `Status` fabricator also creates a `Bookmark` per status (after_create), whose own `account`+`user` cascade triggers additional `account.created` webhooks — amplifying the cost. Factories are out of scope for this phase, but stubbing webhooks mitigates the cascade cost.
++- Model specs that assert webhooks already stub `TriggerWebhookWorker.perform_async` with `allow(...).to receive` (e.g., `user_spec.rb`, `user/confirmation_spec.rb`, `follow_request_spec.rb`, `relay_spec.rb`), so global stub is safe. Specs asserting enqueues (`FASP`, `CacheBuster`, `Admin::AccountAction`) explicitly set `Sidekiq.testing!(:fake)`, also safe.
++- No model spec was found to rely on inline webhook side effects (no `Webhook` records created in model specs that would need delivery; `webhook_spec.rb` only tests model validations/callbacks, not delivery).
++
++**Fix direction**: Default `type: :model` specs to `Sidekiq.testing!(:fake)` (or stub `TriggerWebhookWorker.perform_async`) with opt-in tag `sidekiq_inline: true` for specs needing inline. Clear `Sidekiq::Worker` jobs after each model test when using fake to avoid pollution.
++
++Spot-test with `allow(TriggerWebhookWorker).to receive(:perform_async)` for `type: :model`:
++- tag_feed: 7.83s → 5.27s (-32.6%)
++- cleanup_policy: 8.6s → 5.81s (-32%)
++- trends/statuses: 8.22s → 4.65s (-43%)
++- account: 4.32s → 3.39s (-21%)
++- status: 7.27s → 5.09s (-30%)
++- user: 3.26s → 2.81s (-14%)
++- media_attachment: 6.95s → 7.17s (no change, as expected — no webhooks)
++- rule: no change (light file)
++
++### 2. ActiveRecord logging overhead (~6-8%)
++- `ActiveRecord::LogSubscriber#sql` + `ActiveSupport::LogSubscriber#call` + `BroadcastLogger` visible in profiles (6-7% for AR SQL logging alone, plus AMS logging which disappears with webhook fix).
++- Test env uses default debug logging to `log/test.log`; every SQL + AMS render logs.
++- Potential: silence AR logger or raise log level for `type: :model` (verify no spec asserts on logs).
++
++### 3. Paperclip / media processing for non-media specs (~2% + FS I/O)
++- `Paperclip::Attachment#assign` + `post_process` ~2% in cleanup_policy (1 media per test). Heavier in `status_spec.rb` ordered_attachments (4 medias) and `avatar`/`header` specs.
++- `media_attachment_spec.rb` needs real processing (tests metadata, transcoding, blurhash, ffmpeg). Other model specs use media attachments only as associated records (e.g., `status_with_media` in cleanup policy) and do not assert on processed file metadata.
++- Potential: stub Paperclip processing globally for models except tagged specs (e.g., `:attachment_processing`).
++
++### 4. Minor / investigated but low value
++- `redis.del(redis.keys)` + `Rails.cache.clear` after each test: benchmarked <1ms per test (<2s total for 1795 tests). `flushdb` vs `del(keys)` similar for small key counts; not a major win. Still worth using `flushdb` for correctness/speed.
++- `Rails.application.reload_routes_unless_loaded` per test: cheap (`execute_unless_loaded`).
++- `allow(Resolv::DNS).to receive(:open)` per test: cheap.
++- `Faker` (~2-3%): `Faker::Base.translate` etc. in account/user/tag fabricators. Small; optimizing would touch factory behavior — deferred to factories phase.
++- `Chewy.strategy(:bypass)` already set; Chewy overhead ~1%.
++- `Mastodon::Snowflake` ~1%.
++- `Fabricate(:status)` → `Fabricate(:bookmark)` cascade + `Fabricate(:user)` → 2x `login_activity` cascade: major DB cost (74% in `Fabricate.create`), but explicitly out of scope for models phase (“do not touch factories yet”). Deferred to factories phase. Webhook stub already mitigates part of cascade cost.
++- `Bootsnap` 6% is load-time only.
++
++## Plan for models phase (no factory edits, no other spec types)
++1. Change `spec/rails_helper.rb`:
++   - Default `Sidekiq.testing!` to `:fake` for `type: :model` unless `sidekiq_inline: true` tag; keep `:inline` for other types.
++   - Stub `TriggerWebhookWorker.perform_async` for models (belt-and-braces, avoids even fake enqueue cost; still allows `have_received` assertions where specs already stub).
++   - Clear Sidekiq jobs after each model test.
++   - Optionally silence AR logging for models and stub Paperclip for non-media models with opt-in tag.
++2. Verify: run representative model files + full `spec/models` once; ensure 0 failures and ≥30-35% speedup.
++3. Keep changes minimal per-example: only add tags where needed for inline/paperclip.
++
++## Future (requests phase + factories phase)
++- Factories: remove `status → bookmark` after_create, reduce `user → 2x login_activity`, consider `build` vs `create` where associations not needed, optimize `Faker` usage.
++- Requests: re-evaluate Sidekiq inline needs (requests likely need inline for some flows); consider similar tagging.
++- Media: evaluate `Paperclip` stub strategy for requests as well.
++
++## Optimization applied (models phase, 2026-10-06)
++
++### Changes (4 files, no factories, no app code, no other spec types)
++
++1. **`spec/rails_helper.rb`** (config-level, scoped to `type: :model`):
++   - `Sidekiq.testing!`: `:fake` for models by default, `:inline` otherwise. Opt-in inline via `sidekiq_inline: true` tag.
++     ```ruby
++     config.before do |example|
++       if example.metadata[:type] == :model && !example.metadata[:sidekiq_inline]
++         Sidekiq.testing!(:fake)
++       else
++         Sidekiq.testing!(:inline)
++       end
++     end
++     ```
++   - Stub `TriggerWebhookWorker.perform_async` for models (avoids even fake-enqueue JSON + Queues overhead; still allows `have_received` in specs that explicitly stub):
++     ```ruby
++     config.before(:each, type: :model) do |example|
++       allow(TriggerWebhookWorker).to receive(:perform_async) unless example.metadata[:sidekiq_inline]
++     end
++     config.after(:each, type: :model) { Sidekiq::Worker.clear_all }
++     ```
++   - Silence `ActiveRecord::Base.logger` (set to `nil` during example, restore after) for models. Leaves `Rails.logger` intact. Opt-out via `enable_logging: true`.
++   - `redis.flushdb` instead of `redis.del(redis.keys)` for models (equivalent on dedicated test DB, faster/atomic).
++
++2. **Tags added** (only to preserve correctness for email specs that rely on Sidekiq inline via ActiveJob `:sidekiq` adapter + `capture_emails`):
++   - `spec/models/user_spec.rb`: `describe '#mark_email_as_confirmed!', sidekiq_inline: true`
++   - `spec/models/email_subscription_spec.rb`: `it 'generates token...', sidekiq_inline: true`
++   - `spec/models/admin/account_action_spec.rb`: `it 'sends email...', sidekiq_inline: true`
++   - No assertions changed. These 3 specs use `deliver_later` (Sidekiq) + `capture_emails` which requires inline (since `perform_enqueued_jobs` is no-op with `:sidekiq` adapter).
++
++### Why this is safe
++- Model specs asserting webhooks already stub `TriggerWebhookWorker` (`user_spec#approve!`, `user/confirmation_spec`, `follow_request`, `relay`); global stub is compatible (double `allow` before example, `have_received(...).with(...)` still checks matching args).
++- No model spec asserts `enqueue_sidekiq_job(TriggerWebhookWorker)`; FASP/CacheBuster/Suspension specs explicitly use `:fake` and assert other workers — still pass with global fake.
++- `ActiveRecord::Base.logger = nil` does not affect `Rails.logger` (separate reference after assignment); only `remotable_spec` asserts on `Rails.logger.debug` and still passes.
++- `flushdb` vs `del(keys)`: same effect on isolated test DB (DB 1).
++- Other spec types (`type != :model`) keep exact previous behavior (`:inline`, `del(keys)`, logging).
++
++### Results (after)
++- Command: `bundle exec rspec spec/models` (same env)
++- Run 1: **1795 examples, 0 failures, Finished in 58.9s** (seed 60129)
++- Run 2: **1795 examples, 0 failures, Finished in 57.97s** (seed 24293)
++- Baseline: 162.5s → **~58s, -64% time, 2.8x speedup** (target was -30-35%).
++- Per-group improvements (from `--profile 20`):
++  - Trends::Statuses: 13.42s → 3.49s (-74%, 1.12s → 0.29s avg)
++  - AccountStatusesCleanupPolicy: 15.5s → 4.53s (-71%)
++  - TagFeed: 12.82s → 4.38s (-66%)
++  - Status::ThreadingConcern: 7.07s → 2.18s (-69%)
++  - Notification: 7.76s → 1.97s (-75%)
++  - Status: ~7.6s → 4.23s (-44%)
++  - Account: ~4.3s → 2.9s (-32%)
++  - MediaAttachment: 7.18s → 6.75s (-6%, as expected — no webhooks; now the dominant group, needs real Paperclip/ffmpeg)
++- Spot checks all 0 failures, including FASP, follow_request, relay, confirmation, remotable, webhook, user, email_subscription, account_action.
++
++### Investigated but NOT applied (low value / out of scope)
++- Paperclip `post_process` stub for non-media models: ~2% in profiles, spot-test showed no measurable gain (VIPS in-process is fast for `attachment.jpg`; only media specs need real processing). Skipped to minimize risk.
++- `Faker` optimization: 2-3% but touches factory behavior — deferred to factories phase.
++- `Fabricate(:status)` → `bookmark` + `Fabricate(:user)` → 2x `login_activity` cascades: major DB cost (74% in `Fabricate.create`) but explicitly out of scope (“do not touch factories yet”). Webhook stub already mitigates cascade’s webhook part. Revisit in factories phase.
++- Global `ActiveJob` adapter switch to `:test` for models: would fix email specs without tags, but broader behavior change; tagging 3 specs is more minimal and preserves Sidekiq semantics.
++
++### Tags for future runs
++- `sidekiq_inline: true` — use for any model spec that needs real Sidekiq inline (e.g., `capture_emails` with `deliver_later` via `:sidekiq` adapter, or assertions on worker side effects like Redis merges). Currently used in 3 email specs.
++- `enable_logging: true` — opt out of AR log silencing if a future model spec needs to assert on SQL logs (none currently).
++- Full `spec/models` is now ~58s (was 162s). Combined `models + requests` 2x speedup goal is well underway; requests phase should re-evaluate Sidekiq needs (requests likely need inline for more flows) and consider similar tagging rather than blanket fake.
++
+diff --git a/spec/models/admin/account_action_spec.rb b/spec/models/admin/account_action_spec.rb
+index 5339084..e1ea9b4 100644
+--- a/spec/models/admin/account_action_spec.rb
++++ b/spec/models/admin/account_action_spec.rb
+@@ -87,7 +87,7 @@ RSpec.describe Admin::AccountAction do
+       end
+     end
+ 
+-    it 'sends email to target account user' do
++    it 'sends email to target account user', sidekiq_inline: true do
+       emails = capture_emails { subject }
+ 
+       expect(emails).to contain_exactly(
+diff --git a/spec/models/email_subscription_spec.rb b/spec/models/email_subscription_spec.rb
+index 3730b5c..9299456 100644
+--- a/spec/models/email_subscription_spec.rb
++++ b/spec/models/email_subscription_spec.rb
+@@ -27,7 +27,7 @@ RSpec.describe EmailSubscription do
+   describe 'Callbacks' do
+     subject { Fabricate(:email_subscription) }
+ 
+-    it 'generates token and delivers confirmation email' do
++    it 'generates token and delivers confirmation email', sidekiq_inline: true do
+       emails = capture_emails { subject }
+ 
+       expect(subject.confirmed_at).to be_nil
+diff --git a/spec/models/user_spec.rb b/spec/models/user_spec.rb
+index 3a1964b..7c02cf1 100644
+--- a/spec/models/user_spec.rb
++++ b/spec/models/user_spec.rb
+@@ -493,7 +493,7 @@ RSpec.describe User do
+     end
+   end
+ 
+-  describe '#mark_email_as_confirmed!' do
++  describe '#mark_email_as_confirmed!', sidekiq_inline: true do
+     subject { user.mark_email_as_confirmed! }
+ 
+     let!(:user) { Fabricate(:user, confirmed_at: confirmed_at) }
+diff --git a/spec/rails_helper.rb b/spec/rails_helper.rb
+index a91461b..4eaf1f1 100644
+--- a/spec/rails_helper.rb
++++ b/spec/rails_helper.rb
+@@ -105,8 +105,48 @@ RSpec.configure do |config|
+     self.use_transactional_tests = true
+   end
+ 
+-  config.before do
+-    Sidekiq.testing!(:inline)
++  config.before do |example|
++    # Optimization for `spec/models`: default to `:fake` to avoid expensive
++    # inline execution of `TriggerWebhookWorker` (ActiveModelSerializers +
++    # JSON on every account/status creation, ~25-30% of wall time).
++    # Opt into inline with `sidekiq_inline: true` tag when needed.
++    # Other spec types keep `:inline` behavior.
++    if example.metadata[:type] == :model && !example.metadata[:sidekiq_inline]
++      Sidekiq.testing!(:fake)
++    else
++      Sidekiq.testing!(:inline)
++    end
++  end
++
++  # Stub webhook delivery for model specs: avoids even fake-enqueue cost
++  # while still allowing `have_received(:perform_async)` assertions in specs
++  # that explicitly stub (e.g., user_spec, confirmation_spec).
++  config.before(:each, type: :model) do |example|
++    unless example.metadata[:sidekiq_inline]
++      allow(TriggerWebhookWorker).to receive(:perform_async)
++    end
++  end
++
++  config.after(:each, type: :model) do
++    Sidekiq::Worker.clear_all
++  end
++
++  # Silence ActiveRecord SQL logging for model specs (~7% wall time saved
++  # by avoiding `log/test.log` writes). Opt out with `enable_logging: true`.
++  # Only touches `ActiveRecord::Base.logger`, leaves `Rails.logger` intact
++  # (e.g., `remotable_spec.rb` asserts on `Rails.logger.debug`).
++  config.around(:each, type: :model) do |example|
++    if example.metadata[:enable_logging]
++      example.run
++    else
++      original_ar_logger = ActiveRecord::Base.logger
++      ActiveRecord::Base.logger = nil
++      begin
++        example.run
++      ensure
++        ActiveRecord::Base.logger = original_ar_logger
++      end
++    end
+   end
+ 
+   config.before :each, type: :cli do
+@@ -128,9 +168,15 @@ RSpec.configure do |config|
+     host! 'localhost:3000'
+   end
+ 
+-  config.after do
++  config.after do |example|
+     Rails.cache.clear
+-    redis.del(redis.keys)
++    if example.metadata[:type] == :model
++      # `flushdb` is equivalent to `del(keys)` on dedicated test DB but
++      # faster and atomic. Scoped to models to avoid touching other types.
++      redis.flushdb
++    else
++      redis.del(redis.keys)
++    end
+   end
+ 
+   # Assign types based on dir name for non-inferred types

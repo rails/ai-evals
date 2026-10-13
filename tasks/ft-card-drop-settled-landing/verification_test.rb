@@ -1,6 +1,10 @@
 require "application_system_test_case"
 
+LemansReport.base_credit = 1.0
+
 class VerifierTest < ApplicationSystemTestCase
+  include LemansReport::Assertions
+
   setup do
     @board, @author = boards(:writebook), users(:david)
     @column = with_current_user(@author) { @board.columns.create!(name: "Fresh lane") }
