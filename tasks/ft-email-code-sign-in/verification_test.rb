@@ -1,6 +1,10 @@
 require "application_system_test_case"
 
+LemansReport.base_credit = 1.0
+
 class VerifierTest < ApplicationSystemTestCase
+  include LemansReport::Assertions
+
   setup do
     ActionMailer::Base.deliveries.clear
     @david, @jason, @kevin, @account = identities(:david), identities(:jason), identities(:kevin), accounts("37s")
@@ -19,7 +23,10 @@ class VerifierTest < ApplicationSystemTestCase
     type_code code
     assert_equal @david.id, signed_in_on(:device)
 
-    using_session(:device) { Capybara.reset_session! }
+    using_session(:device) do
+      Capybara.reset_session!
+      page.driver.quit
+    end
     type_email @david.email_address
     type_code code
 

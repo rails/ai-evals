@@ -1,6 +1,10 @@
 require "test_helper"
 
+LemansReport.base_credit = 1.0
+
 class VerifierTest < ActionDispatch::IntegrationTest
+  include LemansReport::Assertions
+
   TRANSLATION_COVERAGE = Struct.new(:translated, :untranslated).new(0, 0)
   JAPANESE = /[\p{Hiragana}\p{Katakana}\p{Han}]/
   ENGLISH = /[A-Za-z][A-Za-z'’\-]+/
@@ -328,6 +332,7 @@ class VerifierTest < ActionDispatch::IntegrationTest
             ctrl shift alt meta cmd enter return esc escape tab space ]
       ].flatten.flat_map { |string| string.to_s.scan(ENGLISH) }.map(&:downcase).to_set
     end
+
 end
 
 Minitest.after_run do
