@@ -1,0 +1,808 @@
+diff --git a/app/controllers/bots_controller.rb b/app/controllers/bots_controller.rb
+index 3533527..14d9463 100644
+--- a/app/controllers/bots_controller.rb
++++ b/app/controllers/bots_controller.rb
+@@ -1,6 +1,7 @@
+ class BotsController < ApplicationController
+-  before_action :set_bot, only: %i[ edit update destroy ]
++  before_action :set_bot, only: %i[ edit update destroy reactivate ]
+   before_action :ensure_can_administer, only: %i[ edit update destroy ]
++  before_action :ensure_administrator, only: :reactivate
+   before_action :ensure_within_bot_limit, only: %i[ new create ]
+ 
+   def index
+@@ -29,6 +30,11 @@ class BotsController < ApplicationController
+     redirect_to bots_url
+   end
+ 
++  def reactivate
++    @bot.reactivate
++    redirect_to bots_url
++  end
++
+   private
+     def bots_scope
+       if Current.user.administrator?
+@@ -46,6 +52,10 @@ class BotsController < ApplicationController
+       head :forbidden unless Current.user.can_administer?(@bot)
+     end
+ 
++    def ensure_administrator
++      head :forbidden unless Current.user.administrator?
++    end
++
+     def ensure_within_bot_limit
+       head :forbidden if Current.user.reached_bot_limit?
+     end
+diff --git a/app/controllers/messages/by_bots_controller.rb b/app/controllers/messages/by_bots_controller.rb
+index bdc4c8e..2336600 100644
+--- a/app/controllers/messages/by_bots_controller.rb
++++ b/app/controllers/messages/by_bots_controller.rb
+@@ -1,5 +1,6 @@
+ class Messages::ByBotsController < ApplicationController
+   authenticate_by_bot_key
++  before_action :ensure_bot_not_suspended
+   include ActiveStorage::SetCurrent, RoomScoped
+ 
+   rescue_from ActiveRecord::RecordNotFound do
+@@ -7,15 +8,37 @@ class Messages::ByBotsController < ApplicationController
+   end
+ 
+   def create
+-    @message = @room.messages.create_with_attachment!(message_params)
+-    @message.broadcast_create
++    Current.user.with_lock do
++      if Current.user.suspended?
++        head :forbidden
++      elsif Current.user.cooling_down?
++        retry_after = Current.user.cooldown_retry_after
++        Current.user.record_cooldown_attempt!
++        response.set_header("Retry-After", retry_after.to_s)
++        head :too_many_requests
++      elsif Current.user.flooding?
++        Current.user.start_cooldown!
++        response.set_header("Retry-After", Current.user.cooldown_retry_after.to_s)
++        head :too_many_requests
++      else
++        @message = @room.messages.create!(message_params)
++      end
++    end
+ 
+-    head :created, location: message_path(@message)
++    if @message
++      @message.process_attachment
++      @message.broadcast_create
++      head :created, location: message_path(@message)
++    end
+   rescue ActiveRecord::RecordInvalid
+     head :unprocessable_content
+   end
+ 
+   private
++    def ensure_bot_not_suspended
++      head :forbidden if Current.user.suspended?
++    end
++
+     def message_params
+       if attachment_param.present?
+         { attachment: attachment_param }
+diff --git a/app/models/membership.rb b/app/models/membership.rb
+index 403f636..63007d8 100644
+--- a/app/models/membership.rb
++++ b/app/models/membership.rb
+@@ -4,7 +4,7 @@ class Membership < ApplicationRecord
+   belongs_to :room
+   belongs_to :user
+ 
+-  after_create_commit :deliver_webhook_later, if: -> { user.bot? && user.active? && !room.direct? }
++  after_create_commit :deliver_webhook_later, if: -> { user.bot? && user.active? && !user.suspended? && !room.direct? }
+   after_destroy_commit { user.reset_remote_connections }
+ 
+   enum :involvement, %w[ invisible nothing mentions everything ].index_by(&:itself), prefix: :involved_in
+diff --git a/app/models/room.rb b/app/models/room.rb
+index a70ce67..30939b2 100644
+--- a/app/models/room.rb
++++ b/app/models/room.rb
+@@ -2,17 +2,17 @@ class Room < ApplicationRecord
+   has_many :memberships, dependent: :delete_all do
+     def grant_to(users)
+       room = proxy_association.owner
+-      users = Array(users).uniq(&:id)
++      users = Array(users).flatten
+       return if users.empty?
+ 
+-      existing_user_ids = room.memberships.where(user_id: users.map(&:id)).pluck(:user_id)
++      existing_user_ids = where(user_id: users.map(&:id)).pluck(:user_id).to_set
+       new_users = users.reject { |user| existing_user_ids.include?(user.id) }
+       return if new_users.empty?
+ 
+       Membership.insert_all(new_users.collect { |user| { room_id: room.id, user_id: user.id, involvement: room.default_involvement } })
+ 
+       unless room.direct?
+-        bots = new_users.select { |user| user.bot? && user.active? }
++        bots = new_users.select { |user| user.bot? && user.active? && !user.suspended? }
+         if bots.any?
+           ActiveRecord.after_all_transactions_commit do
+             bots.each { |bot| bot.webhook&.deliver_later(room) }
+@@ -104,7 +104,7 @@ class Room < ApplicationRecord
+     def deliver_webhooks_later(message)
+       return if message.creator.bot?
+ 
+-      message.mentionees.active.bots.includes(:webhook).each do |bot|
++      message.mentionees.active.bots.unsuspended.includes(:webhook).each do |bot|
+         bot.webhook&.deliver_later(message)
+       end
+     end
+diff --git a/app/models/user.rb b/app/models/user.rb
+index d86c135..a55a7ba 100644
+--- a/app/models/user.rb
++++ b/app/models/user.rb
+@@ -44,7 +44,8 @@ class User < ApplicationRecord
+       sessions.delete_all
+       webhook&.destroy
+ 
+-      update! status: :deactivated, email_address: deactived_email_address, bot_token: nil
++      update! status: :deactivated, email_address: deactived_email_address, bot_token: nil,
++        suspension_reason: nil, cooldown_ends_at: nil, cooldown_attempts: 0, failed_webhook_deliveries: 0
+     end
+   end
+ 
+diff --git a/app/models/user/bot.rb b/app/models/user/bot.rb
+index 7bca362..bc33597 100644
+--- a/app/models/user/bot.rb
++++ b/app/models/user/bot.rb
+@@ -1,6 +1,15 @@
+ module User::Bot
+   extend ActiveSupport::Concern
+ 
++  FLOOD_MESSAGE_LIMIT = 10
++  FLOOD_WINDOW = 10.seconds
++  FLOOD_COOLDOWN = 30.seconds
++  FLOOD_COOLDOWN_ATTEMPT_LIMIT = 5
++  FAILED_WEBHOOK_DELIVERY_LIMIT = 10
++
++  SUSPENSION_REASON_FLOODING = "Flooding"
++  SUSPENSION_REASON_FAILING_WEBHOOKS = "Failing webhooks"
++
+   included do
+     belongs_to :creator, class_name: "User", optional: true
+     has_many :bots, -> { bots }, class_name: "User", foreign_key: :creator_id, dependent: :destroy
+@@ -9,6 +18,8 @@ module User::Bot
+     scope :bots, -> { where(role: :bot) }
+     scope :without_bots, -> { where.not(role: :bot) }
+     scope :auto_join_open_rooms, -> { bots.where(auto_join_open_rooms: true) }
++    scope :suspended, -> { where.not(suspension_reason: nil) }
++    scope :unsuspended, -> { where(suspension_reason: nil) }
+ 
+     before_validation :set_bot_defaults, on: :create, if: :bot?
+     validate :ensure_creator_within_bot_limit, on: :create, if: :bot?
+@@ -54,6 +65,82 @@ module User::Bot
+     end
+   end
+ 
++  def suspended?
++    suspension_reason.present?
++  end
++
++  def suspend!(reason)
++    update!(
++      suspension_reason: reason,
++      cooldown_ends_at: nil,
++      cooldown_attempts: 0
++    )
++  end
++
++  def reactivate
++    update!(
++      suspension_reason: nil,
++      cooldown_ends_at: nil,
++      cooldown_attempts: 0,
++      failed_webhook_deliveries: 0,
++      last_reset_message_id: messages.maximum(:id) || 0
++    )
++  end
++
++  def cooling_down?
++    !suspended? && cooldown_ends_at.present? && cooldown_ends_at > Time.current
++  end
++
++  def cooldown_retry_after
++    return 0 unless cooldown_ends_at.present?
++    [ (cooldown_ends_at - Time.current).ceil, 1 ].max
++  end
++
++  def flooding?
++    messages.where(created_at: FLOOD_WINDOW.ago..).where("id > ?", last_reset_message_id).count >= FLOOD_MESSAGE_LIMIT
++  end
++
++  def start_cooldown!
++    update!(
++      cooldown_ends_at: FLOOD_COOLDOWN.from_now,
++      cooldown_attempts: 0,
++      last_reset_message_id: messages.maximum(:id) || 0
++    )
++  end
++
++  def record_cooldown_attempt!
++    attempts = cooldown_attempts + 1
++    if attempts >= FLOOD_COOLDOWN_ATTEMPT_LIMIT
++      suspend!(SUSPENSION_REASON_FLOODING)
++    else
++      update!(cooldown_attempts: attempts)
++    end
++  end
++
++  def record_failed_webhook_delivery!
++    with_lock do
++      return if !active? || suspended?
++
++      failures = failed_webhook_deliveries + 1
++      if failures >= FAILED_WEBHOOK_DELIVERY_LIMIT
++        update!(
++          failed_webhook_deliveries: failures,
++          suspension_reason: SUSPENSION_REASON_FAILING_WEBHOOKS,
++          cooldown_ends_at: nil,
++          cooldown_attempts: 0
++        )
++      else
++        update!(failed_webhook_deliveries: failures)
++      end
++    end
++  end
++
++  def reset_failed_webhook_deliveries!
++    with_lock do
++      update!(failed_webhook_deliveries: 0) if failed_webhook_deliveries > 0
++    end
++  end
++
+   private
+     def set_bot_defaults
+       self.creator ||= Current.user
+diff --git a/app/models/webhook.rb b/app/models/webhook.rb
+index 4f77a0d..39a962e 100644
+--- a/app/models/webhook.rb
++++ b/app/models/webhook.rb
+@@ -1,7 +1,7 @@
+ require "net/http"
+ 
+ class Webhook < ApplicationRecord
+-  ENDPOINT_TIMEOUT = 10.seconds
++  ENDPOINT_TIMEOUT = 2.seconds
+   ALLOWED_RESPONSE_CONTENT_TYPES = %w[ text/plain text/html ]
+ 
+   belongs_to :user
+@@ -11,18 +11,22 @@ class Webhook < ApplicationRecord
+   end
+ 
+   def deliver(record)
+-    return unless user.active?
++    return if !user.reload.active? || user.suspended?
+ 
+     room = room_for(record)
+     return if room.nil? || (!record.is_a?(Message) && room.direct?)
+ 
+-    response = post(payload_for(record))
++    response = perform_post(payload_for(record))
+ 
+-    if acceptable_reply?(response) && (reply_body = extract_reply_body(response)).present?
+-      receive_reply(room, reply_body)
++    if response.is_a?(Net::HTTPSuccess)
++      user.reset_failed_webhook_deliveries!
++
++      if acceptable_reply?(response) && (reply_body = extract_reply_body(response)).present?
++        receive_reply(room, reply_body)
++      end
++    else
++      user.record_failed_webhook_delivery!
+     end
+-  rescue Exception => e
+-    Rails.logger.error "Failed to deliver webhook #{id} to #{url}: #{e.class} `#{e.message}`"
+   end
+ 
+   private
+@@ -80,6 +84,13 @@ class Webhook < ApplicationRecord
+       }
+     end
+ 
++    def perform_post(payload)
++      post(payload)
++    rescue Exception => e
++      Rails.logger.error "Failed to deliver webhook #{id} to #{url}: #{e.class} `#{e.message}`"
++      nil
++    end
++
+     def post(payload)
+       uri = URI.parse(url)
+       return unless uri.is_a?(URI::HTTP)
+@@ -100,7 +111,20 @@ class Webhook < ApplicationRecord
+     end
+ 
+     def receive_reply(room, body)
+-      message = room.messages.create!(creator: user, body: body)
+-      message.broadcast_create
++      message = nil
++
++      user.with_lock do
++        if user.suspended?
++          nil
++        elsif user.cooling_down?
++          user.record_cooldown_attempt!
++        elsif user.flooding?
++          user.start_cooldown!
++        else
++          message = room.messages.create!(creator: user, body: body)
++        end
++      end
++
++      message&.broadcast_create
+     end
+ end
+diff --git a/app/views/bots/_bot.html.erb b/app/views/bots/_bot.html.erb
+index a31156e..3acbce4 100644
+--- a/app/views/bots/_bot.html.erb
++++ b/app/views/bots/_bot.html.erb
+@@ -4,12 +4,26 @@
+       <%= avatar_tag bot, loading: :lazy %>
+     </figure>
+ 
+-    <div class="min-width">
++    <div class="min-width txt-align-start">
+       <div class="overflow-ellipsis fill-shade"><strong><%= bot.name %></strong></div>
++      <% if bot.suspended? %>
++        <div class="txt-small">
++          <strong>Suspended</strong> — <span><%= bot.suspension_reason %></span>
++        </div>
++      <% end %>
+     </div>
+ 
+     <hr class="separator" aria-hidden="true">
+ 
++    <% if bot.suspended? && Current.user.administrator? %>
++      <%= button_to reactivate_bot_path(bot), method: :post, class: "btn txt-small flex-item-no-shrink",
++            aria: { label: "Reactivate" },
++            data: { turbo_confirm: "Are you sure you want to reactivate this bot?" } do %>
++        <%= image_tag "refresh.svg", aria: { hidden: "true" }, size: 20 %>
++        <span>Reactivate</span>
++      <% end %>
++    <% end %>
++
+     <%= link_to edit_bot_path(bot), class: "btn txt-small flex-item-no-shrink", aria: { label: "Edit #{bot.name}" } do %>
+       <%= image_tag "pencil.svg", size: 20, aria: { hidden: "true" } %>
+       <span class="for-screen-reader">Edit <%= bot.name %></span>
+diff --git a/config/routes.rb b/config/routes.rb
+index 368c692..e0e43ce 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -19,7 +19,9 @@ Rails.application.routes.draw do
+     end
+   end
+ 
+-  resources :bots
++  resources :bots do
++    post :reactivate, on: :member
++  end
+ 
+   direct :fresh_account_logo do |options|
+     route_for :account_logo, v: Current.account&.updated_at&.to_fs(:number), size: options[:size]
+diff --git a/db/migrate/20260204000000_add_bot_moderation_fields_to_users.rb b/db/migrate/20260204000000_add_bot_moderation_fields_to_users.rb
+new file mode 100644
+index 0000000..f07265b
+--- /dev/null
++++ b/db/migrate/20260204000000_add_bot_moderation_fields_to_users.rb
+@@ -0,0 +1,9 @@
++class AddBotModerationFieldsToUsers < ActiveRecord::Migration[8.1]
++  def change
++    add_column :users, :suspension_reason, :string
++    add_column :users, :cooldown_ends_at, :datetime
++    add_column :users, :cooldown_attempts, :integer, default: 0, null: false
++    add_column :users, :failed_webhook_deliveries, :integer, default: 0, null: false
++    add_column :users, :last_reset_message_id, :integer, default: 0, null: false
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index f1158a9..a2dd211 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.1].define(version: 2026_02_03_000000) do
++ActiveRecord::Schema[8.1].define(version: 2026_02_04_000000) do
+   create_table "accounts", force: :cascade do |t|
+     t.datetime "created_at", null: false
+     t.text "custom_styles"
+@@ -148,13 +148,18 @@ ActiveRecord::Schema[8.1].define(version: 2026_02_03_000000) do
+     t.boolean "auto_join_open_rooms", default: false, null: false
+     t.text "bio"
+     t.string "bot_token"
++    t.integer "cooldown_attempts", default: 0, null: false
++    t.datetime "cooldown_ends_at"
+     t.datetime "created_at", null: false
+     t.integer "creator_id"
+     t.string "email_address"
++    t.integer "failed_webhook_deliveries", default: 0, null: false
++    t.integer "last_reset_message_id", default: 0, null: false
+     t.string "name", null: false
+     t.string "password_digest"
+     t.integer "role", default: 0, null: false
+     t.integer "status", default: 0, null: false
++    t.string "suspension_reason"
+     t.datetime "updated_at", null: false
+     t.index ["bot_token"], name: "index_users_on_bot_token", unique: true
+     t.index ["creator_id"], name: "index_users_on_creator_id"
+diff --git a/docs/bots.md b/docs/bots.md
+index 30652ca..8e2a681 100644
+--- a/docs/bots.md
++++ b/docs/bots.md
+@@ -68,3 +68,30 @@ Bots are implemented as `User` records with `role: :bot` via the `User::Bot` con
+   - `Message` validates presence of body or attachment on create (`422 Unprocessable Content` when empty).
+   - Broadcasts message creation via Turbo Streams (`@message.broadcast_create`) and triggers `room.receive(@message)` (unread tracking + `Room::PushMessageJob`).
+   - Responds with `201 Created` and `Location: /messages/:message_id`.
++
++### Moderation: Flooding, Failing Webhooks, Suspension & Reactivation
++
++- Columns on `users` (`db/migrate/20260204000000_add_bot_moderation_fields_to_users.rb`):
++  - `suspension_reason` (string, nullable) — `nil` when unsuspended; `"Flooding"` or `"Failing webhooks"` when suspended.
++  - `cooldown_ends_at` (datetime, nullable) — expiration timestamp of an active 30-second flood cooldown.
++  - `cooldown_attempts` (integer, default `0`, not null) — number of post attempts made during the current cooldown.
++  - `failed_webhook_deliveries` (integer, default `0`, not null) — consecutive failed webhook deliveries.
++  - `last_reset_message_id` (integer, default `0`, not null) — high-water message ID recorded when a cooldown starts or when a bot is reactivated so pre-cooldown/pre-reactivation messages do not re-trigger the 10-second sliding window.
++- **Flooding** (`User::Bot` constants: `FLOOD_MESSAGE_LIMIT = 10`, `FLOOD_WINDOW = 10.seconds`, `FLOOD_COOLDOWN = 30.seconds`, `FLOOD_COOLDOWN_ATTEMPT_LIMIT = 5`):
++  - A bot may post at most 10 messages in any 10 seconds across API posts (`Messages::ByBotsController#create`) and webhook replies (`Webhook#receive_reply`).
++  - The 11th message within 10 seconds is rejected and starts a 30-second cooldown (`bot.start_cooldown!`).
++  - During the cooldown (`bot.cooling_down?`), the posting endpoint responds with `429 Too Many Requests` and a `Retry-After` header (remaining seconds, `bot.cooldown_retry_after`), and webhook replies are not posted.
++  - Five more attempts to post during the same cooldown (`bot.record_cooldown_attempt!`) suspend the bot with reason `"Flooding"`.
++- **Failing webhooks** (`User::Bot::FAILED_WEBHOOK_DELIVERY_LIMIT = 10`):
++  - Any response other than `2xx` (`!response.is_a?(Net::HTTPSuccess)`), a timeout, or a connection error increments `failed_webhook_deliveries` (`bot.record_failed_webhook_delivery!`).
++  - Any `2xx` response resets `failed_webhook_deliveries` to `0` (`bot.reset_failed_webhook_deliveries!`).
++  - 10 failed deliveries in a row suspend the bot with reason `"Failing webhooks"`.
++- **Suspended bots** (`bot.suspended?`):
++  - Keep `status: :active` so they keep their rooms and messages, stay listed on `/bots` (for both owner and administrators), and still count towards their owner's `bots_per_member` limit.
++  - Receive `403 Forbidden` from `POST /rooms/:room_id/:bot_key/messages` (`Messages::ByBotsController#ensure_bot_not_suspended`).
++  - Receive no webhooks (`Room#deliver_webhooks_later`, `Room#memberships.grant_to`, `Membership#deliver_webhook_later`, and `Webhook#deliver` all skip suspended bots).
++  - Show as `"Suspended"` with the reason (`bot.suspension_reason`) on `/bots` (`app/views/bots/_bot.html.erb`).
++- **Reactivation**:
++  - `POST /bots/:id/reactivate` (`reactivate_bot_path`, `BotsController#reactivate`) is restricted to administrators only (`Current.user.administrator?`).
++  - On `/bots`, only administrators see the `"Reactivate"` button (with native confirmation via `data-turbo-confirm`) on suspended bots.
++  - `bot.reactivate` clears `suspension_reason`, `cooldown_ends_at`, `cooldown_attempts`, `failed_webhook_deliveries`, and updates `last_reset_message_id`.
+diff --git a/test/controllers/bots_controller_test.rb b/test/controllers/bots_controller_test.rb
+index c7d31db..febaf38 100644
+--- a/test/controllers/bots_controller_test.rb
++++ b/test/controllers/bots_controller_test.rb
+@@ -274,4 +274,49 @@ class BotsControllerTest < ActionDispatch::IntegrationTest
+     end
+     assert_redirected_to bots_url
+   end
++
++  test "suspended bot stays listed on bots page with Suspended and reason, counts towards limit, and only admins can reactivate" do
++    accounts(:signal).update!(settings: { bots_per_member: 2 })
++
++    flood_bot = User.create_bot!(name: "Flood Bot", creator: users(:kevin))
++    webhook_bot = User.create_bot!(name: "Broken Webhook Bot", webhook_url: "https://example.com/hook", creator: users(:kevin))
++
++    flood_bot.suspend!("Flooding")
++    webhook_bot.suspend!("Failing webhooks")
++
++    # Member (owner) sees both suspended bots with "Suspended" and reason, still at bot limit, and cannot reactivate
++    get bots_url
++    assert_response :ok
++    assert_match(/reached the limit/, response.body)
++    assert_select "li", text: /Flood Bot.*Suspended.*Flooding/m
++    assert_select "li", text: /Broken Webhook Bot.*Suspended.*Failing webhooks/m
++    assert_select "button", text: /Reactivate/, count: 0
++
++    post reactivate_bot_url(flood_bot)
++    assert_response :forbidden
++    assert flood_bot.reload.suspended?
++
++    # Administrator sees "Suspended" with reason and "Reactivate" button with confirmation, and can reactivate
++    sign_in :david
++    get bots_url
++    assert_response :ok
++    assert_select "li", text: /Flood Bot.*Suspended.*Flooding/m
++    assert_select "li", text: /Broken Webhook Bot.*Suspended.*Failing webhooks/m
++    assert_select "button[data-turbo-confirm]", text: /Reactivate/, count: 2
++
++    post reactivate_bot_url(flood_bot)
++    assert_redirected_to bots_url
++    assert_not flood_bot.reload.suspended?
++    assert_nil flood_bot.suspension_reason
++
++    get bots_url
++    assert_response :ok
++    assert_select "li", text: /Broken Webhook Bot.*Suspended.*Failing webhooks/m
++    assert_select "button[data-turbo-confirm]", text: /Reactivate/, count: 1
++
++    # Reactivated bot can post again immediately
++    rooms(:hq).memberships.grant_to(flood_bot)
++    post room_bot_messages_url(rooms(:hq), flood_bot.bot_key), params: "I am back!"
++    assert_response :created
++  end
+ end
+diff --git a/test/controllers/messages/by_bots_controller_test.rb b/test/controllers/messages/by_bots_controller_test.rb
+index 360f9ab..cfc31da 100644
+--- a/test/controllers/messages/by_bots_controller_test.rb
++++ b/test/controllers/messages/by_bots_controller_test.rb
+@@ -95,4 +95,108 @@ class Messages::ByBotsControllerTest < ActionDispatch::IntegrationTest
+ 
+     assert_response :unauthorized
+   end
++
++  test "flooding: bot may post 10 messages in 10s, 11th is rejected with 429 and Retry-After starting 30s cooldown, and posts again after cooldown" do
++    freeze_time do
++      assert_difference -> { @open_room.messages.count }, +10 do
++        10.times do |i|
++          post room_bot_messages_url(@open_room, @bot.bot_key), params: "Message #{i + 1}"
++          assert_response :created
++        end
++      end
++
++      # 11th message goes over the limit and starts a 30-second cooldown
++      assert_no_difference -> { @open_room.messages.count } do
++        post room_bot_messages_url(@open_room, @bot.bot_key), params: "Message 11"
++      end
++      assert_response :too_many_requests
++      assert_equal "30", response.headers["Retry-After"]
++      assert @bot.reload.cooling_down?
++      assert_not @bot.suspended?
++
++      # 12 seconds into cooldown, Retry-After reflects remaining seconds
++      travel 12.seconds
++      assert_no_difference -> { @open_room.messages.count } do
++        post room_bot_messages_url(@open_room, @bot.bot_key), params: "Still cooling down"
++      end
++      assert_response :too_many_requests
++      assert_equal "18", response.headers["Retry-After"]
++
++      # After 30 seconds total, cooldown has expired and bot can post again
++      travel 19.seconds
++      assert_difference -> { @open_room.messages.count }, +1 do
++        post room_bot_messages_url(@open_room, @bot.bot_key), params: "Back after cooldown"
++      end
++      assert_response :created
++    end
++  end
++
++  test "flooding: sliding 10-second window allows more messages once older ones age out" do
++    freeze_time do
++      5.times do |i|
++        post room_bot_messages_url(@open_room, @bot.bot_key), params: "Batch 1 - #{i}"
++        assert_response :created
++      end
++
++      travel 6.seconds
++
++      5.times do |i|
++        post room_bot_messages_url(@open_room, @bot.bot_key), params: "Batch 2 - #{i}"
++        assert_response :created
++      end
++
++      # 5 seconds later (11s after Batch 1, 5s after Batch 2), only 5 messages are in the last 10s
++      travel 5.seconds
++
++      5.times do |i|
++        post room_bot_messages_url(@open_room, @bot.bot_key), params: "Batch 3 - #{i}"
++        assert_response :created
++      end
++
++      # Now 10 messages are in the last 10s (Batch 2 and Batch 3), so the next one triggers cooldown
++      post room_bot_messages_url(@open_room, @bot.bot_key), params: "Over limit"
++      assert_response :too_many_requests
++      assert_equal "30", response.headers["Retry-After"]
++    end
++  end
++
++  test "flooding: five more attempts during the same cooldown suspend the bot, and suspended bot gets 403 Forbidden" do
++    freeze_time do
++      10.times do |i|
++        post room_bot_messages_url(@open_room, @bot.bot_key), params: "Message #{i + 1}"
++        assert_response :created
++      end
++
++      # Message that goes over the limit starts the 30-second cooldown
++      post room_bot_messages_url(@open_room, @bot.bot_key), params: "Over limit"
++      assert_response :too_many_requests
++      assert_equal "30", response.headers["Retry-After"]
++      assert_not @bot.reload.suspended?
++
++      # Attempts 1..4 during cooldown do not suspend yet
++      4.times do |i|
++        post room_bot_messages_url(@open_room, @bot.bot_key), params: "Cooldown attempt #{i + 1}"
++        assert_response :too_many_requests
++        assert_equal "30", response.headers["Retry-After"]
++        assert_not @bot.reload.suspended?
++      end
++
++      # 5th attempt during the same cooldown suspends the bot
++      post room_bot_messages_url(@open_room, @bot.bot_key), params: "Cooldown attempt 5"
++      assert @bot.reload.suspended?
++      assert_equal "Flooding", @bot.suspension_reason
++
++      # Suspended bot gets 403 Forbidden from the posting endpoint (even after 30s)
++      assert_no_difference -> { Message.count } do
++        post room_bot_messages_url(@open_room, @bot.bot_key), params: "While suspended"
++      end
++      assert_response :forbidden
++
++      travel 60.seconds
++      assert_no_difference -> { Message.count } do
++        post room_bot_messages_url(@open_room, @bot.bot_key), params: "Still suspended after cooldown time"
++      end
++      assert_response :forbidden
++    end
++  end
+ end
+diff --git a/test/models/user/bot_test.rb b/test/models/user/bot_test.rb
+index 4649105..5ddc4ba 100644
+--- a/test/models/user/bot_test.rb
++++ b/test/models/user/bot_test.rb
+@@ -134,4 +134,25 @@ class User::BotTest < ActiveSupport::TestCase
+     admin_bot = User.create_bot!(name: "Admin Bot", creator: users(:david))
+     assert admin_bot.persisted?
+   end
++
++  test "suspended bot keeps rooms, messages, and still counts towards owner's bot limit" do
++    accounts(:signal).update!(settings: { bots_per_member: 1 })
++
++    bot = User.create_bot!(name: "Floody Bot", creator: users(:jz), auto_join_open_rooms: true)
++    room = rooms(:hq)
++    message = room.messages.create!(creator: bot, body: "Before suspension")
++
++    bot.suspend!("Flooding")
++    bot.reload
++
++    assert bot.suspended?
++    assert_equal "Flooding", bot.suspension_reason
++    assert_includes bot.rooms, room
++    assert_includes bot.messages, message
++    assert users(:jz).reached_bot_limit?
++
++    assert_raises(ActiveRecord::RecordInvalid) do
++      User.create_bot!(name: "Second Bot", creator: users(:jz))
++    end
++  end
+ end
+diff --git a/test/models/webhook_test.rb b/test/models/webhook_test.rb
+index 3c889b2..9bd4ba1 100644
+--- a/test/models/webhook_test.rb
++++ b/test/models/webhook_test.rb
+@@ -357,4 +357,137 @@ class WebhookTest < ActionDispatch::IntegrationTest
+     thread&.join
+     WebMock.disable_net_connect!
+   end
++
++  test "webhook replies count towards flood limit, are not posted during cooldown, and 5 attempts in cooldown suspend the bot" do
++    stub_request(:post, "https://example.com/webhook")
++      .to_return(status: 200, body: "Bot reply", headers: { "Content-Type" => "text/plain" })
++
++    freeze_time do
++      # Post 8 messages via API and 2 via webhook replies (total 10 in 10s)
++      8.times do |i|
++        post room_bot_messages_url(@room, @bot.bot_key), params: "API #{i + 1}"
++        assert_response :created
++      end
++
++      2.times do |i|
++        assert_difference -> { @room.messages.where(creator: @bot).count }, +1 do
++          perform_enqueued_jobs only: WebhookDeliveryJob do
++            post room_messages_url(@room, format: :turbo_stream), params: {
++              message: { body: "<div>#{mention_attachment_for(@bot)} hi #{i}</div>", client_message_id: "wh-flood-#{i}" }
++            }
++          end
++        end
++      end
++
++      assert_equal 10, @room.messages.where(creator: @bot).count
++
++      # 11th message via webhook reply is rejected and starts 30s cooldown
++      assert_no_difference -> { @room.messages.where(creator: @bot).count } do
++        perform_enqueued_jobs only: WebhookDeliveryJob do
++          post room_messages_url(@room, format: :turbo_stream), params: {
++            message: { body: "<div>#{mention_attachment_for(@bot)} over limit</div>", client_message_id: "wh-flood-over" }
++          }
++        end
++      end
++
++      assert @bot.reload.cooling_down?
++      assert_not @bot.suspended?
++
++      # During cooldown, API gets 429 and webhook replies are not posted; 5 total attempts suspend the bot
++      3.times do |i|
++        post room_bot_messages_url(@room, @bot.bot_key), params: "Cooldown API #{i}"
++        assert_response :too_many_requests
++      end
++
++      assert_not @bot.reload.suspended?
++
++      2.times do |i|
++        assert_no_difference -> { @room.messages.where(creator: @bot).count } do
++          perform_enqueued_jobs only: WebhookDeliveryJob do
++            post room_messages_url(@room, format: :turbo_stream), params: {
++              message: { body: "<div>#{mention_attachment_for(@bot)} cooldown wh #{i}</div>", client_message_id: "wh-cd-#{i}" }
++            }
++          end
++        end
++      end
++
++      assert @bot.reload.suspended?
++      assert_equal "Flooding", @bot.suspension_reason
++    end
++  end
++
++  test "ten failed webhook deliveries in a row suspend the bot while a successful delivery resets the count" do
++    # 5 non-2xx responses + 2 timeouts + 2 connection errors = 9 failures
++    stub_request(:post, "https://example.com/webhook")
++      .to_return({ status: 500 }, { status: 502 }, { status: 404 }, { status: 400 }, { status: 302 })
++      .then.to_timeout
++      .then.to_timeout
++      .then.to_raise(Errno::ECONNREFUSED)
++      .then.to_raise(SocketError.new("Failed to open TCP connection"))
++
++    9.times do |i|
++      perform_enqueued_jobs only: WebhookDeliveryJob do
++        post room_messages_url(@room, format: :turbo_stream), params: {
++          message: { body: "<div>#{mention_attachment_for(@bot)} fail #{i}</div>", client_message_id: "fail-a-#{i}" }
++        }
++      end
++    end
++
++    assert_not @bot.reload.suspended?
++    assert_equal 9, @bot.failed_webhook_deliveries
++
++    # A 2xx response resets the failure count
++    WebMock.reset!
++    stub_request(:post, "https://example.com/webhook").to_return(status: 204)
++
++    perform_enqueued_jobs only: WebhookDeliveryJob do
++      post room_messages_url(@room, format: :turbo_stream), params: {
++        message: { body: "<div>#{mention_attachment_for(@bot)} ok</div>", client_message_id: "ok-reset" }
++      }
++    end
++
++    assert_not @bot.reload.suspended?
++    assert_equal 0, @bot.failed_webhook_deliveries
++
++    # Now 10 failures in a row suspend the bot
++    WebMock.reset!
++    stub_request(:post, "https://example.com/webhook").to_return(status: 503)
++
++    9.times do |i|
++      perform_enqueued_jobs only: WebhookDeliveryJob do
++        post room_messages_url(@room, format: :turbo_stream), params: {
++          message: { body: "<div>#{mention_attachment_for(@bot)} fail2 #{i}</div>", client_message_id: "fail-b-#{i}" }
++        }
++      end
++      assert_not @bot.reload.suspended?
++    end
++
++    perform_enqueued_jobs only: WebhookDeliveryJob do
++      post room_messages_url(@room, format: :turbo_stream), params: {
++        message: { body: "<div>#{mention_attachment_for(@bot)} fail2 10</div>", client_message_id: "fail-b-10" }
++      }
++    end
++
++    assert @bot.reload.suspended?
++    assert_equal "Failing webhooks", @bot.suspension_reason
++
++    # Suspended bot receives no webhooks when mentioned or added to a room
++    WebMock.reset!
++    webhook_stub = stub_request(:post, "https://example.com/webhook").to_return(status: 200)
++
++    assert_no_enqueued_jobs only: WebhookDeliveryJob do
++      post room_messages_url(@room, format: :turbo_stream), params: {
++        message: { body: "<div>#{mention_attachment_for(@bot)} after suspension</div>", client_message_id: "after-susp" }
++      }
++    end
++
++    assert_no_enqueued_jobs only: WebhookDeliveryJob do
++      put rooms_open_url(rooms(:pets)), params: {
++        room: { name: rooms(:pets).name },
++        user_ids: [ @bot.id ]
++      }
++    end
++
++    assert_not_requested webhook_stub
++  end
+ end
