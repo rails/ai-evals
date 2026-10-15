@@ -301,8 +301,10 @@ class SuiteSpeedupTest < Minitest::Test
 
   # @feature password-digest
   def test_password_digest_cached
+    # A fabricator with a precomputed digest never hashes, so nothing loads bcrypt (Devise loads it lazily).
     probe = prepare_spec("spec/models/lemans_password_probe_spec.rb", <<~RUBY)
       require 'rails_helper'
+      require 'bcrypt'
 
       RSpec.describe 'Password hashing' do
         it 'reuses the digest of a password it has already hashed' do
