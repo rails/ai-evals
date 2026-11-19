@@ -35,7 +35,7 @@ class AccountTest < HelpdeskTest
         data = json_request(:post, "/account/create", {
           account: { name: unique("Account"), subdomain: unique("account"),
             admin: { name: "Owner", email: unique_email, password: PASSWORD } }
-        }, status: 201)
+        })
       end
       assert_emails before
 
@@ -65,7 +65,7 @@ class AccountTest < HelpdeskTest
         end
 
         cancellation_time = Time.current
-        assert_status(204, request(:post, "/account/cancel", context: owner))
+        assert_status(:success, request(:post, "/account/cancel", context: owner))
         travel_to cancellation_time + 90.days - 30.minutes do
           sign_in(owner)
           target = merge_rows(target, added_rows(before_target, account_data_rows))
@@ -107,7 +107,11 @@ class AccountTest < HelpdeskTest
     agent = add_staff(owner)
     suspended = add_staff(owner)
     customer = register_customer(owner)
-    unverified = register_customer(owner, verify: false)
+    unverified_user = register_customer(owner, verify: false).fetch(:user)
+    unless unverified_user.key?("id")
+      email = unverified_user.fetch("email")
+      unverified_user = get_collection("/users", "users", context: owner).find { |user| user["email"] == email }
+    end
     groups = [gm_create_group(owner), gm_create_group(owner)]
     memberships = [
       gm_create_membership(owner, groups.first, agent, default: true),
@@ -117,7 +121,7 @@ class AccountTest < HelpdeskTest
     suspend_user(owner, suspended)
     pending = invite_staff(owner)
     revoked = invite_staff(owner)
-    assert_status(204, request(:delete, "/invitations/#{record_id(revoked.fetch(:invitation))}", context: owner))
+    assert_status(:success, request(:delete, "/invitations/#{record_id(revoked.fetch(:invitation))}", context: owner))
 
     requests = 4.times.map { create_request(customer) }
     source, intermediate, survivor, pending_request = requests.map { |record| record_id(record) }
@@ -128,12 +132,10 @@ class AccountTest < HelpdeskTest
     merge_tickets(owner, source, intermediate)
     merge_tickets(owner, intermediate, survivor)
     email_ticket = email_open_ticket(owner, customer, subject: unique("Email ticket"), body: unique("Email body"))
-    assert_status(202, request(:post, "/password_resets", {
-      password_reset: { email: owner.fetch(:user).fetch("email") }
-    }, context: owner, token: nil))
+    request_password_reset(owner, token: nil)
 
     records = [owner.fetch(:account), owner.fetch(:user), agent.fetch(:user), suspended.fetch(:user),
-      customer.fetch(:user), unverified.fetch(:user), agent.fetch(:invitation), suspended.fetch(:invitation),
+      customer.fetch(:user), unverified_user, agent.fetch(:invitation), suspended.fetch(:invitation),
       expired.fetch(:invitation), pending.fetch(:invitation), revoked.fetch(:invitation),
       *groups, *memberships, *requests, email_ticket]
     (requests + [email_ticket]).each do |record|

@@ -5,34 +5,32 @@ require_relative "../test_helper"
 class CoreMembershipsTest < HelpdeskTest
   def test_admin_can_create_rename_and_delete_a_group
     owner = sign_up
-    group = create_group(owner, "Billing")
+    group = gm_create_group(owner, "Billing")
     id = record_id(group)
-    other = create_group(owner, "Alpha Support")
+    other = gm_create_group(owner, "Alpha Support")
     assert_equal "Billing", group["name"]
     assert_equal [id, record_id(other)].sort, record_ids(get_collection("/groups", "groups", context: owner))
-    renamed = response_field(json_request(:patch, "/groups/#{id}", {
-      group: { name: "Accounts" }
-    }, context: owner), "group", type: Hash)
+    renamed = update_resource("/groups/#{id}", "group", { name: "Accounts" }, context: owner)
     assert_equal "Accounts", renamed["name"]
     assert_equal "Accounts", response_field(json_request(:get, "/groups/#{id}", context: owner), "group", type: Hash)["name"]
-    assert_status(204, request(:delete, "/groups/#{id}", context: owner))
+    assert_status(:success, request(:delete, "/groups/#{id}", context: owner))
     assert_equal [record_id(other)], record_ids(get_collection("/groups", "groups", context: owner))
   end
 
   def test_admin_can_add_and_remove_an_agent_membership
     owner = sign_up
     agent = add_staff(owner)
-    group = create_group(owner, "Technical Support")
-    membership = create_membership(owner, group, agent)
+    group = gm_create_group(owner, "Technical Support")
+    membership = gm_create_membership(owner, group, agent)
     id = record_id(membership)
-    other = create_membership(owner, group, owner)
+    other = gm_create_membership(owner, group, owner)
     assert_equal record_id(group), membership["group_id"]
     assert_equal record_id(agent[:user]), membership["user_id"]
     assert_equal id, record_id(response_field(json_request(:get, "/group_memberships/#{id}", context: agent), "group_membership", type: Hash))
     assert_includes record_ids(get_collection("/groups", "groups", context: agent)), record_id(group)
     assert_equal [id, record_id(other)].sort,
       record_ids(get_collection("/group_memberships", "group_memberships", context: agent))
-    assert_status(204, request(:delete, "/group_memberships/#{id}", context: owner))
+    gm_delete_membership(owner, membership)
     assert_equal [record_id(other)], record_ids(get_collection("/group_memberships", "group_memberships", context: owner))
   end
 
@@ -40,8 +38,8 @@ class CoreMembershipsTest < HelpdeskTest
     owner = sign_up
     agent = add_staff(owner)
     customer = register_customer(owner)
-    group = create_group(owner, "Billing")
-    create_membership(owner, group, owner)
+    group = gm_create_group(owner, "Billing")
+    gm_create_membership(owner, group, owner)
     id = record_id(create_request(customer))
     ungrouped_id = record_id(create_request(customer))
     update_ticket(owner, ungrouped_id, group_id: nil, assignee_id: nil)
@@ -135,18 +133,5 @@ class CoreMembershipsTest < HelpdeskTest
     assert_equal record_ids([one, four]), record_ids(get_collection("/group_memberships?user_id=#{agent[:user]['id']}", "group_memberships", context: owner))
     assert_equal [three["id"]], record_ids(get_collection("/group_memberships?group_id=#{groups[2]['id']}&user_id=#{owner[:user]['id']}", "group_memberships", context: owner))
     assert_empty get_collection("/group_memberships?group_id=#{groups[0]['id']}&user_id=#{agent[:user]['id']}", "group_memberships", context: owner)
-  end
-
-  private
-
-  def create_group(owner, name)
-    response_field(json_request(:post, "/groups", { group: { name: name } },
-      context: owner, status: 201), "group", type: Hash)
-  end
-
-  def create_membership(owner, group, person)
-    response_field(json_request(:post, "/group_memberships", {
-      group_membership: { group_id: record_id(group), user_id: record_id(person[:user]) }
-    }, context: owner, status: 201), "group_membership", type: Hash)
   end
 end

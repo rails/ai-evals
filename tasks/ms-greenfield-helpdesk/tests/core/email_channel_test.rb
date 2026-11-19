@@ -58,10 +58,7 @@ class CoreEmailChannelTest < HelpdeskTest
     refute_includes %w[admin agent], role, "A customer must not have a staff role"
     assert_equal false, user["verified"]
     token = token_from_email(before, { account: owner[:account], user: { "email" => email } }, "/verify-email")
-    confirmation = request(:post, "/email_verifications/confirm", {
-      email_verification: { token: token }
-    }, context: owner, token: nil)
-    assert_includes 200..299, confirmation.status
+    confirm_email_verification(owner, token)
     confirmed = response_field(json_request(:get, "/users/#{record_id(user)}", context: owner), "user", type: Hash)
     assert_equal true, confirmed["verified"]
   end

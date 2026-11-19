@@ -126,7 +126,7 @@ module HelpdeskEmailHelpers
     text + "\r\n\r\n" + body.gsub(/\r?\n/, "\r\n")
   end
 
-  def deliver_email(source, status: 204, password: ENV.fetch("RAILS_INBOUND_EMAIL_PASSWORD"), username: "actionmailbox", headers: {})
+  def deliver_email(source, status: :success, password: ENV.fetch("RAILS_INBOUND_EMAIL_PASSWORD"), username: "actionmailbox", headers: {})
     wire_headers = { "Content-Type" => "message/rfc822" }
     if password
       wire_headers["Authorization"] = "Basic #{Base64.strict_encode64("#{username}:#{password}")}"

@@ -120,7 +120,10 @@ class VerifierTest < ActiveSupport::TestCase
     def sweep_work
       queries = []
       capture = ->(*, payload) do
-        next unless payload[:sql].match?(/\ASELECT .* FROM "cards"/m)
+        # Reads only (a CTE starts with WITH). The cards table can come after FROM or JOIN,
+        # quoted or not: a per-board cutoff CTE reads it as `FROM cutoffs CROSS JOIN cards`
+        sql = payload[:sql]
+        next unless sql.match?(/\A\s*(WITH|SELECT)\b/i) && sql.match?(/\b(FROM|JOIN)\s+"?cards"?(\s|\z|\))/i)
 
         queries << [ payload[:sql], Array(payload[:type_casted_binds]) ]
       end

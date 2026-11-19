@@ -55,13 +55,11 @@ module HelpdeskCursorHelpers
   end
 
   def cursor_group(owner, name: unique("Group"))
-    response_field(json_request(:post, "/groups", { group: { name: name } }, context: owner, status: 201), "group", type: Hash)
+    gm_create_group(owner, name)
   end
 
   def cursor_membership(owner, group, person)
-    response_field(json_request(:post, "/group_memberships", {
-      group_membership: { group_id: record_id(group), user_id: record_id(person[:user]) }
-    }, context: owner, status: 201), "group_membership", type: Hash)
+    gm_create_membership(owner, group, person)
   end
 
   def cursor_error(path, context:, status: 400, token: context&.dig(:token))

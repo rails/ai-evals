@@ -24,17 +24,11 @@ module HelpdeskTicketMergeHelpers
   end
 
   def merge_group(owner)
-    group = response_field(json_request(:post, "/groups", { group: { name: unique("Merge group") } }, context: owner, status: 201), "group", type: Hash)
-    record_id(group)
-    group
+    gm_create_group(owner, unique("Merge group"))
   end
 
   def merge_membership(owner, group, agent)
-    membership = response_field(json_request(:post, "/group_memberships", {
-      group_membership: { group_id: group["id"], user_id: agent[:user]["id"] }
-    }, context: owner, status: 201), "group_membership", type: Hash)
-    record_id(membership)
-    membership
+    gm_create_membership(owner, group, agent)
   end
 
   def merge_email_ticket(owner, customer)
