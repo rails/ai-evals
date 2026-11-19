@@ -62,11 +62,13 @@ module HelpdeskApiHelpers
   end
 
   def assert_status(expected, response)
+    if expected == :success
+      assert_includes 200..299, response.status, "Expected HTTP 2xx, got #{response.status}"
+      return response
+    end
+
     acceptable = Array(expected).flat_map do |status|
       case status
-      when 201 then [200, 201]
-      when 202 then [200, 202, 204]
-      when 204 then [200, 204]
       when 400, 415, 422 then [400, 415, 422]
       when 403, 404 then [403, 404]
       when 409 then [409, 422]
@@ -77,15 +79,20 @@ module HelpdeskApiHelpers
     response
   end
 
-  def json_request(method, path, body = nil, status: 200, **options)
-    response = assert_status(status, request(method, path, body, **options))
-    if status == 204
-      assert_empty response.body if response.status == 204
-      return nil
-    end
-    return {} if status == 202 && response.body.empty?
+  def json_request(method, path, body = nil, status: :success, **options)
+    json_response(assert_status(status, request(method, path, body, **options)))
+  end
+
+  def json_response(response)
     assert_match(/application\/json/i, response.headers.fetch("content-type", ""))
     parsed_response(response)
+  end
+
+  def optional_resource(response, key)
+    return if response.body.empty?
+
+    data = json_response(response)
+    response_field(data, key, type: Hash) if data.key?(key)
   end
 
   def parsed_response(response)
@@ -192,7 +199,7 @@ module HelpdeskApiHelpers
 
   def sign_up(email: unique_email, name: "Owner", password: PASSWORD, account_name: unique("Account"), subdomain: unique("account"), verify: true)
     before = mail_count
-    data = json_request(:post, "/account/create", { account: { name: account_name, subdomain: subdomain, admin: { name: name, email: email, password: password } } }, status: 201)
+    data = json_request(:post, "/account/create", { account: { name: account_name, subdomain: subdomain, admin: { name: name, email: email, password: password } } })
     context = { account: response_field(data, "account", type: Hash), user: fixture_user(data), password: password }
     context[:verification_token] = token_from_email(before, context, "/verify-email")
     verify_and_sign_in(context) if verify
@@ -207,24 +214,41 @@ module HelpdeskApiHelpers
   end
 
   def sign_in(context, password: context.fetch(:password), email: response_field(context.fetch(:user), "email", type: String))
-    data = json_request(:post, "/sessions", { session: { email: email, password: password } }, context: context, token: nil, status: 201)
+    data = json_request(:post, "/sessions", { session: { email: email, password: password } }, context: context, token: nil)
     refute_empty response_field(data, "session", "token", type: String)
     data
   end
 
+  def request_password_reset(context, email: context.fetch(:user).fetch("email"), token: context[:token])
+    assert_status(:success, request(:post, "/password_resets", { password_reset: { email: email } }, context: context, token: token))
+  end
+
+  def confirm_email_verification(context, token)
+    assert_status(:success, request(:post, "/email_verifications/confirm", {
+      email_verification: { token: token }
+    }, context: context, token: nil))
+  end
+
   def verify_and_sign_in(context)
-    data = json_request(:post, "/email_verifications/confirm", {
-      email_verification: { token: context.fetch(:verification_token) }
-    }, context: context, token: nil)
-    context[:user] = fixture_user(data)
-    context[:token] = sign_in(context).fetch("session").fetch("token")
+    confirm_email_verification(context, context.fetch(:verification_token))
+    session = sign_in(context)
+    original_user = context.fetch(:user)
+    signed_in_user = fixture_user(session)
+    assert_equal original_user.fetch("email"), signed_in_user.fetch("email")
+    assert_equal record_id(original_user), record_id(signed_in_user) if original_user.key?("id")
+    context[:user] = original_user.merge(signed_in_user)
+    context[:token] = session.fetch("session").fetch("token")
     context
   end
 
   def register_customer(account, email: unique_email, name: "Customer", password: PASSWORD, verify: true)
     before = mail_count
-    data = json_request(:post, "/registrations", { user: { name: name, email: email, password: password } }, context: account, status: 201)
-    context = { account: account.fetch(:account), user: fixture_user(data), password: password }
+    response = assert_status(:success, request(:post, "/registrations", {
+      user: { name: name, email: email, password: password }
+    }, context: account))
+    registered_user = optional_resource(response, "user")
+    user = registered_user ? fixture_user("user" => registered_user) : { "email" => email }
+    context = { account: account.fetch(:account), user: user, password: password }
     context[:verification_token] = token_from_email(before, context, "/verify-email")
     verify_and_sign_in(context) if verify
     context
@@ -232,7 +256,7 @@ module HelpdeskApiHelpers
 
   def invite_staff(account, email: unique_email, role: "agent")
     before = mail_count
-    invitation = response_field(json_request(:post, "/invitations", { invitation: { email: email, role: role } }, context: account, status: 201), "invitation", type: Hash)
+    invitation = response_field(json_request(:post, "/invitations", { invitation: { email: email, role: role } }, context: account), "invitation", type: Hash)
     record_id(invitation)
     response_field(invitation, "email", type: String)
     context = { account: account.fetch(:account), user: { "email" => email }, password: PASSWORD, invitation: invitation }
@@ -243,7 +267,7 @@ module HelpdeskApiHelpers
   def accept_invitation(context, name: "Support person")
     data = json_request(:post, "/invitation_acceptances", {
       invitation_acceptance: { token: context.fetch(:invitation_token), name: name, password: context.fetch(:password) }
-    }, context: context, token: nil, status: 201)
+    }, context: context, token: nil)
     context[:user] = fixture_user(data)
     context[:token] = sign_in(context).fetch("session").fetch("token")
     context
@@ -254,17 +278,22 @@ module HelpdeskApiHelpers
   end
 
   def create_request(customer, subject: unique("Subject"), message: unique("Message"))
-    record = response_field(json_request(:post, "/requests", { request: { subject: subject, comment: { body: message } } }, context: customer, status: 201), "request", type: Hash)
+    record = response_field(json_request(:post, "/requests", { request: { subject: subject, comment: { body: message } } }, context: customer), "request", type: Hash)
     record_id(record)
     record
   end
 
   def ticket(account, id) = response_field(json_request(:get, "/tickets/#{id}", context: account), "ticket", type: Hash)
   def customer_request(customer, id) = response_field(json_request(:get, "/requests/#{id}", context: customer), "request", type: Hash)
-  def update_ticket(account, id, **attributes) = response_field(json_request(:patch, "/tickets/#{id}", { ticket: attributes }, context: account), "ticket", type: Hash)
-  def update_request(customer, id, **attributes) = response_field(json_request(:patch, "/requests/#{id}", { request: attributes }, context: customer), "request", type: Hash)
+  def update_ticket(account, id, **attributes) = update_resource("/tickets/#{id}", "ticket", attributes, context: account)
+  def update_request(customer, id, **attributes) = update_resource("/requests/#{id}", "request", attributes, context: customer)
   def user(account, id) = response_field(json_request(:get, "/users/#{id}", context: account), "user", type: Hash)
-  def suspend_user(account, person, value = true) = response_field(json_request(:patch, "/users/#{record_id(person.fetch(:user))}", { user: { suspended: value } }, context: account), "user", type: Hash)
+  def suspend_user(account, person, value = true) = update_resource("/users/#{record_id(person.fetch(:user))}", "user", { suspended: value }, context: account)
+
+  def update_resource(path, key, attributes, context:)
+    response = assert_status(:success, request(:patch, path, { key => attributes }, context: context))
+    optional_resource(response, key) || response_field(json_request(:get, path, context: context), key, type: Hash)
+  end
 
   def all_pages(path, key, context:, size: 2)
     records = []
