@@ -1,0 +1,634 @@
+diff --git a/app/jobs/storage/refresh_job.rb b/app/jobs/storage/refresh_job.rb
+new file mode 100644
+index 0000000..8a67ca0
+--- /dev/null
++++ b/app/jobs/storage/refresh_job.rb
+@@ -0,0 +1,9 @@
++class Storage::RefreshJob < ApplicationJob
++  queue_as :backend
++  discard_on ActiveJob::DeserializationError
++  retry_on ActiveRecord::Deadlocked, ActiveRecord::LockWaitTimeout, ActiveRecord::StatementTimeout, wait: :polynomially_longer
++
++  def perform(*attachment_ids)
++    attachment_ids.each { |id| Storage::Entry.refresh(id) }
++  end
++end
+diff --git a/app/jobs/storage/reindex_job.rb b/app/jobs/storage/reindex_job.rb
+new file mode 100644
+index 0000000..b3faa18
+--- /dev/null
++++ b/app/jobs/storage/reindex_job.rb
+@@ -0,0 +1,59 @@
++class Storage::ReindexJob < ApplicationJob
++  include ActiveJob::Continuable
++
++  queue_as :backend
++  discard_on ActiveJob::DeserializationError
++  retry_on ActiveRecord::Deadlocked, ActiveRecord::LockWaitTimeout, ActiveRecord::StatementTimeout, wait: :polynomially_longer
++
++  def perform(scope = nil)
++    if scope.is_a?(Card)
++      each_batch :moved, attachments_on_card(scope).select(:id) do |batch|
++        batch.each { |attachment| Storage::Entry.refresh(attachment.id) }
++      end
++    else
++      reconcile(scope)
++    end
++  end
++
++  private
++    def attachments_on_card(card)
++      descriptions = ActionText::RichText.where(record: card, name: "description")
++      comments = ActionText::RichText.where(record_type: "Comment", record_id: card.comments.select(:id), name: "body")
++      embeds = ActiveStorage::Attachment.where(record: descriptions.or(comments), name: "embeds")
++
++      ActiveStorage::Attachment.where(record: card, name: "image").or(embeds)
++    end
++
++    # Backfill existing/imported attachments and catch bulk deletes that bypass
++    # callbacks. Walk the primary keys; only inspect owners and blobs for gaps.
++    def reconcile(account)
++      attachments = ActiveStorage::Attachment.all
++      entries = Storage::Entry.all
++      if account
++        attachments = attachments.where(account_id: account.id)
++        entries = entries.where(account_id: account.id)
++      end
++
++      each_batch :additions, attachments.select(:id, :record_type, :name) do |batch|
++        ids = batch.filter_map { |attachment| attachment.id if attachment.storage_candidate? }
++        refresh_missing(ids, entries)
++      end
++
++      each_batch :removals, entries.select(:id) do |batch|
++        refresh_missing(batch.map(&:id), attachments)
++      end
++    end
++
++    def refresh_missing(ids, from)
++      (ids - from.where(id: ids).ids).each { |id| Storage::Entry.refresh(id) }
++    end
++
++    def each_batch(name, records)
++      step name do |step|
++        records.find_in_batches(start: step.cursor) do |batch|
++          yield batch
++          step.set! batch.last.id
++        end
++      end
++    end
++end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index 18d4f42..c01e76a 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -1,6 +1,8 @@
+ class Account < ApplicationRecord
+   include Cancellable, Entropic, Incineratable, MultiTenantable, Searchable, Seedeable
+ 
++  attr_readonly :bytes_used
++
+   has_one :join_code, dependent: :destroy
+   has_many :users, dependent: :destroy
+   has_many :boards, dependent: :destroy
+@@ -9,6 +11,7 @@ class Account < ApplicationRecord
+   has_many :tags, dependent: :destroy
+   has_many :columns, dependent: :destroy
+   has_many :entropies, dependent: :destroy
++  has_many :storage_entries, class_name: "Storage::Entry", dependent: :delete_all
+   has_many :exports, class_name: "Account::Export", dependent: :destroy
+   has_many :imports, class_name: "Account::Import", dependent: :destroy
+ 
+diff --git a/app/models/account/data_transfer/manifest.rb b/app/models/account/data_transfer/manifest.rb
+index 11aaf6a..9aac718 100644
+--- a/app/models/account/data_transfer/manifest.rb
++++ b/app/models/account/data_transfer/manifest.rb
+@@ -26,12 +26,9 @@ class Account::DataTransfer::Manifest
+       [
+         Account::DataTransfer::AccountRecordSet.new(account),
+         Account::DataTransfer::UserRecordSet.new(account),
+-        *record_sets_for(
+-          ::User::Settings,
+-          ::Tag,
+-          ::Board,
+-          ::Column
+-        ),
++        *record_sets_for(::User::Settings, ::Tag),
++        record_set_for(::Board, attributes: ::Board.column_names.excluding("bytes_used")),
++        record_set_for(::Column),
+         Account::DataTransfer::EntropyRecordSet.new(account),
+         *record_sets_for(
+           ::Board::Publication,
+@@ -71,8 +68,8 @@ class Account::DataTransfer::Manifest
+       end
+     end
+ 
+-    def record_set_for(model)
+-      Account::DataTransfer::RecordSet.new(account: account, model: model)
++    def record_set_for(model, **options)
++      Account::DataTransfer::RecordSet.new(account: account, model: model, **options)
+     end
+ 
+     def set_importable_model_names(record_sets)
+diff --git a/app/models/account/import.rb b/app/models/account/import.rb
+index feb41c4..8265fb3 100644
+--- a/app/models/account/import.rb
++++ b/app/models/account/import.rb
+@@ -49,6 +49,7 @@ class Account::Import < ApplicationRecord
+ 
+     add_importer_to_all_access_boards
+     reconcile_cards_count
++    Current.with_account(account) { Storage::ReindexJob.perform_later(account) }
+ 
+     mark_completed
+   rescue Account::DataTransfer::RecordSet::ConflictError => e
+@@ -89,5 +90,4 @@ class Account::Import < ApplicationRecord
+         board.accesses.grant_to(importer)
+       end
+     end
+-
+ end
+diff --git a/app/models/board.rb b/app/models/board.rb
+index 9f1bcd5..46fd906 100644
+--- a/app/models/board.rb
++++ b/app/models/board.rb
+@@ -1,6 +1,8 @@
+ class Board < ApplicationRecord
+   include Accessible, AutoPostponing, Broadcastable, Cards, Entropic, Filterable, Publishable, Triageable
+ 
++  attr_readonly :bytes_used
++
+   belongs_to :creator, class_name: "User", default: -> { Current.user }
+   belongs_to :account, default: -> { creator.account }
+ 
+diff --git a/app/models/card.rb b/app/models/card.rb
+index 19c3fc2..58465a9 100644
+--- a/app/models/card.rb
++++ b/app/models/card.rb
+@@ -81,6 +81,7 @@ class Card < ApplicationRecord
+         grant_access_to_assignees unless board.all_access?
+       end
+ 
++      Storage::ReindexJob.perform_later(self)
+       remove_inaccessible_notifications_later
+       clean_inaccessible_data_later
+     end
+diff --git a/app/models/storage/entry.rb b/app/models/storage/entry.rb
+new file mode 100644
+index 0000000..8a00314
+--- /dev/null
++++ b/app/models/storage/entry.rb
+@@ -0,0 +1,29 @@
++# The primary key is the attachment id. Retain its last contribution even after
++# the attachment (and possibly its entire board) has been deleted.
++class Storage::Entry < ApplicationRecord
++  self.table_name = "storage_entries"
++
++  after_create  -> { adjust_usage(byte_size) }
++  after_destroy -> { adjust_usage(-byte_size) }
++
++  def self.refresh(attachment_id)
++    transaction do
++      # Serialize workers refreshing the same attachment. Once it is gone, the
++      # entry itself is the lock that prevents two workers debiting it twice.
++      attachment = ActiveStorage::Attachment.lock.find_by(id: attachment_id)
++      previous = (attachment ? all : lock).find_by(id: attachment_id)
++      current = attachment&.storage_entry
++
++      unless previous&.attributes == current&.attributes
++        previous&.destroy!
++        current&.save!
++      end
++    end
++  end
++
++  private
++    def adjust_usage(delta)
++      Board.where(id: board_id, account_id: account_id).update_counters(bytes_used: delta)
++      Account.update_counters(account_id, bytes_used: delta)
++    end
++end
+diff --git a/app/models/storage/tracked_attachment.rb b/app/models/storage/tracked_attachment.rb
+new file mode 100644
+index 0000000..2c4df42
+--- /dev/null
++++ b/app/models/storage/tracked_attachment.rb
+@@ -0,0 +1,47 @@
++module Storage::TrackedAttachment
++  extend ActiveSupport::Concern
++
++  included do
++    after_commit :refresh_storage_entry_later, on: [ :create, :destroy ]
++  end
++
++  def storage_candidate?
++    (record_type == "Card" && name == "image") || (record_type == "ActionText::RichText" && name == "embeds")
++  end
++
++  def storage_entry
++    if storage_candidate? && (board_id = storage_board_id)
++      Storage::Entry.new(id: id, account_id: account_id, board_id: board_id, byte_size: byte_size)
++    end
++  end
++
++  # Active Storage purges (and single-attachment detaches) use delete, not destroy.
++  def delete
++    super.tap { refresh_storage_entry_later }
++  end
++
++  private
++    def refresh_storage_entry_later
++      Storage::RefreshJob.perform_later(id) if storage_candidate?
++    end
++
++    def storage_board_id
++      case record_type
++      when "Card"
++        Card.where(id: record_id, account_id: account_id).pick(:board_id)
++      when "ActionText::RichText"
++        rich_text_board_id
++      end
++    end
++
++    def rich_text_board_id
++      # Only fetch ownership metadata, not the (potentially large) body.
++      type, field, parent_id = ActionText::RichText.where(id: record_id, account_id: account_id).pick(:record_type, :name, :record_id)
++
++      case [ type, field ]
++      when [ "Board", "public_description" ] then Board.where(id: parent_id, account_id: account_id).pick(:id)
++      when [ "Card", "description" ]        then Card.where(id: parent_id, account_id: account_id).pick(:board_id)
++      when [ "Comment", "body" ]            then Comment.where(id: parent_id, account_id: account_id).joins(:card).pick("cards.board_id")
++      end
++    end
++end
+diff --git a/config/initializers/action_text.rb b/config/initializers/action_text.rb
+index 6bbdb3e..79d5682 100644
+--- a/config/initializers/action_text.rb
++++ b/config/initializers/action_text.rb
+@@ -4,6 +4,10 @@ module ActionText
+       extend ActiveSupport::Concern
+ 
+       included do
++        # Action Text extracts embeds only from nonblank bodies. Detach the old
++        # embeds too when an editor clears the field entirely.
++        before_validation -> { self.embeds = [] }, if: -> { persisted? && body.blank? && body_changed? }
++
+         # This overrides the default :embeds association!
+         has_many_attached :embeds do |attachable|
+           ::Attachments::VARIANTS.each do |variant_name, variant_options|
+diff --git a/config/initializers/active_storage.rb b/config/initializers/active_storage.rb
+index f85a27a..cd60ba1 100644
+--- a/config/initializers/active_storage.rb
++++ b/config/initializers/active_storage.rb
+@@ -53,6 +53,7 @@ module ActiveStorageDirectUploadsControllerExtensions
+ end
+ 
+ Rails.application.config.to_prepare do
++  ActiveStorage::Attachment.include Storage::TrackedAttachment
+   ActiveStorage::BaseController.include ActiveStorageControllerExtensions
+   ActiveStorage::DirectUploadsController.include ActiveStorageDirectUploadsControllerExtensions
+ end
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 894c57b..62126e9 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -15,6 +15,9 @@ production: &production
+     schedule: every day at 04:02
+ 
+   # Operations cleanup and backups
++  reconcile_storage_usage:
++    class: "Storage::ReindexJob"
++    schedule: every day at 03:10
+   clear_solid_queue_finished_jobs:
+     command: "SolidQueue::Job.clear_finished_in_batches(sleep_between_batches: 0.3)"
+     schedule: every hour at minute 12
+diff --git a/db/migrate/20260710120000_track_storage_usage.rb b/db/migrate/20260710120000_track_storage_usage.rb
+new file mode 100644
+index 0000000..0340190
+--- /dev/null
++++ b/db/migrate/20260710120000_track_storage_usage.rb
+@@ -0,0 +1,13 @@
++class TrackStorageUsage < ActiveRecord::Migration[8.2]
++  def change
++    add_column :accounts, :bytes_used, :bigint, default: 0, null: false
++    add_column :boards, :bytes_used, :bigint, default: 0, null: false
++
++    # The primary key is the Active Storage attachment id, even after it is purged.
++    create_table :storage_entries, id: :uuid do |t|
++      t.references :account, type: :uuid, null: false
++      t.uuid :board_id, null: false
++      t.bigint :byte_size, null: false
++    end
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 81a3526..01ceb1f 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_07_10_120000) do
+   create_table "accesses", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -66,6 +66,7 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.bigint "external_account_id"
+     t.string "name", null: false
+     t.datetime "updated_at", null: false
++    t.bigint "bytes_used", default: 0, null: false
+     t.index ["external_account_id"], name: "index_accounts_on_external_account_id", unique: true
+   end
+ 
+@@ -175,6 +176,7 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.uuid "creator_id", null: false
+     t.string "name", null: false
+     t.datetime "updated_at", null: false
++    t.bigint "bytes_used", default: 0, null: false
+     t.index ["account_id"], name: "index_boards_on_account_id"
+     t.index ["creator_id"], name: "index_boards_on_creator_id"
+   end
+@@ -731,6 +733,13 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.index ["card_id"], name: "index_steps_on_card_id"
+   end
+ 
++  create_table "storage_entries", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
++    t.uuid "account_id", null: false
++    t.uuid "board_id", null: false
++    t.bigint "byte_size", null: false
++    t.index ["account_id"], name: "index_storage_entries_on_account_id"
++  end
++
+   create_table "taggings", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.uuid "account_id", null: false
+     t.uuid "card_id", null: false
+diff --git a/db/schema_sqlite.rb b/db/schema_sqlite.rb
+index 1c89abe..48d2176 100644
+--- a/db/schema_sqlite.rb
++++ b/db/schema_sqlite.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_07_10_120000) do
+   create_table "accesses", id: :uuid, force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -66,6 +66,7 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.bigint "external_account_id"
+     t.string "name", limit: 255, null: false
+     t.datetime "updated_at", null: false
++    t.bigint "bytes_used", default: 0, null: false
+     t.index ["external_account_id"], name: "index_accounts_on_external_account_id", unique: true
+   end
+ 
+@@ -175,6 +176,7 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.uuid "creator_id", null: false
+     t.string "name", limit: 255, null: false
+     t.datetime "updated_at", null: false
++    t.bigint "bytes_used", default: 0, null: false
+     t.index ["account_id"], name: "index_boards_on_account_id"
+     t.index ["creator_id"], name: "index_boards_on_creator_id"
+   end
+@@ -504,6 +506,13 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.index ["card_id"], name: "index_steps_on_card_id"
+   end
+ 
++  create_table "storage_entries", id: :uuid, force: :cascade do |t|
++    t.uuid "account_id", null: false
++    t.uuid "board_id", null: false
++    t.bigint "byte_size", null: false
++    t.index ["account_id"], name: "index_storage_entries_on_account_id"
++  end
++
+   create_table "taggings", id: :uuid, force: :cascade do |t|
+     t.uuid "account_id", null: false
+     t.uuid "card_id", null: false
+diff --git a/docs/development.md b/docs/development.md
+index 0bca076..4f8fdfc 100644
+--- a/docs/development.md
++++ b/docs/development.md
+@@ -60,6 +60,20 @@ DATABASE_ADAPTER=mysql bin/ci
+ 
+ The remote CI pipeline will run tests against both SQLite and MySQL.
+ 
++### Storage accounting
++
++`Board#bytes_used` and `Account#bytes_used` are persisted counters, updated by jobs
++on the `backend` queue. Each card image or Action Text embed on a board, card, or
++comment contributes its blob's byte size once per attachment. Unattached uploads,
++variants, avatars, and import/export files do not contribute.
++
++Existing installations are backfilled by the daily storage reconciliation job.
++To start it immediately after deploying, run:
++
++```sh
++bin/rails runner 'Storage::ReindexJob.perform_later'
++```
++
+ ### Outbound Emails
+ 
+ You can view email previews at http://app.fizzy.localhost:3006/rails/mailers.
+diff --git a/lib/rails_ext/active_storage_track_detached_embeds.rb b/lib/rails_ext/active_storage_track_detached_embeds.rb
+new file mode 100644
+index 0000000..bfbd85e
+--- /dev/null
++++ b/lib/rails_ext/active_storage_track_detached_embeds.rb
+@@ -0,0 +1,18 @@
++# Unlike purge, Active Storage's many-attachment detach uses delete_all. Keep
++# the ids before deleting so the worker can retire just those storage entries.
++module ActiveStorageTrackDetachedEmbeds
++  def detach
++    if record.is_a?(ActionText::RichText) && name == "embeds"
++      ActiveStorage::Attachment.transaction do
++        record.embeds_attachments.select(:id).find_in_batches do |batch|
++          Storage::RefreshJob.perform_later(*batch.map(&:id))
++        end
++        super
++      end
++    else
++      super
++    end
++  end
++end
++
++ActiveStorage::Attached::Many.prepend ActiveStorageTrackDetachedEmbeds
+diff --git a/test/models/account/import_test.rb b/test/models/account/import_test.rb
+index c1e9c2f..ca91385 100644
+--- a/test/models/account/import_test.rb
++++ b/test/models/account/import_test.rb
+@@ -179,12 +179,15 @@ class Account::ImportTest < ActiveSupport::TestCase
+     exporter = users(:david)
+     identity = exporter.identity
+ 
+-    ActiveStorage::Blob.create_and_upload!(
++    blob = ActiveStorage::Blob.create_and_upload!(
+       io: StringIO.new("test image data"),
+       filename: "logo.png",
+       content_type: "image/png"
+     )
+ 
++    cards(:logo).image.attach(blob)
++    perform_enqueued_jobs only: Storage::RefreshJob
++
+     source_blob_count = ActiveStorage::Blob.where(account: source_account).count
+     source_blob_keys = ActiveStorage::Blob.where(account: source_account).pluck(:key)
+ 
+@@ -215,6 +218,10 @@ class Account::ImportTest < ActiveSupport::TestCase
+     assert_not_nil imported_blob
+     assert_not_includes source_blob_keys, imported_blob.key
+     assert_equal "test image data", imported_blob.download
++
++    perform_enqueued_jobs only: Storage::ReindexJob
++    assert_equal imported_blob.byte_size, target_account.reload.bytes_used
++    assert_equal imported_blob.byte_size, target_account.boards.find_by!(name: "Writebook").bytes_used
+   ensure
+     export_tempfile&.close
+     export_tempfile&.unlink
+diff --git a/test/models/storage_usage_test.rb b/test/models/storage_usage_test.rb
+new file mode 100644
+index 0000000..b1b2b4f
+--- /dev/null
++++ b/test/models/storage_usage_test.rb
+@@ -0,0 +1,138 @@
++require "test_helper"
++
++class StorageUsageTest < ActiveSupport::TestCase
++  setup do
++    Current.session = sessions(:david)
++    @account = Current.account
++    @board = boards(:writebook)
++    @card = cards(:logo)
++    @comment = comments(:logo_agreement_jz)
++  end
++
++  test "board and account usage include only card images and board, card and comment embeds" do
++    @card.image.attach(blob(2))
++    @board.update!(public_description: embed(3))
++    @card.update!(description: embed(5))
++    @comment.update!(body: embed(7))
++    boards(:private).update!(public_description: embed(11))
++    exports(:pending_account_export).file.attach(blob(13))
++    blob(17) # Unattached upload
++    ActionText::RichText.create!(record: @board, name: "other", body: embed(19))
++    Current.with_account(accounts(:initech)) { cards(:radio).image.attach(blob(23)) }
++
++    assert_equal 0, @account.reload.bytes_used
++    perform_enqueued_jobs only: Storage::RefreshJob
++    assert_equal 17, @board.reload.bytes_used
++    assert_equal 11, boards(:private).reload.bytes_used
++    assert_equal 28, @account.reload.bytes_used
++    assert_equal 23, accounts(:initech).reload.bytes_used
++  end
++
++  test "replacement, embed removal, and purging an image reverse only their own bytes" do
++    @card.image.attach(blob(2))
++    @card.update!(description: embed(3) + embed(5))
++    @comment.update!(body: embed(7))
++    refresh
++    assert_usage 17
++
++    @card.image.attach(blob(11))
++    @card.update!(description: "")
++    @comment.destroy!
++    refresh
++    assert_usage 11
++
++    @card.image.purge_later
++    refresh
++    assert_usage 0
++  end
++
++  test "moving a card transfers all of its usage but not the board's own description" do
++    @board.update!(public_description: embed(2))
++    @card.image.attach(blob(3))
++    @card.update!(description: embed(5))
++    @comment.update!(body: embed(7))
++    refresh
++    assert_usage 17
++
++    @card.move_to(boards(:private))
++    perform_enqueued_jobs only: Storage::ReindexJob
++    assert_equal 2, @board.reload.bytes_used
++    assert_equal 15, boards(:private).reload.bytes_used
++    assert_equal 17, @account.reload.bytes_used
++
++    boards(:private).destroy!
++    refresh
++    assert_usage 2
++  end
++
++  test "a delayed or retried job reconciles against current state" do
++    @card.image.attach(blob(2))
++    id = @card.image.attachment.id
++    @card.image.detach
++    @card.image.attach(blob(5))
++    refresh
++    assert_usage 5
++
++    2.times do
++      Storage::RefreshJob.perform_now(@card.image.attachment.id)
++      Storage::RefreshJob.perform_now(id)
++    end
++    assert_usage 5
++
++    @card.image.detach
++    refresh
++    assert_usage 0
++  end
++
++  test "backfill picks up existing attachments without double counting" do
++    @card.image.attach(blob(2))
++    @comment.update!(body: embed(5))
++    clear_enqueued_jobs
++
++    2.times { Storage::ReindexJob.perform_now(@account) }
++    assert_usage 7
++
++    ActiveStorage::Attachment.where(id: @card.image.attachment.id).delete_all
++    Storage::ReindexJob.perform_now
++    assert_usage 5
++  end
++
++  test "detaching multiple embeds removes their usage" do
++    @comment.update!(body: embed(5) + embed(7))
++    refresh
++    assert_usage 12
++
++    @comment.body.embeds.detach
++    refresh
++    assert_usage 0
++  end
++
++  test "rolled back attachment changes do not affect usage" do
++    @card.image.attach(blob(2))
++    refresh
++    @card.transaction do
++      @card.image.purge_later
++      raise ActiveRecord::Rollback
++    end
++    refresh
++    assert_usage 2
++  end
++
++  private
++    def refresh
++      perform_enqueued_jobs only: Storage::RefreshJob
++    end
++
++    def assert_usage(bytes)
++      assert_equal bytes, @board.reload.bytes_used
++      assert_equal bytes, @account.reload.bytes_used
++    end
++
++    def blob(size)
++      ActiveStorage::Blob.create_and_upload!(io: StringIO.new("x" * size), filename: "file.txt", content_type: "text/plain")
++    end
++
++    def embed(size)
++      ActionText::Attachment.from_attachable(blob(size)).to_html
++    end
++end

@@ -1,0 +1,176 @@
+diff --git a/app/models/card/entropic.rb b/app/models/card/entropic.rb
+index ebaad78..6f3acf0 100644
+--- a/app/models/card/entropic.rb
++++ b/app/models/card/entropic.rb
+@@ -1,6 +1,9 @@
+ module Card::Entropic
+   extend ActiveSupport::Concern
+ 
++  AUTO_POSTPONE_BATCH_SIZE = 1_000
++  AUTO_POSTPONE_COMMENT = "<strong>Moved</strong> to “Not Now” due to inactivity"
++
+   included do
+     scope :due_to_be_postponed, -> do
+       active
+@@ -25,10 +28,120 @@ module Card::Entropic
+ 
+   class_methods do
+     def auto_postpone_all_due
+-      due_to_be_postponed.find_each do |card|
+-        card.auto_postpone(user: card.account.system_user)
++      # Postpone in bulk: running the full per-card callback chain (events,
++      # system comments, webhooks, broadcasts) does not scale past ~100k cards.
++      due_to_be_postponed.find_in_batches(batch_size: AUTO_POSTPONE_BATCH_SIZE) do |cards|
++        auto_postpone_batch(cards)
+       end
+     end
++
++    private
++      def auto_postpone_batch(cards)
++        now = Time.current
++        system_users = User.where(account_id: cards.map(&:account_id).uniq, role: :system).index_by(&:account_id)
++
++        events = nil
++        transaction do
++          create_not_nows(cards, system_users, now)
++          events = create_auto_postponed_events(cards, system_users, now)
++          create_auto_postponed_comments(cards, system_users, now)
++          update_postponed_cards(cards, now)
++        end
++
++        enqueue_webhook_dispatches(events)
++      end
++
++      def create_not_nows(cards, system_users, now)
++        Card::NotNow.insert_all! cards.map { |card|
++          {
++            id: ActiveRecord::Type::Uuid.generate,
++            account_id: card.account_id,
++            card_id: card.id,
++            created_at: now,
++            updated_at: now,
++            user_id: system_users.fetch(card.account_id).id
++          }
++        }
++      end
++
++      def create_auto_postponed_events(cards, system_users, now)
++        events = cards.map { |card|
++          {
++            id: ActiveRecord::Type::Uuid.generate,
++            account_id: card.account_id,
++            action: "card_auto_postponed",
++            board_id: card.board_id,
++            created_at: now,
++            creator_id: system_users.fetch(card.account_id).id,
++            eventable_id: card.id,
++            eventable_type: "Card",
++            particulars: {},
++            updated_at: now
++          }
++        }
++
++        Event.insert_all! events
++        events
++      end
++
++      def enqueue_webhook_dispatches(events)
++        board_ids = events.map { it[:board_id] }.uniq
++        webhook_board_ids = Webhook.active
++          .triggered_by_action("card_auto_postponed")
++          .where(board_id: board_ids)
++          .distinct
++          .pluck(:board_id)
++          .to_h { |id| [ id, true ] }
++        events_with_webhooks = events.select { |event| webhook_board_ids[event[:board_id]] }
++
++        if events_with_webhooks.any?
++          ActiveJob.perform_all_later events_with_webhooks.map { |attributes|
++            Event::WebhookDispatchJob.new(Event.instantiate(attributes))
++          }
++        end
++      end
++
++      def create_auto_postponed_comments(cards, system_users, now)
++        comments = cards.map do |card|
++          {
++            id: ActiveRecord::Type::Uuid.generate,
++            account_id: card.account_id,
++            card_id: card.id,
++            created_at: now,
++            creator_id: system_users.fetch(card.account_id).id,
++            updated_at: now
++          }
++        end
++
++        Comment.insert_all! comments
++        ActionText::RichText.insert_all!(comments.map do |comment|
++          {
++            id: ActiveRecord::Type::Uuid.generate,
++            account_id: comment[:account_id],
++            body: auto_postpone_comment_html,
++            created_at: now,
++            name: "body",
++            record_id: comment[:id],
++            record_type: "Comment",
++            updated_at: now
++          }
++        end)
++      end
++
++      def auto_postpone_comment_html
++        @auto_postpone_comment_html ||= ActionText::Content.new(AUTO_POSTPONE_COMMENT)
++      end
++
++      def update_postponed_cards(cards, now)
++        card_ids = cards.map(&:id)
++        board_ids = cards.map(&:board_id).uniq
++        column_ids = cards.filter_map(&:column_id).uniq
++
++        Card.where(id: card_ids).update_all column_id: nil, last_active_at: now, updated_at: now
++        Card::ActivitySpike.where(card_id: card_ids).delete_all
++        Board.where(id: board_ids).update_all updated_at: now
++        Column.where(id: column_ids).update_all(updated_at: now) if column_ids.any?
++      end
+   end
+ 
+   def entropy
+diff --git a/test/models/card/entropic_test.rb b/test/models/card/entropic_test.rb
+index 848cfa7..6eeba3c 100644
+--- a/test/models/card/entropic_test.rb
++++ b/test/models/card/entropic_test.rb
+@@ -69,6 +69,34 @@ class Card::EntropicTest < ActiveSupport::TestCase
+     assert_not_includes Card.postponing_soon, cards(:shipping)
+   end
+ 
++  test "auto postpone all due records events and system comments" do
++    freeze_time
++
++    due_cards = cards(:logo, :layout)
++    due_cards.each { |card| card.update!(last_active_at: 1.day.ago - entropies(:writebook_board).auto_postpone_period) }
++
++    assert_difference -> { Event.where(action: "card_auto_postponed").count }, +due_cards.size do
++      assert_difference -> { Comment.where(creator: accounts("37s").system_user).count }, +due_cards.size do
++        Card.auto_postpone_all_due
++      end
++    end
++
++    due_cards.each do |card|
++      assert card.reload.postponed?
++      assert_equal Time.current, card.last_active_at
++      assert_equal "Moved to “Not Now” due to inactivity", card.comments.by_system.last.body.to_plain_text
++    end
++  end
++
++  test "auto postpone all due dispatches subscribed webhooks" do
++    webhooks(:active).update!(subscribed_actions: [ "card_auto_postponed" ])
++    cards(:logo).update!(last_active_at: 100.days.ago)
++
++    assert_enqueued_jobs 1, only: Event::WebhookDispatchJob do
++      Card.auto_postpone_all_due
++    end
++  end
++
+   test "auto postpone all due works properly cross-account" do
+     cards(:logo).update!(last_active_at: entropies(:writebook_board).auto_postpone_period.seconds.ago - 2.days)
+     cards(:radio).update!(last_active_at: entropies(:miltons_wish_list_board).auto_postpone_period.seconds.ago - 2.days)
