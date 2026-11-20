@@ -1,0 +1,180 @@
+diff --git a/app/jobs/account/incinerate_due_job.rb b/app/jobs/account/incinerate_due_job.rb
+new file mode 100644
+index 0000000..e5e9982
+--- /dev/null
++++ b/app/jobs/account/incinerate_due_job.rb
+@@ -0,0 +1,5 @@
++class Account::IncinerateDueJob < ApplicationJob
++  def perform
++    Account.incinerate_due
++  end
++end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index a6a70b1..92590d9 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -1,5 +1,5 @@
+ class Account < ApplicationRecord
+-  include Account::Storage, Cancellable, Entropic, MultiTenantable, Seedeable
++  include Account::Storage, Cancellable, Entropic, Incineratable, MultiTenantable, Seedeable
+ 
+   has_one :join_code, dependent: :destroy
+   has_many :users, dependent: :destroy
+diff --git a/app/models/account/incineratable.rb b/app/models/account/incineratable.rb
+index 2357b99..bf0775e 100644
+--- a/app/models/account/incineratable.rb
++++ b/app/models/account/incineratable.rb
+@@ -1,3 +1,55 @@
+ module Account::Incineratable
++  extend ActiveSupport::Concern
++
+   INCINERATION_GRACE_PERIOD = 30.days
++
++  included do
++    scope :due_for_incineration, -> {
++      joins(:cancellation).where(account_cancellations: { created_at: ...INCINERATION_GRACE_PERIOD.ago })
++    }
++  end
++
++  class_methods do
++    def incinerate_due
++      due_for_incineration.find_each(&:incinerate)
++    end
++  end
++
++  def incinerate
++    transaction do
++      # Recheck under lock: the account may have been reactivated since the sweep began.
++      if self.class.due_for_incineration.lock.exists?(id)
++        incinerate_storage
++        incinerate_content
++        destroy!
++      end
++    end
++  end
++
++  private
++    def incinerate_storage
++      # Remove content attachments without generating new storage ledger entries. Let
++      # Active Storage purge previews/variants with their blobs, and keep shared blobs.
++      ActiveStorage::Attachment.where(account: self)
++        .where.not(record_type: %w[ ActiveStorage::Blob ActiveStorage::VariantRecord Identity ]).delete_all
++      ActiveStorage::Blob.unattached.where(account: self).find_each(&:purge_later)
++      Storage::Entry.where(account: self).delete_all
++      Storage::Total.where(owner: boards).delete_all
++    end
++
++    def incinerate_content
++      # Filters own join rows without an account_id. Search records own FTS rows on SQLite.
++      Filter.where(account: self).find_each(&:destroy!)
++      Search::Record.for(id).where(account_id: id).find_each(&:destroy!)
++
++      # Delete by tenant, not by walking every card's associations. This removes even
++      # records whose parent has gone away and avoids enqueuing per-record callbacks.
++      [ Webhook::Delivery, Webhook::DelinquencyTracker, Notification, Notification::Bundle,
++        Event, Mention, Reaction, Pin, Watch, Tagging, Assignment, Closure, Step, Card::Goldness,
++        Card::NotNow, Card::ActivitySpike, ActionText::RichText, Comment, Card, Access,
++        Board::Publication, Column, Webhook, Entropy, Board, Tag, Search::Query, Push::Subscription,
++        User::Settings, Export, Account::Import, Account::JoinCode, User ].each do |model|
++        model.where(account_id: id).delete_all
++      end
++    end
+ end
+diff --git a/app/models/filter/resources.rb b/app/models/filter/resources.rb
+index 655746f..b286ae2 100644
+--- a/app/models/filter/resources.rb
++++ b/app/models/filter/resources.rb
+@@ -5,6 +5,7 @@ module Filter::Resources
+     has_and_belongs_to_many :tags
+     has_and_belongs_to_many :boards
+     has_and_belongs_to_many :assignees, class_name: "User", join_table: "assignees_filters", association_foreign_key: "assignee_id"
++    has_and_belongs_to_many :assigners, class_name: "User", join_table: "assigners_filters", association_foreign_key: "assigner_id"
+     has_and_belongs_to_many :creators, class_name: "User", join_table: "creators_filters", association_foreign_key: "creator_id"
+     has_and_belongs_to_many :closers, class_name: "User", join_table: "closers_filters", association_foreign_key: "closer_id"
+   end
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 549f6ae..06e1a31 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -10,6 +10,9 @@ production: &production
+   auto_postpone_all_due:
+     command: "Card.auto_postpone_all_due"
+     schedule: every hour at minute 50
++  incinerate_due_accounts:
++    class: Account::IncinerateDueJob
++    schedule: every day at 03:30
+   delete_unused_tags:
+     class: DeleteUnusedTagsJob
+     schedule: every day at 04:02
+diff --git a/saas/app/models/account/storage_limited.rb b/saas/app/models/account/storage_limited.rb
+index 46db552..cdb8232 100644
+--- a/saas/app/models/account/storage_limited.rb
++++ b/saas/app/models/account/storage_limited.rb
+@@ -5,7 +5,7 @@ module Account::StorageLimited
+   NEAR_STORAGE_LIMIT_THRESHOLD = 500.megabytes
+ 
+   included do
+-    has_one :storage_exception
++    has_one :storage_exception, dependent: :destroy
+   end
+ 
+   def storage_limit
+diff --git a/test/jobs/account/incinerate_due_job_test.rb b/test/jobs/account/incinerate_due_job_test.rb
+new file mode 100644
+index 0000000..c7e9fa7
+--- /dev/null
++++ b/test/jobs/account/incinerate_due_job_test.rb
+@@ -0,0 +1,53 @@
++require "test_helper"
++
++class Account::IncinerateDueJobTest < ActiveJob::TestCase
++  test "incinerates only accounts past the cancellation grace period" do
++    account = accounts("37s")
++    other = accounts(:initech)
++    identity = users(:david).identity
++    ActiveStorage::Blob.create_and_upload!(io: StringIO.new("upload"), filename: "unused.txt")
++    cards(:logo).image.attach(io: StringIO.new("attachment"), filename: "card.txt")
++
++    cards(:logo).reindex
++    cards(:radio).reindex
++    board_total = boards(:writebook).create_storage_total!
++
++    freeze_time do
++      account.create_cancellation!(initiated_by: users(:david), created_at: 30.days.ago - 1.second)
++      other.create_cancellation!(initiated_by: users(:mike), created_at: 30.days.ago)
++
++      perform_enqueued_jobs(only: ActiveStorage::PurgeJob) do
++        Current.without_account { Account::IncinerateDueJob.perform_now }
++      end
++
++      assert_not Account.exists?(account.id)
++      assert_not Account::Cancellation.exists?(account: account)
++      assert_not Board.exists?(account: account)
++      assert_not User.exists?(account: account)
++      assert_not Card.exists?(account: account)
++      assert_not ActionText::RichText.exists?(account: account)
++      assert_not Search::Record.for(account.id).exists?(account_id: account.id)
++      assert_not Storage::Total.exists?(board_total.id)
++      assert_not ActiveStorage::Attachment.exists?(account: account)
++      assert_not Storage::Entry.exists?(account: account)
++      assert_not ActiveStorage::Blob.exists?(account: account)
++      assert Identity.exists?(identity.id)
++      assert Board.exists?(account: other)
++      assert Search::Record.for(other.id).exists?(account_id: other.id)
++      assert Account.exists?(other.id)
++      assert Account.exists?(accounts(:acme).id)
++    end
++  end
++
++  test "reactivation prevents incineration" do
++    account = accounts("37s")
++    account.create_cancellation!(initiated_by: users(:david), created_at: 31.days.ago)
++    candidate = Account.due_for_incineration.find(account.id)
++    account.reactivate
++
++    assert_no_difference -> { Account.count } do
++      candidate.incinerate
++      Account::IncinerateDueJob.perform_now
++    end
++  end
++end

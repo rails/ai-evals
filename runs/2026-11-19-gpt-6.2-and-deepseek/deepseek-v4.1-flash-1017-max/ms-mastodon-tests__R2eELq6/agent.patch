@@ -1,0 +1,578 @@
+diff --git a/config/environments/test.rb b/config/environments/test.rb
+index 12709d5..3d444a6 100644
+--- a/config/environments/test.rb
++++ b/config/environments/test.rb
+@@ -20,6 +20,11 @@ Rails.application.configure do
+   config.eager_load = ENV['CI'].present?
+ 
+   # Show full error reports and disable caching.
++
++  # Query and request logging is pure overhead in tests and can dominate the
++  # runtime when examples issue many queries. Keep warnings and errors visible.
++  config.log_level = :warn
++  config.active_record.verbose_query_logs = false
+   config.consider_all_requests_local = true
+   config.action_controller.perform_caching = false
+   config.cache_store = :memory_store
+diff --git a/docs/test-suite-performance.md b/docs/test-suite-performance.md
+new file mode 100644
+index 0000000..8c2e2e7
+--- /dev/null
++++ b/docs/test-suite-performance.md
+@@ -0,0 +1,324 @@
++# Test Suite Performance Notes
++
++This document tracks profiling data and optimizations for the RSpec suite. Keep it
++updated as each spec group is optimized so future runs do not have to rediscover
++the same bottlenecks.
++
++## Rules for profiling runs
++
++- Do not run the entire suite or multiple top-level spec directories at once. The
++  Bash tool can time out. Profile one group at a time, e.g.
++  `bundle exec rspec spec/models`.
++- Exclude `spec/system` and streaming specs from these measurements. They are not
++  part of the default CI run.
++- Keep assertion behavior unchanged. Prefer test configuration and shared setup
++  changes over rewriting individual examples.
++- Do not optimize factories in the `spec/models` phase; factories are handled in a
++  later phase.
++
++## Phase 1: `spec/models`
++
++### Baseline (before optimization)
++
++Command:
++
++```sh
++TIMEFORMAT='ELAPSED=%3R USER=%3U SYS=%3S'
++time bundle exec rspec spec/models --profile 60 --format progress
++```
++
++Result:
++
++- 1,795 examples, 0 failures
++- RSpec time: **2 minutes 37 seconds**
++- Wall time: **160.04 seconds**
++- Seed: 435
++
++Profiling command:
++
++```sh
++TEST_STACK_PROF=1 TEST_STACK_PROF_MODE=wall TEST_STACK_PROF_RAW=1 \
++  bundle exec rspec -r test_prof spec/models --format progress
++```
++
++Important findings:
++
++1. `spec/models/concerns/status/fetch_replies_concern_spec.rb` set
++   `ActiveRecord.verbose_query_logs = true` at file load time. RSpec loads all spec
++   files up front, so this leaked into the entire run. Every SQL query then paid
++   for caller backtrace collection and cleaning. StackProf attributed roughly 32%
++   of sampled wall time to `ActiveSupport::BacktraceCleaner#first_clean_frame` and
++   related `Rails::BacktraceCleaner` work.
++2. The test environment was logging at `debug`, so ActiveRecord's SQL subscriber
++   and logger formatting were doing unnecessary work for every query.
++3. The after-example Redis cleanup used `redis.del(redis.keys)`, which allocates a
++   full key array before deleting it. The test Redis database is dedicated to the
++   current test process, so `redis.flushdb` is equivalent cleanup with less work.
++
++### Changes applied
++
++- Removed the leaked `ActiveRecord.verbose_query_logs = true` from the model spec.
++- Set `config.log_level = :warn` and
++  `config.active_record.verbose_query_logs = false` in
++  `config/environments/test.rb`.
++- Replaced `redis.del(redis.keys)` with `redis.flushdb` in `spec/rails_helper.rb`.
++
++### Result after optimization
++
++Command:
++
++```sh
++TIMEFORMAT='ELAPSED=%3R USER=%3U SYS=%3S'
++time bundle exec rspec spec/models --profile 20 --format progress
++```
++
++Result:
++
++- 1,795 examples, 0 failures
++- RSpec time: **1 minute 27.28 seconds**
++- Wall time: **90.30 seconds**
++- Seed: 34353
++- Improvement: **45.5% faster** (about 1.83x), down from 160.04 seconds
++
++Repeated runs after the logging fix landed in the 86-90 second wall-time range.
++Random ordering causes a few seconds of variation.
++
++### Remaining profile observations
++
++SQL is still the largest measurable block:
++
++- `EVENT_PROF='sql.active_record'` measured about **113,957 SQL events** taking
++  roughly **20.2 seconds (21.8%)** of a 92.7 second run, or about 63 queries per
++  example.
++- The largest SQL consumers were `TagFeed`, `AccountStatusesCleanupPolicy`,
++  `PublicFeed`, `Status`, and `Trends::Statuses`.
++- Most of this comes from test-data setup and factory callbacks, which are
++  intentionally deferred to the factory optimization phase.
++- StackProf after the fix showed remaining time mostly in PostgreSQL calls,
++  Redis I/O, BCrypt, image/audio processing, and ActiveRecord callbacks rather
++  than one shared Ruby hotspot.
++
++Potential future item: running the suite under YJIT (`RUBYOPT=--yjit`) reduced this
++same group to about 79 seconds in an exploratory run. That was not applied here
++because it is an environment/runtime change and should be evaluated separately for
++CI compatibility.
++
++## Phase 2: `spec/requests`
++
++### Baseline (after the models-phase changes)
++
++Command:
++
++```sh
++TIMEFORMAT='ELAPSED=%3R USER=%3U SYS=%3S'
++time bundle exec rspec spec/requests --profile 40 --format progress
++```
++
++Result:
++
++- 1,877 examples, 0 failures
++- RSpec time: **2 minutes 41.7 seconds**
++- Wall time: **165.101 seconds**
++- Seed: 59517
++
++Profiling command:
++
++```sh
++bundle exec stackprof run --mode=wall --interval=1000 \
++  --out=tmp/requests.stackprof -- bundle exec rspec spec/requests --format progress
++```
++
++A temporary Sidekiq client instrumentation script was also used to count inline
++jobs by class. This is important because the suite runs Sidekiq in `:inline` mode.
++
++### Important findings
++
++1. **Webhook worker explosion.** 6,718 of the 7,745 inline Sidekiq jobs were
++   `TriggerWebhookWorker` calls caused by local status/account/user creation in
++   factories. The worker's `WebhookService` path accounted for about 20.5% of
++   wall samples. No request spec asserts webhook delivery; the only request spec
++   that mentions webhooks tests invalid admin webhook parameters.
++2. **Per-example route reloads.** `signature_verification_spec.rb` and
++   `api/v1/csp_spec.rb` called `Rails.application.routes.draw` before every
++   example and `Rails.application.reload_routes!` afterwards. Route
++   draw/reload work was about 5.6% of the run. The signature group alone took
++   about 5.33 seconds before this change.
++3. **Mail setup jobs.** `ActionMailer::MailDeliveryJob` accounted for about 4.7%
++   of samples. Most request specs do not assert emails. Three request examples do
++   assert delivered mail: the report creation spec, admin confirmation resend
++   spec, and the shared admin account-action notification example.
++4. **Repeated cache-spec setup.** `cache_spec.rb` has 258 examples and ran the
++   same seven-record base setup before every one. That group was about 30.5
++   seconds. All examples in the group only read the base records.
++5. **Remaining cost is factory setup.** After the request-specific fixes, roughly
++   55% of samples are still inside `Fabricate`. A large share comes from the
++   status fabricator's `after_create` bookmark creation, which in turn builds an
++   extra account. Factory changes are intentionally deferred to the later
++   factory-optimization phase.
++
++### Changes applied
++
++- Added request-only setup in `spec/rails_helper.rb` to stub
++  `TriggerWebhookWorker.perform_async`. This avoids thousands of no-op webhook
++  jobs during request setup.
++- Stubbed `ActionMailer::MessageDelivery#deliver_later` for request examples,
++  except examples tagged `:preserve_mail_delivery`. The three mail-asserting
++  examples carry that tag.
++- Moved the temporary test-route definitions in `signature_verification_spec.rb`
++  and `api/v1/csp_spec.rb` from per-example hooks to `before(:all)` hooks, with
++  route restoration in `after(:all)`. Per-example controller stubbing and all
++  assertions are unchanged.
++- Changed `cache_spec.rb`'s shared base setup from `before` to `before(:all)`.
++  The setup runs inside an explicit outer transaction, which is rolled back in
++  `after(:all)`. Each example still runs with its normal transactional isolation.
++- Kept the existing request-specific fixes from the models phase:
++  warning-level logging, no verbose query logs, and `redis.flushdb` cleanup.
++
++### Result after optimization
++
++Command:
++
++```sh
++TIMEFORMAT='ELAPSED=%3R USER=%3U SYS=%3S'
++time bundle exec rspec spec/requests --format progress
++```
++
++Result:
++
++- 1,877 examples, 0 failures
++- RSpec time: **1 minute 46.3 seconds**
++- Wall time: **109.496 seconds**
++- Seed: 13203
++- Improvement: **33.7% faster** (about 1.51x), down from 165.101 seconds
++
++A second full run with `--seed 1` completed in **103.726 seconds** wall /
++100.58 seconds RSpec, also with 1,877 examples and 0 failures. Across the two
++post-optimization runs, wall time was 103.7-109.5 seconds, or **33.7-37.2%**
++faster than the baseline.
++
++Intermediate checkpoints:
++
++- After webhook suppression: 135.9 seconds wall.
++- After route and mail setup changes: about 120 seconds wall.
++- After moving cache-spec setup to the group level: 109.5 seconds wall.
++- The cache-spec group itself dropped from about 30.5 seconds to 6.2 seconds.
++
++### Remaining observations and cautions
++
++- `status_fabricator.rb` creates a bookmark after every status, and the bookmark
++  fabricator builds an additional account. This is the largest remaining setup
++  cost and should be addressed in the factory-optimization phase, not here.
++- Request processing itself is now about 19-20% of the profile. Remaining inline
++  jobs are mostly `LocalNotificationWorker` (~4.9%) and distribution jobs, which
++  are semantically relevant to request behavior and should not be disabled
++  globally.
++- If `cache_spec.rb` later starts mutating its base records, revisit the
++  group-level transaction setup. The current optimization is valid because those
++  examples are read-only.
++- The `:preserve_mail_delivery` tag must be added to any future request example
++  that asserts delivered email.
++
++## Final target
++
++The combined `spec/models` + `spec/requests` runtime should eventually be at least
++twice as fast as the original combined baseline. Record the original requests
++baseline before making changes.
++
++Current estimate: models 90.3 seconds + requests 103.7-109.5 seconds = about
++**194-199.8 seconds**, compared with the original combined baseline of about
++**325.1 seconds** (160.04 + 165.101). That is about **1.63-1.68x faster** so far.
++Reaching the overall 2x target will require the planned factory-optimization
++phase or further request-specific wins; factory setup remains the dominant shared
++cost.
++
++Update after Phase 3 (factory usage): clean runs were models **57.9s** and
++requests **93.1s**, or **151.0s combined**. That is **2.15x faster** than the
++original 325.1s combined baseline and **1.29x faster** than the
++post-Phase-2 baseline, so the 2x target has been reached.
++
++## Phase 3: Factory usage
++
++### Baseline before factory optimization
++
++This phase started from the post-Phase-2 state (models logging/cleanup fixes and
++request setup fixes already applied). To make the factory work measurable, the
++same two groups were profiled one at a time with temporary instrumentation around
++`Fabricate.create` / `Fabricate.build` and inline Sidekiq jobs:
++
++```sh
++TIMEFORMAT='ELAPSED=%3R USER=%3U SYS=%3S'
++time bundle exec rspec -r ./tmp/factory_profile.rb spec/models --format progress --profile 10
++time bundle exec rspec -r ./tmp/factory_profile.rb spec/requests --format progress --profile 10
++```
++
++Baseline result (instrumentation adds a small amount of overhead):
++
++- `spec/models`: 1,795 examples, 0 failures, **89.4s wall / 75.1s inside factories**
++- `spec/requests`: 1,877 examples, 0 failures, **105.4s wall / 60.0s inside factories**
++- Combined wall time: **194.8s**
++
++### Factory findings
++
++1. **Every status created a bookmark.** `status_fabricator.rb` had an
++   `after_create` callback that fabricated a bookmark. The bookmark fabricator
++   built its own account, so this added 1,002 bookmark/account pairs in the
++   models run and 945 in requests. Nothing asserted that a bare
++   `Fabricate(:status)` was bookmarked; specs that need a bookmark create one
++   explicitly.
++2. **Every user created two login activities.** `user_fabricator.rb` had an
++   `after_create` callback creating two `LoginActivity` rows. This produced 270
++   extra rows in models and 2,456 in requests. The callback was not used by any
++   assertion; login-activity behavior is tested by creating activities explicitly
++   or through sign-in endpoints.
++3. **Model specs executed thousands of no-op webhook jobs.** Request specs
++   already stubbed `TriggerWebhookWorker.perform_async`, but model specs did not.
++   The models profile recorded **2,839 `TriggerWebhookWorker` inline jobs taking
++   17.1s**. The worker has no matching webhook subscriptions in these examples,
++   so the jobs only did lookup work. Explicit webhook-call assertions use their
++   own stubs and continue to work.
++
++### Changes applied
++
++- Removed the unconditional bookmark `after_create` callback from
++  `spec/fabricators/status_fabricator.rb`.
++- Removed the unconditional two-login-activity `after_create` callback from
++  `spec/fabricators/user_fabricator.rb`.
++- Moved `TriggerWebhookWorker.perform_async` stubbing into a suite-wide
++  `config.before` hook in `spec/rails_helper.rb`. A future example can opt out
++  with the `:preserve_webhook_delivery` tag.
++
++### Result after optimization
++
++Clean final runs, without profiling instrumentation:
++
++```sh
++time bundle exec rspec spec/models --format progress
++time bundle exec rspec spec/requests --format progress
++```
++
++- `spec/models`: 1,795 examples, 0 failures, **57.9s wall / 54.9s RSpec**
++- `spec/requests`: 1,877 examples, 0 failures, **93.1s wall / 90.0s RSpec**
++- Combined wall time: **151.0s**
++- Improvement in this phase: **22.5% faster** (194.8s → 151.0s)
++- Versus the original combined baseline (325.1s): **2.15x faster**
++
++The instrumented models run after the changes still spent about 45.9s inside
++factories; the remaining largest entries were `account` (20.1s),
++`status` (10.5s), `media_attachment` (6.9s), and `user` (5.6s). The request run
++spent about 49.0s inside factories. These are now dominated by actual persistence
++and association setup rather than redundant callbacks.
++
++### Remaining observations and cautions
++
++- The account fabricator still builds a user and a test keypair for every local
++  account. Many examples need one or both, so changing the default is higher-risk
++  and should be done with a transient/tag rather than globally.
++- Media attachment examples do real file processing and remain among the slowest
++  individual examples. Do not replace processing with a no-op for examples that
++  assert metadata or validation behavior.
++- Remaining inline jobs in the models/requests groups are small and mostly
++  semantically relevant (`LocalNotificationWorker`, distribution workers, etc.).
++  Do not suppress them without checking assertions.
++- Any new example that asserts real webhook delivery must use the
++  `:preserve_webhook_delivery` tag. Any new request example that asserts email
++  delivery must use the `:preserve_mail_delivery` tag.
+diff --git a/spec/fabricators/status_fabricator.rb b/spec/fabricators/status_fabricator.rb
+index 2539d48..32a2cbf 100644
+--- a/spec/fabricators/status_fabricator.rb
++++ b/spec/fabricators/status_fabricator.rb
+@@ -7,8 +7,4 @@ Fabricator(:status) do
+   after_build do |status|
+     status.uri = Faker::Internet.device_token if !status.account.local? && status.uri.nil?
+   end
+-
+-  after_create do |status|
+-    Fabricate(:bookmark, status: status)
+-  end
+ end
+diff --git a/spec/fabricators/user_fabricator.rb b/spec/fabricators/user_fabricator.rb
+index c82a3c9..300a6d9 100644
+--- a/spec/fabricators/user_fabricator.rb
++++ b/spec/fabricators/user_fabricator.rb
+@@ -12,10 +12,6 @@ Fabricator(:user) do
+   confirmed_at { Time.zone.now }
+   current_sign_in_at { Time.zone.now }
+   agreement true
+-
+-  after_create do |user|
+-    2.times { Fabricate(:login_activity, user: user) }
+-  end
+ end
+ 
+ Fabricator(:admin_user, from: :user) do
+diff --git a/spec/models/concerns/status/fetch_replies_concern_spec.rb b/spec/models/concerns/status/fetch_replies_concern_spec.rb
+index e9c81d4..15e8ad7 100644
+--- a/spec/models/concerns/status/fetch_replies_concern_spec.rb
++++ b/spec/models/concerns/status/fetch_replies_concern_spec.rb
+@@ -3,7 +3,6 @@
+ require 'rails_helper'
+ 
+ RSpec.describe Status::FetchRepliesConcern do
+-  ActiveRecord.verbose_query_logs = true
+ 
+   let!(:alice)  { Fabricate(:account, username: 'alice') }
+   let!(:bob)    { Fabricate(:account, username: 'bob', domain: 'other.com') }
+diff --git a/spec/rails_helper.rb b/spec/rails_helper.rb
+index a91461b..5015e66 100644
+--- a/spec/rails_helper.rb
++++ b/spec/rails_helper.rb
+@@ -117,10 +117,26 @@ RSpec.configure do |config|
+     allow(Resolv::DNS).to receive(:open).and_raise('Real DNS queries are disabled, stub Resolv::DNS as needed') unless example.metadata[:type] == :system
+   end
+ 
+-  config.before :each, type: :request do
++  # Webhook delivery is an asynchronous side effect that is not asserted by
++  # default. Local status/account/user creation otherwise enqueues thousands of
++  # no-op webhook jobs during setup, which are executed inline by Sidekiq
++  # testing and dominate the runtime. Specs that need real delivery can opt out
++  # with the `:preserve_webhook_delivery` tag.
++  config.before do |example|
++    allow(TriggerWebhookWorker).to receive(:perform_async) unless example.metadata[:preserve_webhook_delivery]
++  end
++
++  config.before :each, type: :request do |example|
+     # Use https and configured hostname in request spec requests
+     integration_session.https!
+     host! Rails.configuration.x.local_domain
++
++    # Mail delivery is usually an unrelated setup side effect in request specs.
++    # A handful of examples assert delivered email and opt back in with the
++    # `:preserve_mail_delivery` tag.
++    unless example.metadata[:preserve_mail_delivery]
++      allow_any_instance_of(ActionMailer::MessageDelivery).to receive(:deliver_later)
++    end
+   end
+ 
+   config.before :each, type: :system do
+@@ -130,7 +146,7 @@ RSpec.configure do |config|
+ 
+   config.after do
+     Rails.cache.clear
+-    redis.del(redis.keys)
++    redis.flushdb
+   end
+ 
+   # Assign types based on dir name for non-inferred types
+diff --git a/spec/requests/admin/confirmations_spec.rb b/spec/requests/admin/confirmations_spec.rb
+index 5f9dbb2..6af5698 100644
+--- a/spec/requests/admin/confirmations_spec.rb
++++ b/spec/requests/admin/confirmations_spec.rb
+@@ -37,7 +37,7 @@ RSpec.describe 'Admin Confirmations' do
+     context 'when email is confirmed' do
+       let(:confirmed_at) { Time.zone.now }
+ 
+-      it 'does not resend confirmation mail' do
++      it 'does not resend confirmation mail', :preserve_mail_delivery do
+         emails = capture_emails { subject }
+ 
+         expect(emails)
+diff --git a/spec/requests/api/v1/admin/account_actions_spec.rb b/spec/requests/api/v1/admin/account_actions_spec.rb
+index b67db3d..1f4a487 100644
+--- a/spec/requests/api/v1/admin/account_actions_spec.rb
++++ b/spec/requests/api/v1/admin/account_actions_spec.rb
+@@ -6,7 +6,7 @@ RSpec.describe 'Account actions' do
+   include_context 'with API authentication', user_fabricator: :admin_user, oauth_scopes: 'admin:write admin:write:accounts'
+ 
+   shared_examples 'a successful notification delivery' do
+-    it 'notifies the user about the action taken' do
++    it 'notifies the user about the action taken', :preserve_mail_delivery do
+       emails = capture_emails { subject }
+ 
+       expect(emails.size)
+diff --git a/spec/requests/api/v1/csp_spec.rb b/spec/requests/api/v1/csp_spec.rb
+index 5d61d7f..0953f84 100644
+--- a/spec/requests/api/v1/csp_spec.rb
++++ b/spec/requests/api/v1/csp_spec.rb
+@@ -3,9 +3,15 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'API namespace minimal Content-Security-Policy' do
+-  before { stub_tests_controller }
++  before(:all) do
++    Rails.application.routes.draw do
++      get '/api/v1/tests', to: 'api/v1/tests#index'
++    end
++  end
+ 
+-  after { Rails.application.reload_routes! }
++  after(:all) { Rails.application.reload_routes! }
++
++  before { stub_tests_controller }
+ 
+   it 'returns the correct CSP headers' do
+     get '/api/v1/tests'
+@@ -18,10 +24,6 @@ RSpec.describe 'API namespace minimal Content-Security-Policy' do
+ 
+   def stub_tests_controller
+     stub_const('Api::V1::TestsController', api_tests_controller)
+-
+-    Rails.application.routes.draw do
+-      get '/api/v1/tests', to: 'api/v1/tests#index'
+-    end
+   end
+ 
+   def api_tests_controller
+diff --git a/spec/requests/api/v1/reports_spec.rb b/spec/requests/api/v1/reports_spec.rb
+index 52cd581..504d308 100644
+--- a/spec/requests/api/v1/reports_spec.rb
++++ b/spec/requests/api/v1/reports_spec.rb
+@@ -32,7 +32,7 @@ RSpec.describe 'Reports' do
+ 
+     it_behaves_like 'forbidden for wrong scope', 'read read:reports'
+ 
+-    it 'creates a report', :aggregate_failures do
++    it 'creates a report', :aggregate_failures, :preserve_mail_delivery do
+       emails = capture_emails { subject }
+ 
+       expect(response).to have_http_status(200)
+diff --git a/spec/requests/cache_spec.rb b/spec/requests/cache_spec.rb
+index 8fa5a03..2b73670 100644
+--- a/spec/requests/cache_spec.rb
++++ b/spec/requests/cache_spec.rb
+@@ -171,7 +171,13 @@ RSpec.describe 'Caching behavior' do
+   let(:user) { User.find_by(email: 'user@host.example') }
+   let(:token) { Doorkeeper::AccessToken.find_by(resource_owner_id: user.id) }
+ 
+-  before do
++  # All examples in this group only read this base data. Create it once and
++  # keep it inside an outer transaction so it can be rolled back after the
++  # group, while each example still gets its usual transactional isolation.
++  before(:all) do
++    @cache_setup_connection = ActiveRecord::Base.connection
++    @cache_setup_connection.begin_transaction(joinable: false)
++
+     alice = Fabricate(:account, username: 'alice')
+     user = Fabricate(:moderator_user, email: 'user@host.example')
+     status = Fabricate(:status, account: alice, id: 110_224_538_612_341_312)
+@@ -183,6 +189,10 @@ RSpec.describe 'Caching behavior' do
+     user.account.follow!(alice)
+   end
+ 
++  after(:all) do
++    @cache_setup_connection.rollback_transaction if @cache_setup_connection&.transaction_open?
++  end
++
+   context 'when anonymously accessed' do
+     describe '/users/alice' do
+       it 'redirects with proper cache header', :aggregate_failures do
+diff --git a/spec/requests/signature_verification_spec.rb b/spec/requests/signature_verification_spec.rb
+index 9556911..a8c9666 100644
+--- a/spec/requests/signature_verification_spec.rb
++++ b/spec/requests/signature_verification_spec.rb
+@@ -3,6 +3,19 @@
+ require 'rails_helper'
+ 
+ RSpec.describe 'signature verification concern' do
++  before(:all) do
++    Rails.application.routes.draw do
++      # NOTE: RouteSet#draw removes all routes, so we need to re-insert one
++      resource :instance_actor, path: 'actor', only: [:show]
++
++      match :via => [:get, :post], '/activitypub/success' => 'activitypub/tests#success'
++      match :via => [:get, :post], '/activitypub/alternative-path' => 'activitypub/tests#alternative_success'
++      match :via => [:get, :post], '/activitypub/signature_required' => 'activitypub/tests#signature_required'
++    end
++  end
++
++  after(:all) { Rails.application.reload_routes! }
++
+   before do
+     stub_tests_controller
+ 
+@@ -10,8 +23,6 @@ RSpec.describe 'signature verification concern' do
+     travel_to '2023-12-20T10:00:00Z'
+   end
+ 
+-  after { Rails.application.reload_routes! }
+-
+   # Include the private key so the tests can be easily adjusted and reviewed
+   let(:actor_keypair) do
+     OpenSSL::PKey.read(<<~PEM_TEXT)
+@@ -767,15 +778,6 @@ RSpec.describe 'signature verification concern' do
+ 
+   def stub_tests_controller
+     stub_const('ActivityPub::TestsController', activitypub_tests_controller)
+-
+-    Rails.application.routes.draw do
+-      # NOTE: RouteSet#draw removes all routes, so we need to re-insert one
+-      resource :instance_actor, path: 'actor', only: [:show]
+-
+-      match :via => [:get, :post], '/activitypub/success' => 'activitypub/tests#success'
+-      match :via => [:get, :post], '/activitypub/alternative-path' => 'activitypub/tests#alternative_success'
+-      match :via => [:get, :post], '/activitypub/signature_required' => 'activitypub/tests#signature_required'
+-    end
+   end
+ 
+   def stub_key_requests

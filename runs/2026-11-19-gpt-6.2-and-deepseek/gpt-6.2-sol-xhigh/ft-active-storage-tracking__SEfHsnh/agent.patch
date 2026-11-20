@@ -1,0 +1,485 @@
+diff --git a/app/jobs/account/measure_storage_job.rb b/app/jobs/account/measure_storage_job.rb
+new file mode 100644
+index 0000000..07effeb
+--- /dev/null
++++ b/app/jobs/account/measure_storage_job.rb
+@@ -0,0 +1,11 @@
++class Account::MeasureStorageJob < ApplicationJob
++  queue_as :backend
++  limits_concurrency key: ->(account_id) { account_id }, on_conflict: :discard
++  retry_on ActiveRecord::Deadlocked, ActiveRecord::LockWaitTimeout
++
++  def perform(account_id)
++    if account = Account.find_by(id: account_id)
++      Account::StorageUsage.new(account).measure
++    end
++  end
++end
+diff --git a/app/models/account/data_transfer/account_record_set.rb b/app/models/account/data_transfer/account_record_set.rb
+index a5151f0..883a2fa 100644
+--- a/app/models/account/data_transfer/account_record_set.rb
++++ b/app/models/account/data_transfer/account_record_set.rb
+@@ -20,7 +20,8 @@ class Account::DataTransfer::AccountRecordSet < Account::DataTransfer::RecordSet
+     end
+ 
+     def export_record(account)
+-      zip.add_file "data/account.json", account.as_json.merge(join_code: account.join_code.as_json).to_json
++      account_data = account.as_json(except: %i[ bytes_used storage_measured_at ])
++      zip.add_file "data/account.json", account_data.merge(join_code: account.join_code.as_json).to_json
+     end
+ 
+     def files
+diff --git a/app/models/account/data_transfer/manifest.rb b/app/models/account/data_transfer/manifest.rb
+index 11aaf6a..cdc9f7d 100644
+--- a/app/models/account/data_transfer/manifest.rb
++++ b/app/models/account/data_transfer/manifest.rb
+@@ -26,12 +26,9 @@ class Account::DataTransfer::Manifest
+       [
+         Account::DataTransfer::AccountRecordSet.new(account),
+         Account::DataTransfer::UserRecordSet.new(account),
+-        *record_sets_for(
+-          ::User::Settings,
+-          ::Tag,
+-          ::Board,
+-          ::Column
+-        ),
++        *record_sets_for(::User::Settings, ::Tag),
++        record_set_for(::Board, attributes: ::Board.column_names - %w[ bytes_used ]),
++        record_set_for(::Column),
+         Account::DataTransfer::EntropyRecordSet.new(account),
+         *record_sets_for(
+           ::Board::Publication,
+@@ -71,8 +68,8 @@ class Account::DataTransfer::Manifest
+       end
+     end
+ 
+-    def record_set_for(model)
+-      Account::DataTransfer::RecordSet.new(account: account, model: model)
++    def record_set_for(model, **options)
++      Account::DataTransfer::RecordSet.new(account: account, model: model, **options)
+     end
+ 
+     def set_importable_model_names(record_sets)
+diff --git a/app/models/account/storage_usage.rb b/app/models/account/storage_usage.rb
+new file mode 100644
+index 0000000..c8b2cc6
+--- /dev/null
++++ b/app/models/account/storage_usage.rb
+@@ -0,0 +1,89 @@
++class Account::StorageUsage
++  ATTACHMENT_BATCH_SIZE = 5_000
++  BOARD_BATCH_SIZE = 500
++  ATTACHMENT_TYPES = { "Card" => "image", "ActionText::RichText" => "embeds" }.freeze
++
++  def self.measure_all_later
++    accounts = ATTACHMENT_TYPES.reduce(Account.where.not(bytes_used: 0)) do |scope, (type, name)|
++      attachments = ActiveStorage::Attachment.where(record_type: type, name: name)
++        .where("active_storage_attachments.account_id = accounts.id")
++      scope.or(Account.where(attachments.arel.exists))
++    end
++
++    accounts.in_batches do |batch|
++      ActiveJob.perform_all_later batch.pluck(:id).map { |id| Account::MeasureStorageJob.new(id) }
++    end
++  end
++
++  def initialize(account)
++    @account = account
++  end
++
++  def measure
++    started_at = Time.current
++    totals = measure_boards
++    store(totals, started_at)
++  end
++
++  private
++    def measure_boards
++      totals = Hash.new(0)
++
++      # Bound the queries to attachment metadata, regardless of the size of each file
++      # or how many cards and comments do not have attachments.
++      ActiveStorage::Attachment.uncached do
++        ATTACHMENT_TYPES.each do |type, name|
++          attachments = ActiveStorage::Attachment.where(account_id: @account.id, record_type: type, name: name)
++          if last_id = attachments.maximum(:id)
++            attachments.in_batches(of: ATTACHMENT_BATCH_SIZE, finish: last_id, use_ranges: true) do |batch|
++              bytes_by_board(batch).each { |id, bytes| totals[id] += bytes }
++            end
++          end
++        end
++      end
++
++      totals
++    end
++
++    def bytes_by_board(attachments)
++      attachments.joins(:blob).joins(<<~SQL.squish).group("boards.id").sum("active_storage_blobs.byte_size")
++        LEFT JOIN action_text_rich_texts AS rich_text ON
++          active_storage_attachments.record_type = 'ActionText::RichText'
++          AND rich_text.id = active_storage_attachments.record_id
++          AND rich_text.account_id = active_storage_attachments.account_id
++        LEFT JOIN comments ON rich_text.record_type = 'Comment' AND rich_text.name = 'body'
++          AND comments.id = rich_text.record_id AND comments.account_id = active_storage_attachments.account_id
++        LEFT JOIN cards ON cards.id = CASE
++            WHEN active_storage_attachments.record_type = 'Card' THEN active_storage_attachments.record_id
++            WHEN rich_text.record_type = 'Card' AND rich_text.name = 'description' THEN rich_text.record_id
++            ELSE comments.card_id
++          END AND cards.account_id = active_storage_attachments.account_id
++        INNER JOIN boards ON boards.id = CASE
++            WHEN rich_text.record_type = 'Board' AND rich_text.name = 'public_description' THEN rich_text.record_id
++            ELSE cards.board_id
++          END AND boards.account_id = active_storage_attachments.account_id
++      SQL
++    end
++
++    def store(totals, started_at)
++      # Do not lock any account or board rows while measuring attachments. Only
++      # publish once the measurement is ready, and never overwrite a newer one.
++      Account.transaction do
++        updated = Account.where(id: @account.id).where("storage_measured_at IS NULL OR storage_measured_at < ?", started_at)
++          .update_all(bytes_used: totals.values.sum, storage_measured_at: started_at)
++        store_board_totals(totals) if updated == 1
++      end
++    end
++
++    def store_board_totals(totals)
++      previous_totals = @account.boards.where.not(bytes_used: 0).pluck(:id, :bytes_used).to_h
++      changed_ids = (previous_totals.keys | totals.keys).reject { |id| previous_totals.fetch(id, 0) == totals[id] }
++
++      changed_ids.each_slice(BOARD_BATCH_SIZE) do |ids|
++        board_id = Board.arel_table[:id]
++        bytes_used = Arel::Nodes::Case.new(board_id)
++        ids.each { |id| bytes_used.when(Arel::Nodes.build_quoted(id, board_id)).then(totals[id]) }
++        @account.boards.where(id: ids).update_all(bytes_used: bytes_used)
++      end
++    end
++end
+diff --git a/config/initializers/action_text.rb b/config/initializers/action_text.rb
+index 6bbdb3e..543e3de 100644
+--- a/config/initializers/action_text.rb
++++ b/config/initializers/action_text.rb
+@@ -10,6 +10,11 @@ module ActionText
+             attachable.variant variant_name, **variant_options, process: :immediately
+           end
+         end
++
++        before_validation do
++          # Action Text only rebuilds embeds when the body is present.
++          self.embeds = [] if will_save_change_to_body? && body.blank?
++        end
+       end
+ 
+       def accessible_to?(user)
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 894c57b..ecc92d3 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -6,6 +6,11 @@ production: &production
+     command: "Notification::Bundle.deliver_all_later"
+     schedule: every 30 minutes
+ 
++  # Storage accounting
++  measure_storage_usage:
++    command: "Account::StorageUsage.measure_all_later"
++    schedule: every minute
++
+   # Application cleanup
+   auto_postpone_all_due:
+     command: "Card.auto_postpone_all_due"
+diff --git a/db/migrate/20260710120000_add_storage_usage.rb b/db/migrate/20260710120000_add_storage_usage.rb
+new file mode 100644
+index 0000000..2ae6c98
+--- /dev/null
++++ b/db/migrate/20260710120000_add_storage_usage.rb
+@@ -0,0 +1,10 @@
++class AddStorageUsage < ActiveRecord::Migration[8.2]
++  def change
++    add_column :accounts, :bytes_used, :bigint, default: 0, null: false
++    add_column :accounts, :storage_measured_at, :datetime
++    add_column :boards, :bytes_used, :bigint, default: 0, null: false
++
++    add_index :active_storage_attachments, [ :account_id, :record_type, :name, :id ],
++      name: :index_active_storage_attachments_for_usage
++  end
++end
+diff --git a/db/schema.rb b/db/schema.rb
+index 81a3526..35a9d11 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_07_10_120000) do
+   create_table "accesses", id: :uuid, charset: "utf8mb4", collation: "utf8mb4_0900_ai_ci", force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -66,6 +66,8 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.bigint "external_account_id"
+     t.string "name", null: false
+     t.datetime "updated_at", null: false
++    t.bigint "bytes_used", default: 0, null: false
++    t.datetime "storage_measured_at"
+     t.index ["external_account_id"], name: "index_accounts_on_external_account_id", unique: true
+   end
+ 
+@@ -104,6 +106,7 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.string "name", null: false
+     t.uuid "record_id", null: false
+     t.string "record_type", null: false
++    t.index ["account_id", "record_type", "name", "id"], name: "index_active_storage_attachments_for_usage"
+     t.index ["account_id"], name: "index_active_storage_attachments_on_account_id"
+     t.index ["blob_id"], name: "index_active_storage_attachments_on_blob_id"
+     t.index ["record_type", "record_id", "name", "blob_id"], name: "index_active_storage_attachments_uniqueness", unique: true
+@@ -175,6 +178,7 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.uuid "creator_id", null: false
+     t.string "name", null: false
+     t.datetime "updated_at", null: false
++    t.bigint "bytes_used", default: 0, null: false
+     t.index ["account_id"], name: "index_boards_on_account_id"
+     t.index ["creator_id"], name: "index_boards_on_creator_id"
+   end
+diff --git a/db/schema_sqlite.rb b/db/schema_sqlite.rb
+index 1c89abe..2c2aa0b 100644
+--- a/db/schema_sqlite.rb
++++ b/db/schema_sqlite.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
++ActiveRecord::Schema[8.2].define(version: 2026_07_10_120000) do
+   create_table "accesses", id: :uuid, force: :cascade do |t|
+     t.datetime "accessed_at"
+     t.uuid "account_id", null: false
+@@ -66,6 +66,8 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.bigint "external_account_id"
+     t.string "name", limit: 255, null: false
+     t.datetime "updated_at", null: false
++    t.bigint "bytes_used", default: 0, null: false
++    t.datetime "storage_measured_at"
+     t.index ["external_account_id"], name: "index_accounts_on_external_account_id", unique: true
+   end
+ 
+@@ -104,6 +106,7 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.string "name", limit: 255, null: false
+     t.uuid "record_id", null: false
+     t.string "record_type", limit: 255, null: false
++    t.index ["account_id", "record_type", "name", "id"], name: "index_active_storage_attachments_for_usage"
+     t.index ["account_id"], name: "index_active_storage_attachments_on_account_id"
+     t.index ["blob_id"], name: "index_active_storage_attachments_on_blob_id"
+     t.index ["record_type", "record_id", "name", "blob_id"], name: "index_active_storage_attachments_uniqueness", unique: true
+@@ -175,6 +178,7 @@ ActiveRecord::Schema[8.2].define(version: 2026_07_09_120000) do
+     t.uuid "creator_id", null: false
+     t.string "name", limit: 255, null: false
+     t.datetime "updated_at", null: false
++    t.bigint "bytes_used", default: 0, null: false
+     t.index ["account_id"], name: "index_boards_on_account_id"
+     t.index ["creator_id"], name: "index_boards_on_creator_id"
+   end
+diff --git a/test/models/account/import_test.rb b/test/models/account/import_test.rb
+index c1e9c2f..d195d9c 100644
+--- a/test/models/account/import_test.rb
++++ b/test/models/account/import_test.rb
+@@ -179,11 +179,15 @@ class Account::ImportTest < ActiveSupport::TestCase
+     exporter = users(:david)
+     identity = exporter.identity
+ 
+-    ActiveStorage::Blob.create_and_upload!(
++    source_blob = ActiveStorage::Blob.create_and_upload!(
+       io: StringIO.new("test image data"),
+       filename: "logo.png",
+       content_type: "image/png"
+     )
++    card = cards(:logo)
++    card.image.attach(source_blob)
++    Account::MeasureStorageJob.perform_now(source_account.id)
++    assert_equal source_blob.byte_size, card.board.reload.bytes_used
+ 
+     source_blob_count = ActiveStorage::Blob.where(account: source_account).count
+     source_blob_keys = ActiveStorage::Blob.where(account: source_account).pluck(:key)
+@@ -215,6 +219,12 @@ class Account::ImportTest < ActiveSupport::TestCase
+     assert_not_nil imported_blob
+     assert_not_includes source_blob_keys, imported_blob.key
+     assert_equal "test image data", imported_blob.download
++
++    imported_board = target_account.boards.find(card.board_id)
++    assert_equal 0, imported_board.bytes_used
++    Account::MeasureStorageJob.perform_now(target_account.id)
++    assert_equal imported_blob.byte_size, imported_board.reload.bytes_used
++    assert_equal imported_blob.byte_size, target_account.reload.bytes_used
+   ensure
+     export_tempfile&.close
+     export_tempfile&.unlink
+diff --git a/test/models/account/storage_usage_test.rb b/test/models/account/storage_usage_test.rb
+new file mode 100644
+index 0000000..e1700ef
+--- /dev/null
++++ b/test/models/account/storage_usage_test.rb
+@@ -0,0 +1,164 @@
++require "test_helper"
++
++class Account::StorageUsageTest < ActiveSupport::TestCase
++  setup do
++    @account = accounts(:"37s")
++    @board = boards(:writebook)
++    @card = cards(:logo)
++    Current.account = @account
++    Current.user = users(:david)
++  end
++
++  test "reports the measured storage used by a board and its account" do
++    image = upload("image.jpg", "image/jpeg", file_fixture("moon.jpg").binread)
++    card_file = upload("card.txt", "text/plain", "card description")
++    board_file = upload("board.txt", "text/plain", "board description")
++    comment_file = upload("comment.txt", "text/plain", "comment body")
++    upload("unattached.txt", "text/plain", "unattached")
++
++    @card.image.attach(image)
++    @card.update!(description: embed(card_file))
++    @board.update!(public_description: embed(board_file))
++    @card.comments.create!(body: embed(comment_file))
++
++    assert_equal 0, @board.bytes_used
++    assert_equal 0, @account.bytes_used
++
++    perform_measurement
++
++    expected_bytes = [ image, card_file, board_file, comment_file ].sum(&:byte_size)
++    assert_equal expected_bytes, @board.reload.bytes_used
++    assert_equal expected_bytes, @account.reload.bytes_used
++  end
++
++  test "excludes avatars, variants, and other accounts' files" do
++    image = upload("image.jpg", "image/jpeg", file_fixture("moon.jpg").binread)
++    users(:david).avatar.attach(image)
++    assert image.variant_records.exists?
++    @card.image.attach(image)
++
++    other_account = accounts(:initech)
++    other_board = boards(:miltons_wish_list)
++    other_file = Current.with_account(other_account) { upload("other.txt", "text/plain", "another account's file") }
++    other_board.update!(public_description: embed(other_file))
++
++    perform_measurement
++    assert_equal image.byte_size, @board.reload.bytes_used
++    assert_equal image.byte_size, @account.reload.bytes_used
++    assert_equal 0, other_board.reload.bytes_used
++
++    Account::MeasureStorageJob.perform_now(other_account.id)
++    assert_equal other_file.byte_size, other_board.reload.bytes_used
++    assert_equal other_file.byte_size, other_account.reload.bytes_used
++  end
++
++  test "counts existing attachments across batches and boards using 64-bit totals" do
++    stub_const(Account::StorageUsage, :ATTACHMENT_BATCH_SIZE, 1) do
++      blob = ActiveStorage::Blob.create!(filename: "large.txt", byte_size: 5.gigabytes, checksum: "unused")
++      other_board = boards(:private)
++
++      # Bulk writes bypass model callbacks, as they do in an account import.
++      ActiveStorage::Attachment.insert_all! [ @card, cards(:layout), other_board.cards.create!(title: "Draft") ].map { |card|
++        { id: ActiveRecord::Type::Uuid.generate, account_id: @account.id, record_type: "Card", record_id: card.id, name: "image", blob_id: blob.id }
++      }
++
++      perform_measurement
++
++      assert_equal 10.gigabytes, @board.reload.bytes_used
++      assert_equal 5.gigabytes, other_board.reload.bytes_used
++      assert_equal 15.gigabytes, @account.reload.bytes_used
++    end
++  end
++
++  test "moves a card's image, description, and comment files to its new board" do
++    file = upload("shared.txt", "text/plain", "shared file")
++    @card.image.attach(file)
++    @card.update!(description: embed(file))
++    @card.comments.create!(body: embed(file))
++    perform_measurement
++
++    other_board = boards(:private)
++    @card.move_to(other_board)
++    perform_measurement
++
++    assert_equal 0, @board.reload.bytes_used
++    assert_equal 3 * file.byte_size, other_board.reload.bytes_used
++    assert_equal 3 * file.byte_size, @account.reload.bytes_used
++  end
++
++  test "removes usage when attachments and their owners are removed" do
++    image = upload("image.jpg", "image/jpeg", file_fixture("moon.jpg").binread)
++    @card.image.attach(image)
++    @board.update!(public_description: embed(upload("board.txt", "text/plain", "board file")))
++    @card.update!(description: embed(upload("card.txt", "text/plain", "card file")))
++    comment = @card.comments.create!(body: embed(upload("comment.txt", "text/plain", "comment file")))
++    perform_measurement
++
++    @card.image.purge_later
++    @board.update!(public_description: "")
++    @card.update!(description: nil)
++    comment.destroy!
++    perform_measurement
++
++    assert_equal 0, @board.reload.bytes_used
++    assert_equal 0, @account.reload.bytes_used
++  end
++
++  test "remeasures the account even after the last attachment is gone" do
++    @card.image.attach(upload("file.txt", "text/plain", "only attachment"))
++    assert_enqueued_with(job: Account::MeasureStorageJob, args: [ @account.id ]) do
++      Account::StorageUsage.measure_all_later
++    end
++    perform_enqueued_jobs(only: Account::MeasureStorageJob)
++    assert_operator @account.reload.bytes_used, :>, 0
++
++    @card.image.detach
++    assert_enqueued_jobs 1, only: Account::MeasureStorageJob do
++      Account::StorageUsage.measure_all_later
++    end
++    perform_enqueued_jobs(only: Account::MeasureStorageJob)
++    assert_equal 0, @board.reload.bytes_used
++    assert_equal 0, @account.reload.bytes_used
++
++    assert_no_enqueued_jobs(only: Account::MeasureStorageJob) { Account::StorageUsage.measure_all_later }
++  end
++
++  test "replaces the measured size when a file is replaced" do
++    initial_file = upload("initial.txt", "text/plain", "initial file")
++    replacement = upload("replacement.txt", "text/plain", "a much longer file")
++    @board.update!(public_description: embed(initial_file))
++    perform_measurement
++    assert_equal initial_file.byte_size, @board.reload.bytes_used
++
++    @board.update!(public_description: embed(replacement))
++    perform_measurement
++    assert_equal replacement.byte_size, @board.reload.bytes_used
++    assert_equal replacement.byte_size, @account.reload.bytes_used
++  end
++
++  test "an older measurement cannot replace a newer measurement" do
++    file = upload("file.txt", "text/plain", "current file")
++    @card.image.attach(file)
++    perform_measurement
++    measured_at = @account.reload.storage_measured_at
++
++    @card.image.detach
++    travel_to(measured_at - 1.minute) { perform_measurement }
++
++    assert_equal file.byte_size, @account.reload.bytes_used
++    assert_equal file.byte_size, @board.reload.bytes_used
++  end
++
++  private
++    def perform_measurement
++      Account::MeasureStorageJob.perform_now(@account.id)
++    end
++
++    def upload(filename, content_type, content)
++      ActiveStorage::Blob.create_and_upload!(io: StringIO.new(content), filename: filename, content_type: content_type)
++    end
++
++    def embed(blob)
++      ActionText::Attachment.from_attachable(blob).to_html
++    end
++end

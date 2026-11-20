@@ -1,0 +1,212 @@
+diff --git a/app/jobs/account/incinerate_due_job.rb b/app/jobs/account/incinerate_due_job.rb
+new file mode 100644
+index 0000000..a11323a
+--- /dev/null
++++ b/app/jobs/account/incinerate_due_job.rb
+@@ -0,0 +1,7 @@
++class Account::IncinerateDueJob < ApplicationJob
++  queue_as :backend
++
++  def perform
++    Account.due_for_incineration.find_each(&:incinerate_if_due)
++  end
++end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index a6a70b1..92590d9 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -1,5 +1,5 @@
+ class Account < ApplicationRecord
+-  include Account::Storage, Cancellable, Entropic, MultiTenantable, Seedeable
++  include Account::Storage, Cancellable, Entropic, Incineratable, MultiTenantable, Seedeable
+ 
+   has_one :join_code, dependent: :destroy
+   has_many :users, dependent: :destroy
+diff --git a/app/models/account/incineratable.rb b/app/models/account/incineratable.rb
+index 2357b99..23316e6 100644
+--- a/app/models/account/incineratable.rb
++++ b/app/models/account/incineratable.rb
+@@ -1,3 +1,45 @@
+ module Account::Incineratable
++  extend ActiveSupport::Concern
++
+   INCINERATION_GRACE_PERIOD = 30.days
++
++  included do
++    scope :due_for_incineration, -> { joins(:cancellation).where(account_cancellations: { created_at: ...INCINERATION_GRACE_PERIOD.ago }) }
++  end
++
++  def incinerate_if_due
++    transaction do
++      # Reactivation takes the same account lock. Recheck in case it happened
++      # after the recurring job selected this account.
++      if Account.due_for_incineration.lock.exists?(id)
++        delete_filter_memberships
++        Storage::Total.where(owner: boards).delete_all
++        Search::Record.delete_all_for_account(id)
++        delete_tenant_records
++        ActiveStorage::Blob.unattached.where(account_id: id).find_each(&:purge_later)
++        destroy!
++      end
++    end
++  end
++
++  private
++    def delete_filter_memberships
++      filter_ids = Filter.where(account_id: id).select(:id)
++      %w[ assignees_filters assigners_filters boards_filters closers_filters creators_filters filters_tags ].each do |table|
++        Filter.connection.delete("DELETE FROM #{table} WHERE filter_id IN (#{filter_ids.to_sql})")
++      end
++    end
++
++    # Delete by tenant rather than walking the entire graph and running callbacks
++    # that broadcast changes, reindex content or write new storage ledger entries.
++    def delete_tenant_records
++      [
++        ActiveStorage::Attachment, ActiveStorage::VariantRecord, ActionText::RichText,
++        Storage::Entry, Search::Query, Push::Subscription, Notification, Notification::Bundle,
++        Webhook::Delivery, Webhook::DelinquencyTracker, Webhook, Event, Mention, Reaction,
++        Watch, Pin, Closure, Card::Goldness, Card::NotNow, Card::ActivitySpike, Tagging,
++        Assignment, Step, Comment, Card, Column, Board::Publication, Access, Entropy,
++        Board, Tag, Filter, Export, Account::Import, User::Settings, User
++      ].each { |model| model.where(account_id: id).delete_all }
++    end
+ end
+diff --git a/app/models/search/record/sqlite.rb b/app/models/search/record/sqlite.rb
+index 857e858..66748c9 100644
+--- a/app/models/search/record/sqlite.rb
++++ b/app/models/search/record/sqlite.rb
+@@ -17,6 +17,12 @@ module Search::Record::SQLite
+   end
+ 
+   class_methods do
++    def delete_all_for_account(account_id)
++      records = where(account_id: account_id)
++      Fts.where(rowid: records.select(:id)).delete_all
++      records.delete_all
++    end
++
+     def search_fields(query)
+       opening_mark = connection.quote(Search::Highlighter::OPENING_MARK)
+       closing_mark = connection.quote(Search::Highlighter::CLOSING_MARK)
+diff --git a/app/models/search/record/trilogy.rb b/app/models/search/record/trilogy.rb
+index 7705f3b..e726435 100644
+--- a/app/models/search/record/trilogy.rb
++++ b/app/models/search/record/trilogy.rb
+@@ -28,6 +28,10 @@ module Search::Record::Trilogy
+       Zlib.crc32(account_id.to_s) % SHARD_COUNT
+     end
+ 
++    def delete_all_for_account(account_id)
++      self.for(account_id).where(account_id: account_id).delete_all
++    end
++
+     def search_fields(query)
+       "#{connection.quote(query.terms)} AS query"
+     end
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 549f6ae..a15377f 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -7,6 +7,9 @@ production: &production
+     schedule: every 30 minutes
+ 
+   # Application cleanup
++  incinerate_due_accounts:
++    class: Account::IncinerateDueJob
++    schedule: every day at 04:30
+   auto_postpone_all_due:
+     command: "Card.auto_postpone_all_due"
+     schedule: every hour at minute 50
+diff --git a/saas/app/models/account/storage_limited.rb b/saas/app/models/account/storage_limited.rb
+index 46db552..cdb8232 100644
+--- a/saas/app/models/account/storage_limited.rb
++++ b/saas/app/models/account/storage_limited.rb
+@@ -5,7 +5,7 @@ module Account::StorageLimited
+   NEAR_STORAGE_LIMIT_THRESHOLD = 500.megabytes
+ 
+   included do
+-    has_one :storage_exception
++    has_one :storage_exception, dependent: :destroy
+   end
+ 
+   def storage_limit
+diff --git a/test/jobs/account/incinerate_due_job_test.rb b/test/jobs/account/incinerate_due_job_test.rb
+new file mode 100644
+index 0000000..eff680a
+--- /dev/null
++++ b/test/jobs/account/incinerate_due_job_test.rb
+@@ -0,0 +1,73 @@
++require "test_helper"
++
++class Account::IncinerateDueJobTest < ActiveJob::TestCase
++  setup do
++    @account = accounts(:"37s")
++    @owner = users(:jason)
++  end
++
++  test "incinerates accounts only after the full cancellation grace period" do
++    freeze_time
++    @account.cancel(initiated_by: @owner)
++
++    travel 30.days
++    Account::IncinerateDueJob.perform_now
++    assert Account.exists?(@account.id)
++    assert Card.exists?(account_id: @account.id)
++
++    travel 1.second
++    Account::IncinerateDueJob.perform_now
++    assert_not Account.exists?(@account.id)
++    assert_not Account::Cancellation.exists?(account_id: @account.id)
++    assert_not Card.exists?(account_id: @account.id)
++  end
++
++  test "reactivating a due account protects it even if it was already selected for incineration" do
++    travel_to(31.days.ago) { @account.cancel(initiated_by: @owner) }
++    candidate = Account.due_for_incineration.find(@account.id)
++    @account.reactivate
++
++    candidate.incinerate_if_due
++    Account::IncinerateDueJob.perform_now
++
++    assert @account.reload.active?
++    assert Card.exists?(account_id: @account.id)
++  end
++
++  test "deletes tenant data, including uploads, storage accounting and search, without affecting other memberships" do
++    other_account = accounts(:initech)
++    other_membership = other_account.users.create!(identity: @owner.identity, name: @owner.name)
++    card = cards(:logo)
++    other_card = cards(:radio)
++    card.reindex
++    other_card.reindex
++    search_record = Search::Record.for(@account.id).find_by!(searchable: card)
++
++    card.image.attach(io: StringIO.new("attached"), filename: "attachment.txt")
++    unattached = ActiveStorage::Blob.create_and_upload!(io: StringIO.new("unused"), filename: "unused.txt")
++    card.board.materialize_storage
++    @account.materialize_storage
++
++    travel_to(31.days.ago) { @account.cancel(initiated_by: @owner) }
++    Current.without_account { Account::IncinerateDueJob.perform_now }
++    perform_enqueued_jobs only: ActiveStorage::PurgeJob
++
++    [ User, Board, Comment, ActionText::RichText, Export, Event, Filter, Storage::Entry,
++      ActiveStorage::Attachment, ActiveStorage::Blob ].each do |model|
++      assert_not model.exists?(account_id: @account.id), "#{model} data was left behind"
++    end
++    assert_not unattached.service.exist?(unattached.key)
++    assert_not Storage::Total.exists?(owner: @account)
++    assert_not Storage::Total.exists?(owner: card.board)
++    assert_not search_record.class.exists?(search_record.id)
++    if Fizzy.db_adapter.sqlite?
++      assert_not Search::Record::SQLite::Fts.exists?(search_record.id)
++    end
++
++    assert Account.exists?(other_account.id)
++    assert Card.exists?(other_card.id)
++    assert Search::Record.for(other_account.id).exists?(searchable: other_card)
++    assert User.exists?(other_membership.id)
++    assert Identity.exists?(@owner.identity_id)
++  end
++end

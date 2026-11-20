@@ -1,0 +1,183 @@
+diff --git a/app/jobs/account/incinerate_due_job.rb b/app/jobs/account/incinerate_due_job.rb
+new file mode 100644
+index 0000000..b805613
+--- /dev/null
++++ b/app/jobs/account/incinerate_due_job.rb
+@@ -0,0 +1,7 @@
++class Account::IncinerateDueJob < ApplicationJob
++  queue_as :backend
++
++  def perform
++    Account.incinerate_due
++  end
++end
+diff --git a/app/models/account.rb b/app/models/account.rb
+index a6a70b1..92590d9 100644
+--- a/app/models/account.rb
++++ b/app/models/account.rb
+@@ -1,5 +1,5 @@
+ class Account < ApplicationRecord
+-  include Account::Storage, Cancellable, Entropic, MultiTenantable, Seedeable
++  include Account::Storage, Cancellable, Entropic, Incineratable, MultiTenantable, Seedeable
+ 
+   has_one :join_code, dependent: :destroy
+   has_many :users, dependent: :destroy
+diff --git a/app/models/account/incineratable.rb b/app/models/account/incineratable.rb
+index 2357b99..f85a61f 100644
+--- a/app/models/account/incineratable.rb
++++ b/app/models/account/incineratable.rb
+@@ -1,3 +1,39 @@
+ module Account::Incineratable
++  extend ActiveSupport::Concern
++
+   INCINERATION_GRACE_PERIOD = 30.days
++
++  class_methods do
++    def incinerate_due
++      Account::Cancellation.where(created_at: ...INCINERATION_GRACE_PERIOD.ago).find_each do |cancellation|
++        transaction do
++          account = lock.find_by(id: cancellation.account_id)
++
++          # Reactivation and cancellation take the same lock and may have replaced this cancellation.
++          if account&.cancellation == cancellation
++            incinerate(account)
++          end
++        end
++      end
++    end
++
++    private
++      def incinerate(account)
++        incinerate_storage(account)
++        Search::Record.for(account.id).where(account_id: account.id).find_each(&:destroy!)
++        account.destroy!
++      end
++
++      def incinerate_storage(account)
++        # Skip detach callbacks: the whole account and its storage ledger are being deleted.
++        ActiveStorage::Attachment.where(account: account).delete_all
++        ActiveStorage::VariantRecord.where(account: account).delete_all
++        ::Storage::Entry.where(account: account).delete_all
++
++        ActiveStorage::Blob.where(account: account).find_each do |blob|
++          blob.destroy!
++          ActiveRecord.after_all_transactions_commit { blob.delete }
++        end
++      end
++  end
+ end
+diff --git a/config/recurring.yml b/config/recurring.yml
+index 549f6ae..9f0618e 100644
+--- a/config/recurring.yml
++++ b/config/recurring.yml
+@@ -13,6 +13,9 @@ production: &production
+   delete_unused_tags:
+     class: DeleteUnusedTagsJob
+     schedule: every day at 04:02
++  incinerate_due_accounts:
++    class: Account::IncinerateDueJob
++    schedule: every day at 04:07
+ 
+   # Operations cleanup and backups
+   clear_solid_queue_finished_jobs:
+diff --git a/saas/app/models/account/storage_limited.rb b/saas/app/models/account/storage_limited.rb
+index 46db552..cdb8232 100644
+--- a/saas/app/models/account/storage_limited.rb
++++ b/saas/app/models/account/storage_limited.rb
+@@ -5,7 +5,7 @@ module Account::StorageLimited
+   NEAR_STORAGE_LIMIT_THRESHOLD = 500.megabytes
+ 
+   included do
+-    has_one :storage_exception
++    has_one :storage_exception, dependent: :destroy
+   end
+ 
+   def storage_limit
+diff --git a/test/jobs/account/incinerate_due_job_test.rb b/test/jobs/account/incinerate_due_job_test.rb
+new file mode 100644
+index 0000000..087cc02
+--- /dev/null
++++ b/test/jobs/account/incinerate_due_job_test.rb
+@@ -0,0 +1,82 @@
++require "test_helper"
++
++class Account::IncinerateDueJobTest < ActiveJob::TestCase
++  test "permanently removes an overdue account and its data without removing shared identities" do
++    account = accounts(:"37s")
++    other_account = accounts(:initech)
++    identity = identities(:david)
++    other_user = other_account.users.create!(name: "David", identity: identity)
++    card = cards(:logo)
++    card.reindex
++    search_record = Search::Record.for(account.id).find_by!(searchable: card)
++    card.image.attach(io: StringIO.new("attached"), filename: "attached.txt")
++    card.image.blob.variant_records.create!(variation_digest: "example")
++    unattached_blob = ActiveStorage::Blob.create_and_upload!(io: StringIO.new("unattached"), filename: "unattached.txt")
++    other_blob = Current.with_account(other_account) do
++      ActiveStorage::Blob.create_and_upload!(io: StringIO.new("other account"), filename: "other.txt")
++    end
++
++    travel_to 31.days.ago do
++      account.cancel(initiated_by: users(:david))
++    end
++    assert Storage::Entry.exists?(account: account)
++
++    Current.without_account { Account::IncinerateDueJob.perform_now }
++
++    assert_not Account.exists?(account.id)
++    assert_not Account::Cancellation.exists?(account: account)
++    assert_not User.exists?(account: account)
++    assert_not Board.exists?(account: account)
++    assert_not Card.exists?(account: account)
++    assert_not Export.exists?(account: account)
++    assert_not ActionText::RichText.exists?(account: account)
++    assert_not Search::Record.for(account.id).exists?(account_id: account.id)
++    assert_not Storage::Entry.exists?(account: account)
++    assert_not ActiveStorage::Attachment.exists?(account: account)
++    assert_not ActiveStorage::VariantRecord.exists?(account: account)
++    assert_not ActiveStorage::Blob.exists?(account: account)
++    assert_not unattached_blob.service.exist?(unattached_blob.key)
++    assert_not Search::Record::SQLite::Fts.exists?(rowid: search_record.id) if Fizzy.db_adapter.sqlite?
++
++    assert Account.exists?(other_account.id)
++    assert Card.exists?(cards(:radio).id)
++    assert Identity.exists?(identity.id)
++    assert User.exists?(other_user.id)
++    assert ActiveStorage::Blob.exists?(other_blob.id)
++  end
++
++  test "retains accounts until their cancellations are more than 30 days old" do
++    account = accounts(:"37s")
++    recent_account = accounts(:initech)
++
++    freeze_time do
++      account.cancel(initiated_by: users(:david))
++      travel 1.day
++      recent_account.cancel(initiated_by: users(:mike))
++      travel 29.days
++
++      Current.without_account { Account::IncinerateDueJob.perform_now }
++      assert Account.exists?(account.id), "An account canceled exactly 30 days ago should be retained"
++      assert Account.exists?(recent_account.id)
++
++      travel 1.second
++
++      Current.without_account { Account::IncinerateDueJob.perform_now }
++      assert_not Account.exists?(account.id)
++      assert Account.exists?(recent_account.id)
++    end
++  end
++
++  test "retains reactivated accounts" do
++    account = accounts(:"37s")
++    travel_to 31.days.ago do
++      account.cancel(initiated_by: users(:david))
++    end
++    account.reactivate
++
++    Current.without_account { Account::IncinerateDueJob.perform_now }
++
++    assert Account.exists?(account.id)
++    assert account.reload.active?
++  end
++end

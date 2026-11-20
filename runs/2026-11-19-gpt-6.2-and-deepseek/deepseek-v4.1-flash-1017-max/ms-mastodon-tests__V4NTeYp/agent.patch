@@ -1,0 +1,820 @@
+diff --git a/config/environments/test.rb b/config/environments/test.rb
+index 12709d5..ce76d84 100644
+--- a/config/environments/test.rb
++++ b/config/environments/test.rb
+@@ -19,6 +19,11 @@ Rails.application.configure do
+   # loading is working properly before deploying your code.
+   config.eager_load = ENV['CI'].present?
+ 
++  # Test runs do not consume application logs. Debug-level SQL logging is a
++  # significant source of I/O and formatting work across the whole suite.
++  config.log_level = :warn
++  config.active_record.verbose_query_logs = false
++
+   # Show full error reports and disable caching.
+   config.consider_all_requests_local = true
+   config.action_controller.perform_caching = false
+diff --git a/docs/test-suite-profiling.md b/docs/test-suite-profiling.md
+new file mode 100644
+index 0000000..9f95c2b
+--- /dev/null
++++ b/docs/test-suite-profiling.md
+@@ -0,0 +1,309 @@
++# Test Suite Profiling Notes
++
++This document records measurements and reusable findings from test-suite
++performance work. Keep it updated as additional spec groups are optimized.
++
++## Ground Rules
++
++- Do not run the entire suite at once in this environment; run one spec folder
++  at a time, e.g. `bundle exec rspec spec/models`.
++- System and streaming specs are excluded by the default RSpec filters and are
++  out of scope for these optimization passes.
++- Prefer configuration/setup-level changes over rewriting individual examples.
++  Assertions must not change.
++- Do not change factories during the model phase; factory changes are handled in
++  a later pass.
++
++## Phase 1: `spec/models`
++
++### Baseline
++
++Command:
++
++```sh
++TIMEFORMAT='WALL=%3R'; time bundle exec rspec spec/models --profile 50 --format progress
++```
++
++Environment: Ruby 4.0.6, RSpec 3.13, Rails 8.1, PostgreSQL. Test data is
++transactional; examples are randomized.
++
++Baseline result (seed 22251):
++
++- 1795 examples, 0 failures
++- RSpec-reported example time: 2m37.3s
++- Wall time: 160.7s
++- Load time: 2.8s
++
++A CPU StackProf file of the same folder showed the suite was spending most of
++its time in an unexpected place:
++
++- `ActiveSupport::BacktraceCleaner#clean_frame`: 32.3% total CPU
++- `Rails::BacktraceCleaner#initialize`: 4.6% total CPU
++- `String#sub`: 13.2% self CPU
++- `Thread::Backtrace::Location#to_s`: 7.0% self CPU
++
++The cause was `ActiveRecord::LogSubscriber#query_source_location`: with
++`ActiveRecord.verbose_query_logs` enabled, every SQL query walked and cleaned
++the caller backtrace to add a source annotation to debug logs. One model spec
++set `ActiveRecord.verbose_query_logs = true` at file-load time, so the setting
++leaked across the entire randomized run.
++
++### Changes
++
++1. `spec/models/concerns/status/fetch_replies_concern_spec.rb`
++   - Removed the top-level `ActiveRecord.verbose_query_logs = true` line. It
++     only affected debug logging, not the behavior or assertions of the example.
++
++2. `config/environments/test.rb`
++   - Set `config.log_level = :warn` to avoid formatting and writing every
++     debug-level SQL/query log during tests.
++   - Set `config.active_record.verbose_query_logs = false` explicitly so this
++     expensive behavior does not come back accidentally.
++   - Test logs are not part of any assertion. The test logger is now quiet.
++
++### Results
++
++After removing the leaked verbose-query-log setting (seed 2657):
++
++- RSpec-reported example time: 1m27.3s (157.3s -> 87.3s, 44.5% faster)
++- Wall time: 90.5s (160.7s -> 90.5s, 43.7% faster)
++
++After also quieting test logging (seed 58574):
++
++- RSpec-reported example time: 1m18.4s
++- Wall time: 81.7s
++- Improvement versus baseline: 50.2% less example time, 49.2% less wall time
++
++Later repeated full-folder runs were in the 74.5-78.4s RSpec-reported range
++depending on random order. The final verification run (seed 14687) completed in
++1m15.6s (75.6s) with a 78.6s wall time and 0 failures: 52.0% less RSpec example
++time and 51.1% less wall time than the baseline. The models target of 30-35% was
++exceeded; `spec/models` is now comfortably more than twice as fast as the
++original baseline.
++
++### What Is Not the Bottleneck
++
++Instrumented hook timings across all 1795 model examples:
++
++- `Rails.cache.clear`: ~0.01s total
++- `Redis#keys` + `Redis#del`: ~0.19s total
++- `Sidekiq.testing!(:inline)`: ~0.01s total
++- `Rails.application.reload_routes_unless_loaded`: ~0.13s total
++
++The remaining time is dominated by database work and model callbacks/object
++creation. An instrumented run saw about 113,700 SQL queries (15.7s of DB time,
++~20% of suite time). Common query families were `UserRole Load`, `Keypair
++Exists?`, `UsernameBlock Exists?`, `UserIp Load`, and account/user creation.
++These are largely driven by factory/example setup and are intentionally left for
++the later factory phase.
++
++### Reusable Checks for Future Phases
++
++1. Search for global test state leaks before profiling deeply:
++   `grep -R "verbose_query_logs" -n spec`.
++2. Run StackProf on one folder at a time. Backtrace-cleaner samples are a strong
++   signal that debug query-source logging was accidentally enabled.
++3. Keep test log level at `:warn` unless a specific example needs to assert
++   application logging.
++4. Use `--profile N` and an instrumented `sql.active_record` subscriber to
++   separate query time from Ruby/CPU time.
++5. Profile `spec/requests` independently; it can have different dominant
++   setup costs. Reuse the logging configuration but do not assume model findings
++   apply unchanged.
++
++## Phase 2: `spec/requests`
++
++### Baseline
++
++Command:
++
++```sh
++TIMEFORMAT='WALL=%3R'; time bundle exec rspec spec/requests --profile 50 --format progress
++```
++
++Baseline at the start of this phase (seed 27646):
++
++- 1,877 examples, 0 failures
++- RSpec-reported example time: 2m27.7s (147.7s)
++- Wall time: 151.0s
++- Load time: 2.8s
++
++This baseline already includes the Phase 1 logging configuration. Profiling used
++StackProf plus temporary SQL/job/hook instrumentation. The main findings were:
++
++- `TriggerWebhookWorker` executed inline after almost every fabricated user,
++  account update, and status creation. It serialized a full webhook payload
++  before discovering that no webhooks were enabled. This was ~22% of CPU.
++- Sidekiq inline execution accounted for ~12s of the run. Most jobs were
++  incidental setup/action side effects that request examples never asserted.
++- Signup approval checks (`UsernameBlock.matches?` and
++  `EmailDomainBlock.requires_approval?`) ran for every fabricated user even
++  though request specs do not exercise blocked signups. This caused ~15k extra
++  queries.
++- Per-example RSpec stubs for the above behavior were themselves measurable.
++  Thread-local fast paths installed once were faster than recreating RSpec
++  mocks for every example.
++
++Experiments that did **not** help or were unsafe:
++
++- Wrapping request examples in `ActiveRecord::Base.cache`: no measurable gain.
++- Batching GC with automatic collection disabled: no gain; fully disabling GC
++  exceeded the 2 GB container limit.
++- Preserving `Rails.cache` between examples: caused 1,027 failures from stale
++  cached settings/state.
++
++### Changes
++
++1. Added `spec/support/request_suite_optimizations.rb`:
++   - Installs thread-local fast paths once for `TriggerWebhookWorker`,
++     signup block checks, `NotifyService#send_email!`, and
++     `DistributionWorker`.
++   - Suppresses webhook jobs for request examples. Webhook behavior remains
++     covered by worker/service specs.
++   - Short-circuits username/e-mail domain approval checks during request setup.
++   - Suppresses notification e-mails unless an example opts in.
++   - Uses `Sidekiq.testing!(:fake)` by default for request examples so jobs are
++     enqueued for matchers but not executed.
++   - Uses `Sidekiq.testing!(:inline)` only for examples tagged
++     `:sidekiq_inline`; `:sidekiq_distribution` also runs
++     `DistributionWorker` inline.
++   - `:send_notification_emails` and `:real_signup_block_checks` are available
++     as opt-outs from the request-suite shortcuts.
++2. Added narrow metadata tags to 41 examples whose assertions depend on inline
++   job side effects:
++   - `spec/requests/api/v1/admin/account_actions_spec.rb`
++   - `spec/requests/api/v1/conversations_spec.rb`
++   - `spec/requests/api/v1/notifications_spec.rb`
++   - `spec/requests/api/v1/reports_spec.rb`
++   - `spec/requests/api/v1/statuses/favourites_spec.rb`
++   - `spec/requests/api/v1/timelines/home_spec.rb`
++   - `spec/requests/api/v2/notifications/accounts_spec.rb`
++   - `spec/requests/api/v2/notifications_spec.rb`
++
++Assertions were not changed.
++
++### Results
++
++Final verification runs:
++
++- Seed 3350: 1,877 examples, 0 failures; RSpec-reported 1m40.35s, wall 103.69s
++- Seed 31409: 1,877 examples, 0 failures; RSpec-reported 1m40.85s, wall 104.31s
++- Seed 37133: 1,877 examples, 0 failures; RSpec-reported 1m40.64s, wall 103.94s
++
++Compared with the request baseline:
++
++- RSpec-reported time: ~147.7s -> ~100.6s (~31.9% faster)
++- Wall time: ~151.0s -> ~104.0s (~31.1% faster)
++
++This exceeds the request-phase target of >30% and is stable across randomized
++orders.
++
++### Remaining Bottlenecks
++
++The remaining runtime is still dominated by factory/setup data creation:
++
++- `Fabricate`/model callbacks are roughly half of remaining CPU time.
++- BCrypt password hashing is ~5% of CPU.
++- The suite still issues over 100k SQL queries; DB time is a significant share.
++
++These are intentionally left for the factory optimization phase. Request-suite
++hooks only skip behavior that request examples do not assert, so further gains
++should focus on factory setup rather than removing more request behavior.
++
++## Phase 3: factory usage (`spec/models` and `spec/requests`)
++
++### Baseline at start of phase
++
++The baseline includes all Phase 1 and Phase 2 optimizations.
++
++Command (run once per folder, never together):
++
++```sh
++TIMEFORMAT='WALL=%3R'; time bundle exec rspec spec/models --profile 50 --format progress
++TIMEFORMAT='WALL=%3R'; time bundle exec rspec spec/requests --profile 50 --format progress
++```
++
++| Folder | Examples | RSpec time | Wall time | Seed |
++| --- | ---: | ---: | ---: | ---: |
++| `spec/models` | 1,795 | 75.35s | 78.94s | 57569 |
++| `spec/requests` | 1,877 | 104.23s | 107.93s | 19649 |
++| Combined | 3,672 | 179.58s | 186.87s | - |
++
++A temporary Fabrication/SQL profiler recorded factory self-time and query
++families. The largest factory costs were:
++
++- `spec/models`: `status` 1,003 calls / 31.84s inclusive, `account` 1,194 /
++  15.93s, `bookmark` 1,019 / 14.79s, `media_attachment` 40 / 6.36s,
++  `build(:user)` 2,997 / 3.73s.
++- `spec/requests`: `bookmark` 1,459 / 13.27s, `status` 1,450 / 23.33s,
++  `account` 1,070 / 10.49s, `user` 939 / 9.68s, `build(:user)` 3,376 /
++  4.26s, `login_activity` 2,970 / 2.21s.
++
++The common causes were:
++
++1. Every `Fabricate(:status)` created an unrelated bookmark through an
++   `after_create` callback. Almost no examples inspected that record.
++2. Every `Fabricate(:user)` created two login activities through an
++   `after_create` callback. Only the association itself is generally asserted;
++   examples that need real login activities create them explicitly.
++3. Every nested `Fabricate.build(:user)` eagerly BCrypt-hashed the default
++   password, even though most built users were either never persisted or were
++   eventually persisted with the same fixed test password.
++
++### Changes
++
++1. Removed the unconditional bookmark creation from
++   `spec/fabricators/status_fabricator.rb`. Examples that assert bookmark
++   behavior already create bookmarks explicitly.
++2. Removed the two unconditional login activities from
++   `spec/fabricators/user_fabricator.rb`. Login-activity behavior remains
++   covered by its own model/controller specs, which create records explicitly.
++3. Reworked the default user password in `spec/fabricators/user_fabricator.rb`:
++   - Compute the BCrypt digest for the default `123456789` password once when
++     the fabricator loads.
++   - Set `encrypted_password` directly instead of assigning the virtual
++     `password` attribute on every build.
++   - In `after_build`, set the virtual password only when an explicit password
++     override has not already set it, so Devise's new-record validations still
++     pass while explicit passwords continue to hash normally.
++
++No assertions were changed and no application runtime code was modified.
++
++### Results
++
++Final verification runs (all with 0 failures):
++
++| Folder | Seed | RSpec time | Wall time |
++| --- | ---: | ---: | ---: |
++| `spec/models` | 26792 | 56.48s | 59.55s |
++| `spec/requests` | 62338 | 84.44s | 87.67s |
++| Combined | - | 140.92s | 147.22s |
++
++Observed ranges across post-change randomized runs:
++
++- `spec/models`: 56.48-59.02s RSpec time (24.3-21.7% faster than the
++  75.35s phase baseline).
++- `spec/requests`: 78.91-84.60s RSpec time (24.3-18.8% faster than the
++  104.23s phase baseline).
++- Combined best observed: 135.95s RSpec time, 24.3% faster than 179.58s.
++- Combined final verification: 140.92s RSpec time, 21.5% faster than 179.58s.
++
++Relative to the original pre-Phase-1 measurements recorded above
++(~157.3s + ~147.7s = ~305.0s RSpec example time), the two folders now run in
++~136-141s, more than twice as fast overall.
++
++### Remaining Factory Costs
++
++The next largest safe opportunities, if another factory pass is needed, are:
++
++- `media_attachment`: real fixture processing is still relatively expensive
++  (~6.4s in models, ~1.9s in requests). Any change here should be opt-in so
++  examples asserting attachment metadata/processing keep using real files.
++- Account creation still accounts for a large share of setup. Many statuses
++  only need an account and do not inspect `account.user`, so an opt-in
++  lightweight account variant could be considered, but it would require
++  auditing the examples that explicitly use `account.user`.
++
++Do not reintroduce per-example side-effect records into the base `status` or
++`user` fabricators. Prefer explicit factory calls or narrow transient flags
++when an example genuinely needs those records.
+diff --git a/spec/fabricators/status_fabricator.rb b/spec/fabricators/status_fabricator.rb
+index 2539d48..32a2cbf 100644
+--- a/spec/fabricators/status_fabricator.rb
++++ b/spec/fabricators/status_fabricator.rb
+@@ -7,8 +7,4 @@ Fabricator(:status) do
+   after_build do |status|
+     status.uri = Faker::Internet.device_token if !status.account.local? && status.uri.nil?
+   end
+-
+-  after_create do |status|
+-    Fabricate(:bookmark, status: status)
+-  end
+ end
+diff --git a/spec/fabricators/user_fabricator.rb b/spec/fabricators/user_fabricator.rb
+index c82a3c9..1c8bd56 100644
+--- a/spec/fabricators/user_fabricator.rb
++++ b/spec/fabricators/user_fabricator.rb
+@@ -1,5 +1,8 @@
+ # frozen_string_literal: true
+ 
++DEFAULT_USER_PASSWORD = '123456789'
++DEFAULT_USER_ENCRYPTED_PASSWORD = Devise::Encryptor.digest(User, DEFAULT_USER_PASSWORD).freeze
++
+ Fabricator(:user) do
+   account do |attrs|
+     Fabricate.build(
+@@ -7,14 +10,17 @@ Fabricator(:user) do
+       attrs.fetch(:account_attributes, {}).merge(user: nil)
+     )
+   end
+-  email        { sequence(:email) { |i| "#{i}#{Faker::Internet.email}" } }
+-  password     '123456789'
++  email { sequence(:email) { |i| "#{i}#{Faker::Internet.email}" } }
++  encrypted_password DEFAULT_USER_ENCRYPTED_PASSWORD
+   confirmed_at { Time.zone.now }
+   current_sign_in_at { Time.zone.now }
+   agreement true
+ 
+-  after_create do |user|
+-    2.times { Fabricate(:login_activity, user: user) }
++  after_build do |user|
++    # Devise requires the virtual password attribute to be present for new
++    # records, but hashing it on every build is unnecessary. The encrypted
++    # password above is the precomputed hash for the default password.
++    user.instance_variable_set(:@password, DEFAULT_USER_PASSWORD) if user.password.nil?
+   end
+ end
+ 
+diff --git a/spec/models/concerns/status/fetch_replies_concern_spec.rb b/spec/models/concerns/status/fetch_replies_concern_spec.rb
+index e9c81d4..15e8ad7 100644
+--- a/spec/models/concerns/status/fetch_replies_concern_spec.rb
++++ b/spec/models/concerns/status/fetch_replies_concern_spec.rb
+@@ -3,7 +3,6 @@
+ require 'rails_helper'
+ 
+ RSpec.describe Status::FetchRepliesConcern do
+-  ActiveRecord.verbose_query_logs = true
+ 
+   let!(:alice)  { Fabricate(:account, username: 'alice') }
+   let!(:bob)    { Fabricate(:account, username: 'bob', domain: 'other.com') }
+diff --git a/spec/requests/api/v1/admin/account_actions_spec.rb b/spec/requests/api/v1/admin/account_actions_spec.rb
+index b67db3d..f378260 100644
+--- a/spec/requests/api/v1/admin/account_actions_spec.rb
++++ b/spec/requests/api/v1/admin/account_actions_spec.rb
+@@ -6,7 +6,7 @@ RSpec.describe 'Account actions' do
+   include_context 'with API authentication', user_fabricator: :admin_user, oauth_scopes: 'admin:write admin:write:accounts'
+ 
+   shared_examples 'a successful notification delivery' do
+-    it 'notifies the user about the action taken' do
++    it 'notifies the user about the action taken', :sidekiq_inline do
+       emails = capture_emails { subject }
+ 
+       expect(emails.size)
+diff --git a/spec/requests/api/v1/conversations_spec.rb b/spec/requests/api/v1/conversations_spec.rb
+index aed3645..59dd075 100644
+--- a/spec/requests/api/v1/conversations_spec.rb
++++ b/spec/requests/api/v1/conversations_spec.rb
+@@ -16,7 +16,7 @@ RSpec.describe 'API V1 Conversations' do
+       PostStatusService.new.call(user.account, text: 'Hey, nobody here', visibility: 'direct')
+     end
+ 
+-    it 'returns pagination headers', :aggregate_failures do
++    it 'returns pagination headers', :aggregate_failures, :sidekiq_distribution, :sidekiq_inline do
+       get '/api/v1/conversations', params: { limit: 1 }, headers: headers
+ 
+       expect(response)
+@@ -29,7 +29,7 @@ RSpec.describe 'API V1 Conversations' do
+         .to start_with('application/json')
+     end
+ 
+-    it 'returns conversations', :aggregate_failures do
++    it 'returns conversations', :aggregate_failures, :sidekiq_distribution, :sidekiq_inline do
+       get '/api/v1/conversations', headers: headers
+ 
+       expect(response.parsed_body.size).to eq 2
+@@ -38,7 +38,7 @@ RSpec.describe 'API V1 Conversations' do
+ 
+     context 'with since_id' do
+       context 'when requesting old posts' do
+-        it 'returns conversations' do
++        it 'returns conversations', :sidekiq_distribution, :sidekiq_inline do
+           get '/api/v1/conversations', params: { since_id: Mastodon::Snowflake.id_at(1.hour.ago, with_random: false) }, headers: headers
+ 
+           expect(response.parsed_body.size).to eq 2
+diff --git a/spec/requests/api/v1/notifications_spec.rb b/spec/requests/api/v1/notifications_spec.rb
+index 15183d2..75e712b 100644
+--- a/spec/requests/api/v1/notifications_spec.rb
++++ b/spec/requests/api/v1/notifications_spec.rb
+@@ -25,7 +25,7 @@ RSpec.describe 'Notifications' do
+ 
+     it_behaves_like 'forbidden for wrong scope', 'write write:notifications'
+ 
+-    context 'with no options' do
++    context 'with no options', :sidekiq_distribution, :sidekiq_inline do
+       it 'returns expected notifications count' do
+         subject
+ 
+@@ -36,7 +36,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'with a read marker' do
++    context 'with a read marker', :sidekiq_inline do
+       before do
+         id = user.account.notifications.browserable.order(id: :desc).offset(2).first.id
+         user.markers.create!(timeline: 'notifications', last_read_id: id)
+@@ -52,7 +52,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'with exclude_types param' do
++    context 'with exclude_types param', :sidekiq_inline do
+       let(:params) { { exclude_types: %w(mention) } }
+ 
+       it 'returns expected notifications count' do
+@@ -65,7 +65,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'with a user-provided limit' do
++    context 'with a user-provided limit', :sidekiq_inline do
+       let(:params) { { limit: 2 } }
+ 
+       it 'returns a capped value' do
+@@ -78,7 +78,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'when there are more notifications than the limit' do
++    context 'when there are more notifications than the limit', :sidekiq_inline do
+       before do
+         stub_const('Api::V1::NotificationsController::DEFAULT_NOTIFICATIONS_COUNT_LIMIT', 2)
+       end
+@@ -115,7 +115,7 @@ RSpec.describe 'Notifications' do
+ 
+     it_behaves_like 'forbidden for wrong scope', 'write write:notifications'
+ 
+-    context 'with no options' do
++    context 'with no options', :sidekiq_distribution, :sidekiq_inline do
+       it 'returns expected notification types', :aggregate_failures do
+         subject
+ 
+@@ -128,7 +128,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'with include_filtered' do
++    context 'with include_filtered', :sidekiq_distribution, :sidekiq_inline do
+       let(:params) { { include_filtered: true } }
+ 
+       it 'returns expected notification types, including filtered notifications' do
+@@ -143,7 +143,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'with account_id param' do
++    context 'with account_id param', :sidekiq_inline do
+       let(:params) { { account_id: tom.account.id } }
+ 
+       it 'returns only notifications from specified user', :aggregate_failures do
+@@ -173,7 +173,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'with exclude_types param' do
++    context 'with exclude_types param', :sidekiq_inline do
+       let(:params) { { exclude_types: %w(mention) } }
+ 
+       it 'returns everything but excluded type', :aggregate_failures do
+@@ -187,7 +187,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'with types param' do
++    context 'with types param', :sidekiq_distribution, :sidekiq_inline do
+       let(:params) { { types: %w(mention) } }
+ 
+       it 'returns only requested type', :aggregate_failures do
+@@ -200,7 +200,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'with limit param' do
++    context 'with limit param', :sidekiq_distribution, :sidekiq_inline do
+       let(:params) { { limit: 3 } }
+ 
+       it 'returns the requested number of notifications paginated', :aggregate_failures do
+diff --git a/spec/requests/api/v1/reports_spec.rb b/spec/requests/api/v1/reports_spec.rb
+index 52cd581..3916425 100644
+--- a/spec/requests/api/v1/reports_spec.rb
++++ b/spec/requests/api/v1/reports_spec.rb
+@@ -32,7 +32,7 @@ RSpec.describe 'Reports' do
+ 
+     it_behaves_like 'forbidden for wrong scope', 'read read:reports'
+ 
+-    it 'creates a report', :aggregate_failures do
++    it 'creates a report', :aggregate_failures, :send_notification_emails, :sidekiq_inline do
+       emails = capture_emails { subject }
+ 
+       expect(response).to have_http_status(200)
+diff --git a/spec/requests/api/v1/statuses/favourites_spec.rb b/spec/requests/api/v1/statuses/favourites_spec.rb
+index 0e58f3e..62da489 100644
+--- a/spec/requests/api/v1/statuses/favourites_spec.rb
++++ b/spec/requests/api/v1/statuses/favourites_spec.rb
+@@ -83,7 +83,7 @@ RSpec.describe 'Favourites' do
+ 
+     it_behaves_like 'forbidden for wrong scope', 'read read:favourites'
+ 
+-    context 'with public status' do
++    context 'with public status', :sidekiq_inline do
+       before do
+         FavouriteService.new.call(user.account, status)
+       end
+@@ -103,7 +103,7 @@ RSpec.describe 'Favourites' do
+       end
+     end
+ 
+-    context 'when the requesting user was blocked by the status author' do
++    context 'when the requesting user was blocked by the status author', :sidekiq_inline do
+       before do
+         FavouriteService.new.call(user.account, status)
+         status.account.block!(user.account)
+diff --git a/spec/requests/api/v1/timelines/home_spec.rb b/spec/requests/api/v1/timelines/home_spec.rb
+index 6ff0a51..631d056 100644
+--- a/spec/requests/api/v1/timelines/home_spec.rb
++++ b/spec/requests/api/v1/timelines/home_spec.rb
+@@ -17,7 +17,7 @@ RSpec.describe 'Home' do
+ 
+     it_behaves_like 'forbidden for wrong scope', 'write write:statuses'
+ 
+-    context 'when the timeline is available' do
++    context 'when the timeline is available', :sidekiq_distribution, :sidekiq_inline do
+       let(:home_statuses) { bob.statuses + ana.statuses }
+       let!(:bob)          { Fabricate(:account) }
+       let!(:tim)          { Fabricate(:account) }
+diff --git a/spec/requests/api/v2/notifications/accounts_spec.rb b/spec/requests/api/v2/notifications/accounts_spec.rb
+index ddc9c5d..fa0baa0 100644
+--- a/spec/requests/api/v2/notifications/accounts_spec.rb
++++ b/spec/requests/api/v2/notifications/accounts_spec.rb
+@@ -8,7 +8,7 @@ RSpec.describe 'Accounts in grouped notifications' do
+   let(:scopes)  { 'read:notifications write:notifications' }
+   let(:headers) { { 'Authorization' => "Bearer #{token.token}" } }
+ 
+-  describe 'GET /api/v2/notifications/:group_key/accounts' do
++  describe 'GET /api/v2/notifications/:group_key/accounts', :sidekiq_inline do
+     subject do
+       get "/api/v2/notifications/#{user.account.notifications.first.group_key}/accounts", headers: headers, params: params
+     end
+diff --git a/spec/requests/api/v2/notifications_spec.rb b/spec/requests/api/v2/notifications_spec.rb
+index 23e617f..333df3a 100644
+--- a/spec/requests/api/v2/notifications_spec.rb
++++ b/spec/requests/api/v2/notifications_spec.rb
+@@ -25,7 +25,7 @@ RSpec.describe 'Notifications' do
+ 
+     it_behaves_like 'forbidden for wrong scope', 'write write:notifications'
+ 
+-    context 'with no options' do
++    context 'with no options', :sidekiq_distribution, :sidekiq_inline do
+       it 'returns expected notifications count' do
+         subject
+ 
+@@ -36,7 +36,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'with grouped_types parameter' do
++    context 'with grouped_types parameter', :sidekiq_distribution, :sidekiq_inline do
+       let(:params) { { grouped_types: %w(reblog) } }
+ 
+       it 'returns expected notifications count' do
+@@ -49,7 +49,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'with a read marker' do
++    context 'with a read marker', :sidekiq_inline do
+       before do
+         id = user.account.notifications.browserable.order(id: :desc).offset(2).first.id
+         user.markers.create!(timeline: 'notifications', last_read_id: id)
+@@ -65,7 +65,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'with exclude_types param' do
++    context 'with exclude_types param', :sidekiq_inline do
+       let(:params) { { exclude_types: %w(mention) } }
+ 
+       it 'returns expected notifications count' do
+@@ -78,7 +78,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'with a user-provided limit' do
++    context 'with a user-provided limit', :sidekiq_inline do
+       let(:params) { { limit: 2 } }
+ 
+       it 'returns a capped value' do
+@@ -91,7 +91,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'when there are more notifications than the limit' do
++    context 'when there are more notifications than the limit', :sidekiq_inline do
+       before do
+         stub_const('Api::V2::NotificationsController::DEFAULT_NOTIFICATIONS_COUNT_LIMIT', 2)
+       end
+@@ -142,7 +142,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'when there are numerous notifications for the same final group' do
++    context 'when there are numerous notifications for the same final group', :sidekiq_distribution, :sidekiq_inline do
+       before do
+         user.account.notifications.destroy_all
+         5.times.each { FavouriteService.new.call(Fabricate(:account), user.account.statuses.first) }
+@@ -189,7 +189,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'with no options' do
++    context 'with no options', :sidekiq_distribution, :sidekiq_inline do
+       it 'returns expected notification types', :aggregate_failures do
+         subject
+ 
+@@ -200,7 +200,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'with grouped_types param' do
++    context 'with grouped_types param', :sidekiq_distribution, :sidekiq_inline do
+       let(:params) { { grouped_types: %w(reblog) } }
+ 
+       it 'returns everything, but does not group favourites' do
+@@ -248,7 +248,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'with types param' do
++    context 'with types param', :sidekiq_distribution, :sidekiq_inline do
+       let(:params) { { types: %w(mention) } }
+ 
+       it 'returns only requested type', :aggregate_failures do
+@@ -262,7 +262,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'with limit param' do
++    context 'with limit param', :sidekiq_inline do
+       let(:params) { { limit: 3 } }
+       let(:notifications) { user.account.notifications.reorder(id: :desc) }
+ 
+@@ -284,7 +284,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'with since_id param' do
++    context 'with since_id param', :sidekiq_inline do
+       let(:params) { { since_id: notifications[2].id } }
+       let(:notifications) { user.account.notifications.reorder(id: :desc) }
+ 
+@@ -306,7 +306,7 @@ RSpec.describe 'Notifications' do
+       end
+     end
+ 
+-    context 'when requesting stripped-down accounts' do
++    context 'when requesting stripped-down accounts', :sidekiq_inline do
+       let(:params) { { expand_accounts: 'partial_avatars' } }
+ 
+       let(:recent_account) { Fabricate(:account) }
+diff --git a/spec/support/request_suite_optimizations.rb b/spec/support/request_suite_optimizations.rb
+new file mode 100644
+index 0000000..05d3426
+--- /dev/null
++++ b/spec/support/request_suite_optimizations.rb
+@@ -0,0 +1,94 @@
++# frozen_string_literal: true
++
++# Request specs create a large amount of setup data and trigger background jobs
++# for every authenticated request. Most examples do not inspect those side
++# effects, so keep the expensive work out of the common path and let individual
++# examples opt back in through metadata.
++#
++# Metadata:
++#   :sidekiq_inline             - execute Sidekiq jobs inline for this example
++#   :sidekiq_distribution       - when inline, also execute DistributionWorker
++#   :send_notification_emails   - do not suppress NotifyService email delivery
++#   :real_signup_block_checks   - do not skip username/e-mail block approval checks
++module RequestSuiteOptimizations
++  THREAD_KEY = :request_suite_optimizations
++
++  class << self
++    def enabled?
++      Thread.current[THREAD_KEY]
++    end
++
++    def enabled=(value)
++      Thread.current[THREAD_KEY] = value
++    end
++  end
++end
++
++module SuppressWebhookEnqueue
++  def perform_async(*args, **kwargs)
++    return if RequestSuiteOptimizations.enabled?
++
++    super
++  end
++end
++
++module SuppressSignupBlockMatches
++  def matches?(*args, **kwargs)
++    return false if RequestSuiteOptimizations.enabled? && !Thread.current[:real_signup_block_checks]
++
++    super
++  end
++end
++
++module SuppressEmailDomainApproval
++  def requires_approval?(*args, **kwargs)
++    return false if RequestSuiteOptimizations.enabled? && !Thread.current[:real_signup_block_checks]
++
++    super
++  end
++end
++
++module SuppressNotificationEmail
++  def send_email!
++    return if RequestSuiteOptimizations.enabled? && Thread.current[:suppress_notification_emails]
++
++    super
++  end
++end
++
++module SuppressDistributionEnqueue
++  def perform_async(*args, **kwargs)
++    return if RequestSuiteOptimizations.enabled? && Thread.current[:suppress_distribution_worker]
++
++    super
++  end
++end
++
++TriggerWebhookWorker.singleton_class.prepend(SuppressWebhookEnqueue)
++UsernameBlock.singleton_class.prepend(SuppressSignupBlockMatches)
++EmailDomainBlock.singleton_class.prepend(SuppressEmailDomainApproval)
++NotifyService.prepend(SuppressNotificationEmail)
++DistributionWorker.singleton_class.prepend(SuppressDistributionEnqueue)
++
++RSpec.configure do |config|
++  config.before(:each, type: :request) do |example|
++    RequestSuiteOptimizations.enabled = true
++    Thread.current[:real_signup_block_checks] = example.metadata[:real_signup_block_checks]
++    Thread.current[:suppress_notification_emails] = !example.metadata[:send_notification_emails]
++
++    if example.metadata[:sidekiq_inline]
++      Thread.current[:suppress_distribution_worker] = !example.metadata[:sidekiq_distribution]
++      Sidekiq.testing!(:inline)
++    else
++      Thread.current[:suppress_distribution_worker] = false
++      Sidekiq.testing!(:fake)
++    end
++  end
++
++  config.after(:each, type: :request) do
++    RequestSuiteOptimizations.enabled = false
++    Thread.current[:real_signup_block_checks] = nil
++    Thread.current[:suppress_notification_emails] = nil
++    Thread.current[:suppress_distribution_worker] = nil
++  end
++end
